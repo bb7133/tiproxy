@@ -189,6 +189,14 @@ impl ConfigModuleHandle {
         Ok(())
     }
 
+    /// Whether the initial persistent `/config` view has been incorporated
+    /// (always true for a file-only owner). Non-blocking counterpart of
+    /// [`Self::wait_ready`] for readiness probes.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
     /// Persists the dynamic proxy subset under /config/proxy.
     ///
     /// # Errors

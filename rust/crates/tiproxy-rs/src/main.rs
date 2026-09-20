@@ -56,6 +56,7 @@ use control_topology::{
     AdvertiseEndpointResolver, InterfaceAdvertiseResolver, MetricCollector, TopologyModule,
     TopologyModuleHandle,
 };
+use dataplane::GenerationStatusSnapshot;
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
 use dataplane::session::SessionLoopConfig;
@@ -103,11 +104,12 @@ struct Options {
     drain_grace: Option<Duration>,
     health_port: u16,
     metrics_addr: Option<SocketAddr>,
+    admin_addr: Option<SocketAddr>,
     log_file: Option<PathBuf>,
 }
 
 enum Command {
-    Run(Options),
+    Run(Box<Options>),
     Version,
     Help,
     IntegrationCapabilities,
@@ -144,7 +146,7 @@ async fn main() -> ExitCode {
             println!("{INTEGRATION_CAPABILITIES}");
             ExitCode::SUCCESS
         }
-        Command::Run(options) => match run(options).await {
+        Command::Run(options) => match run(*options).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("tiproxy-rs stopped: {error}");
@@ -234,6 +236,7 @@ struct RunningProcess<R, E, S, H> {
     health_task: Option<H>,
     metrics_http_task: Option<JoinHandle<()>>,
     log_reload_task: Option<JoinHandle<()>>,
+    admin_task: Option<AdminTask>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -262,6 +265,8 @@ struct StartupGuard<R, E, S, H> {
     metrics_http_task: Option<JoinHandle<()>>,
     /// Applies `log.log-file.*` reloads to the process log output.
     log_reload_task: Option<JoinHandle<()>>,
+    /// Management-plane HTTP server (CP-ADMIN), stopped gracefully at exit.
+    admin_task: Option<AdminTask>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -285,6 +290,7 @@ where
             health_task: None,
             metrics_http_task: None,
             log_reload_task: None,
+            admin_task: None,
             routing_shadow: None,
         }
     }
@@ -326,6 +332,12 @@ where
         }
     }
 
+    fn set_admin_task(&mut self, task: AdminTask) {
+        if self.admin_task.replace(task).is_some() {
+            unreachable!("the admin task was set twice");
+        }
+    }
+
     fn set_log_reload_task(&mut self, task: JoinHandle<()>) {
         if self.log_reload_task.replace(task).is_some() {
             unreachable!("the log reload task was set twice");
@@ -360,6 +372,9 @@ where
         if let Some(task) = self.log_reload_task.take() {
             steps.push(("log_reload_task", startup::Teardown::teardown(task)));
         }
+        if let Some(task) = self.admin_task.take() {
+            steps.push(("admin_task", startup::Teardown::teardown(task)));
+        }
         let _order = startup::run_teardowns_in_reverse(steps).await;
         // The owner and its modules were acquired first, so they retire last.
         // Make shutdown mandatory and advance to Stopping (so a topology module
@@ -391,6 +406,7 @@ where
             health_task,
             metrics_http_task,
             log_reload_task,
+            admin_task,
             routing_shadow,
         } = self;
         let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
@@ -407,6 +423,7 @@ where
             health_task,
             metrics_http_task,
             log_reload_task,
+            admin_task,
             routing_shadow,
         }
     }
@@ -802,10 +819,35 @@ async fn run(options: Options) -> Result<(), String> {
         config_owner.handle.source().subscribe(),
         initial_log_file,
     )));
+    // Management plane (CP-ADMIN): bound before ready so a bad address fails
+    // fast; its readiness gate opens together with the process, like Go's
+    // `ready` toggle at the end of `NewServer`.
+    let admin_app = match spawn_admin(
+        options.admin_addr,
+        admin_hooks(
+            &in_process,
+            &config_owner.handle,
+            &serving,
+            &metrics_registry,
+        ),
+        admin_tls_source(config_owner.handle.source().clone()),
+    )
+    .await
+    {
+        Ok(Some((app, task))) => {
+            guard.set_admin_task(task);
+            Some(app)
+        }
+        Ok(None) => None,
+        Err(error) => return Err(guard.rollback(error).await),
+    };
     if let Err(error) = in_process.mark_ready() {
         return Err(guard
             .rollback(format!("mark in-process control runtime ready: {error}"))
             .await);
+    }
+    if let Some(app) = &admin_app {
+        app.mark_ready();
     }
     // STARTUP-GUARD:COMMIT
     let RunningProcess {
@@ -820,6 +862,7 @@ async fn run(options: Options) -> Result<(), String> {
         health_task,
         metrics_http_task,
         log_reload_task,
+        admin_task,
         routing_shadow,
     } = guard.commit();
 
@@ -952,6 +995,9 @@ async fn run(options: Options) -> Result<(), String> {
     if let Some(task) = log_reload_task {
         task.abort();
         let _ = task.await;
+    }
+    if let Some(admin) = admin_task {
+        startup::Teardown::teardown(admin).await;
     }
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
@@ -1319,6 +1365,129 @@ async fn run_log_reload(
 }
 
 /// Binds the native `/metrics` listener when an address was configured.
+/// Management-plane server task plus its graceful stop signal.
+struct AdminTask {
+    task: JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl startup::Teardown for AdminTask {
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let AdminTask { mut task, shutdown } = self;
+            // Stop accepting and let in-flight requests finish within the
+            // server's own grace period; abort only if it overruns that.
+            shutdown.send_replace(true);
+            if tokio::time::timeout(ADMIN_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        })
+    }
+}
+
+/// Upper bound on the admin server's graceful stop at process exit.
+const ADMIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+async fn spawn_admin(
+    address: Option<SocketAddr>,
+    hooks: control_admin::AdminHooks,
+    tls: control_admin::TlsConfigSource,
+) -> Result<Option<(Arc<control_admin::AdminApp>, AdminTask)>, String> {
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("bind admin endpoint {address}: {error}"))?;
+    let app = Arc::new(control_admin::AdminApp::new(
+        hooks,
+        control_admin::HealthState::new(),
+    ));
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(control_admin::serve(
+        listener,
+        control_admin::full_router(Arc::clone(&app)),
+        control_admin::plaintext_router(Arc::clone(&app)),
+        tls,
+        shutdown_rx,
+        control_admin::ServeOptions::default(),
+    ));
+    Ok(Some((app, AdminTask { task, shutdown })))
+}
+
+/// Process-state accessors behind the admin handlers. Every closure reads
+/// live state on each request; none retains a payload.
+fn admin_hooks(
+    in_process: &Arc<InProcessControlRuntime>,
+    config: &ConfigModuleHandle,
+    serving: &DataplaneServingHandle,
+    registry: &Arc<MetricsRegistry>,
+) -> control_admin::AdminHooks {
+    let lifecycle = in_process.handle();
+    let health_config = config.clone();
+    let health_serving = serving.clone();
+    let status_serving = serving.clone();
+    let registry = Arc::clone(registry);
+    control_admin::AdminHooks {
+        health_inputs: Arc::new(move || control_admin::HealthInputs {
+            // Go `PreClose` sets closing when the drain begins.
+            closing: !matches!(
+                lifecycle.lifecycle().phase,
+                LifecyclePhase::Starting | LifecyclePhase::Ready
+            ),
+            namespaces_ready: health_config.is_ready(),
+            applied_generation: health_serving.status().applied_generation,
+            config_checksum: health_config.source().current().config_checksum(),
+        }),
+        metrics_text: Arc::new(move || registry.render_prometheus_text()),
+        dataplane_status: Arc::new(move || dataplane_status(&status_serving.status())),
+    }
+}
+
+/// Reads the server-HTTP TLS identity retained by the current accepted config
+/// generation, the same source the metric owner endpoint uses.
+fn admin_tls_source(
+    source: control_config::ConfigNamespaceStore,
+) -> control_admin::TlsConfigSource {
+    Arc::new(move || {
+        source
+            .current()
+            .prepared()
+            .downcast_ref::<topology_composition::PreparedProcessSet>()
+            .and_then(topology_composition::PreparedProcessSet::server_http_tls)
+    })
+}
+
+/// Projects the Rust-owned generation counters onto the Go
+/// `/api/dataplane/status` shape. There is no transport hop in-process, so
+/// desired and sent are both the latest composed generation.
+fn dataplane_status(status: &GenerationStatusSnapshot) -> control_admin::DataplaneStatus {
+    let composed = status.composition_generation.max(status.applied_generation);
+    let last_result_code = if status.rejected_generation > status.applied_generation {
+        "ERROR_CODE_INVALID_SNAPSHOT"
+    } else if status.applied_generation > 0 {
+        "ERROR_CODE_OK"
+    } else {
+        "ERROR_CODE_UNSPECIFIED"
+    };
+    control_admin::DataplaneStatus {
+        enabled: true,
+        desired_generation: composed,
+        sent_generation: composed,
+        applied_generation: status.applied_generation,
+        rejected_generation: status.rejected_generation,
+        last_result_code: last_result_code.to_owned(),
+        detail: String::new(),
+        last_good_age_ms: status
+            .last_good_age
+            .map_or(0, |age| i64::try_from(age.as_millis()).unwrap_or(i64::MAX)),
+    }
+}
+
 async fn spawn_metrics_http(
     address: Option<SocketAddr>,
     registry: Arc<MetricsRegistry>,
@@ -1347,6 +1516,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut drain_grace = None;
     let mut health_port: u16 = 0;
     let mut metrics_addr: Option<SocketAddr> = None;
+    let mut admin_addr: Option<SocketAddr> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut routing_shadow_socket = None;
     while let Some(argument) = arguments.next() {
@@ -1402,6 +1572,16 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                         format!("metrics address must be host:port, got {value:?}")
                     })?);
             }
+            "--admin-addr" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--admin-addr requires host:port".to_owned())?;
+                admin_addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("admin address must be host:port, got {value:?}"))?,
+                );
+            }
             "--log-file" => {
                 log_file = Some(PathBuf::from(
                     arguments
@@ -1444,7 +1624,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     if log_file.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err("log file path must be absolute".to_owned());
     }
-    Ok(Command::Run(Options {
+    Ok(Command::Run(Box::new(Options {
         config_file: config_file
             .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
         control_socket,
@@ -1455,8 +1635,9 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         drain_grace,
         health_port,
         metrics_addr,
+        admin_addr,
         log_file,
-    }))
+    })))
 }
 
 fn parse_uid(value: &str) -> Result<u32, String> {
@@ -1491,9 +1672,10 @@ mod tests {
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
 
     use super::{
-        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
-        config_persistence_client, join_modules_with_timeout, parse_options, persistence_options,
-        session_loop_config, version_output, wait_module_ready,
+        Command, GenerationStatusSnapshot, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS,
+        Options, StartupGuard, config_persistence_client, dataplane_status,
+        join_modules_with_timeout, parse_options, persistence_options, session_loop_config,
+        version_output, wait_module_ready,
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
@@ -1866,6 +2048,7 @@ mod tests {
             health_task,
             metrics_http_task: _,
             log_reload_task: _,
+            admin_task: _,
             routing_shadow,
         } = guard.commit();
         // Tearing the transferred handles down proves they were moved out of the
@@ -2078,7 +2261,7 @@ mod tests {
             unreachable!("valid operational arguments")
         };
         assert_eq!(
-            options,
+            *options,
             Options {
                 routing_shadow_socket: None,
                 config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
@@ -2088,6 +2271,7 @@ mod tests {
                 drain_grace: None,
                 health_port: 0,
                 metrics_addr: None,
+                admin_addr: None,
                 log_file: None,
             }
         );
@@ -2147,6 +2331,7 @@ mod tests {
             drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
             metrics_addr: None,
+            admin_addr: None,
             log_file: None,
         };
         let source = ConfigNamespaceStore::from_toml(
@@ -2293,6 +2478,65 @@ pd-addrs = "routing-pd:2379"
                 "not-a-port".to_owned(),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_admin_addr() {
+        let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--admin-addr".to_owned(),
+            "127.0.0.1:3082".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.admin_addr,
+            "127.0.0.1:3082".parse::<SocketAddr>().ok(),
+            "the admin address is a plain socket address"
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--admin-addr".to_owned(),
+                "3082".to_owned(),
+            ])
+            .is_err(),
+            "a bare port is not an address"
+        );
+    }
+
+    #[test]
+    fn dataplane_status_projection_follows_the_go_shape() {
+        let mut status = GenerationStatusSnapshot {
+            applied_generation: 3,
+            rejected_generation: 0,
+            composition_generation: 4,
+            last_good_age: Some(Duration::from_millis(1500)),
+            ..Default::default()
+        };
+        let projected = dataplane_status(&status);
+        assert_eq!(
+            projected.to_json(),
+            "{\"applied_generation\":3,\"desired_generation\":4,\"detail\":\"\",\"enabled\":true,\"last_good_age_ms\":1500,\"last_result_code\":\"ERROR_CODE_OK\",\"rejected_generation\":0,\"sent_generation\":4}"
+        );
+        status.rejected_generation = 5;
+        assert_eq!(
+            dataplane_status(&status).last_result_code,
+            "ERROR_CODE_INVALID_SNAPSHOT"
+        );
+        assert_eq!(
+            dataplane_status(&GenerationStatusSnapshot::default()).last_result_code,
+            "ERROR_CODE_UNSPECIFIED"
         );
     }
 

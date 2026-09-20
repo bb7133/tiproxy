@@ -12,6 +12,7 @@ build = "build.rs"
 default = []
 
 [dependencies]
+control-admin.workspace = true
 control-config.workspace = true
 control-etcd.workspace = true
 control-external.workspace = true

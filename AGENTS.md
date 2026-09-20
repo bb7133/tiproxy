@@ -87,6 +87,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `rust/crates/control-topology/src/api_replay.rs` - Test-feature-only whole observer result input through existing publishers; never seeds router state or runs in the production binary.
 - `rust/crates/control-topology/src/metrics/` - Bounded query/history data core for staged backend resource metrics; runtime source/election authority is supplied separately by the collector.
 - `rust/crates/control-plane/` - Process-local Rust control-domain types, ownership fencing, config/TLS views, lifecycle/shutdown, and bounded observability; it must not depend on `control-proto`.
+- `rust/crates/control-admin/` - Rust management plane (CP-ADMIN #150): the Go `pkg/server/api` HTTP surface, middleware order, TLS/plaintext split and health semantics on `--admin-addr`; process state arrives through hooks, never payloads.
 - `rust/crates/control-external/` - Fenced, bounded Rust clients for control-plane external dependencies plus the minimal diagnostics gRPC binding; generated etcd protobuf types stay private to `etcd-client`.
 - `rust/crates/control-etcd/` - Stateful PD-etcd lease, session, election, resumable-watch, and transaction ownership fenced by the Rust process generation.
 - `rust/crates/dataplane/` - Rust dataplane orchestration across wire, transport, session, and control components.
@@ -95,6 +96,7 @@ When adding or modifying features, prefer extending existing packages before cre
 - `tests/compatibility/` - Versioned client-driver and MySQL capability contract shared by the Go/Rust dataplane integration tests.
 - `tests/controlplane/cproute/api-differential/` - One test-only external router API input/output runner and its frozen acceptance/retirement inventories; synthetic adapter smoke does not qualify recorded-trace acceptance. Its `metrics/` package shares value-only query packets and decoding between recording and API replay; it owns no factor state. Its `clock/` package supplies the shared public event clock to test-build overlays only.
 - `tests/controlplane/` - Versioned Go control-plane contract and fault catalogs plus the payload-free observation comparator used by every Rust control-plane migration slice.
+- `tests/controlplane/cpadmin/` - Go gin engine (api package capture test with its unit-test mocks) vs Rust `control-admin` router on one request script, plus Go/Rust config-checksum scenarios; declared divergences are listed in `docs/design/rust-control-admin.md` and fail closed when they stop differing.
 - `tests/controlplane/cplog/` - Go lumberjack oracle and TZ-parameterized harness that pins the Rust log-rotation retention (local-time names, UTC age parse) to the Go logger.
 - `tests/dataplane/metrics/` - Recorded Rust metrics batches plus the Go `promhttp` oracle that pins the Rust native `/metrics` exposition to the Go output for the same series.
 - `tests/dataplane/corpus/` - Deterministic, language-neutral Go dataplane protocol corpus.

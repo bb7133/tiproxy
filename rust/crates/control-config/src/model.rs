@@ -878,6 +878,13 @@ impl EffectiveConfig {
         Ok(normalized)
     }
 
+    /// CRC32-IEEE over the Go-encoded TOML, the value Go's `ConfigManager`
+    /// reports as the config checksum. CP-ADMIN serves it from `/api/debug/health`.
+    #[must_use]
+    pub fn go_checksum(&self) -> u32 {
+        crc32fast::hash(self.encode_go_toml().as_bytes())
+    }
+
     /// Encodes the exact byte representation used by Go's `BurntSushi` TOML
     /// encoder before `ConfigManager` computes its CRC32 checksum.
     #[allow(clippy::too_many_lines)]

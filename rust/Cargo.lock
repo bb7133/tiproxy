@@ -328,6 +328,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-admin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "control-config",
+ "control-plane",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+]
+
+[[package]]
 name = "control-config"
 version = "0.1.0"
 dependencies = [
@@ -2164,6 +2184,7 @@ dependencies = [
 name = "tiproxy-rs"
 version = "0.1.0"
 dependencies = [
+ "control-admin",
  "control-config",
  "control-etcd",
  "control-external",

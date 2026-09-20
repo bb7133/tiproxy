@@ -37,7 +37,7 @@ const IO_DEADLINE: Duration = Duration::from_secs(2);
 /// Largest request head accepted; scrapers send a few hundred bytes.
 const MAX_REQUEST_HEAD: usize = 4 * 1024;
 /// Exposition content type expected by Prometheus for the text format.
-const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8; escaping=underscores";
 
 /// Outcome of reading one request head.
 #[derive(Debug, PartialEq, Eq)]

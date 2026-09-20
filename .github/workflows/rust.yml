@@ -110,6 +110,8 @@ jobs:
         run: make dataplane-metrics-parity
       - name: Check log rotation retention against the Go lumberjack writer
         run: make controlplane-cplog-evidence
+      - name: Check the admin API and config checksum against the Go server
+        run: make controlplane-cpadmin-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
