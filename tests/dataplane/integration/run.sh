@@ -163,14 +163,17 @@ PYT4PROCESSFINAL
 finalize() {
 	local status=$?
 	local cleanup_status=0
+	local audit_output
 	trap - EXIT
 	set +e
 	record_t4_process harness finalizer 0 0
 	close_t4_process_lineage
 	if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && -n ${T3_DROP_PID:-} ]]; then
+		audit_output="$run_dir/t4-route-audit-final.json"
+		[[ ! -f $audit_output ]] || audit_output="$run_dir/t4-route-audit-cleanup.json"
 		curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:${T3_DROP_ADMIN_PORT:-0}/state" \
-			-o "$run_dir/t4-route-audit-final.json" || true
+			-o "$audit_output" || true
 	fi
 	# Preserve the keyspace/redirect tap as well when a T4 row fails before
 	# its normal final audit.  In particular, a peer metering fatal can stop
@@ -179,13 +182,22 @@ finalize() {
 	# earlier phase snapshot.
 	if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 &&
 		-n ${KA_DROP_PID:-} ]] && kill -0 "$KA_DROP_PID" 2>/dev/null; then
+		audit_output="$run_dir/t4-route-audit-ka-final.json"
+		[[ ! -f $audit_output ]] || audit_output="$run_dir/t4-route-audit-ka-cleanup.json"
 		curl --noproxy '*' --fail --silent --max-time 5 \
 			"http://127.0.0.1:${ka_drop_admin_port:-0}/state" \
-			-o "$run_dir/t4-route-audit-ka-final.json" || true
+			-o "$audit_output" || true
 	fi
 	"$script_dir/collect-diagnostics.sh" "$run_dir" "$tag"
 	"$script_dir/cleanup.sh" "$run_dir" "$tag"
 	cleanup_status=$?
+	# The producer WAL lives beside its external socket, outside run_dir.
+	# Preserve it after owned cleanup, so a tap ACK can be checked against
+	# durable producer state without copying a file still being updated.
+	if [[ $cleanup_status == 0 && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 &&
+		-n ${ka_rust_control_socket:-} && -f ${ka_rust_control_socket}.metering.wal ]]; then
+		cp "${ka_rust_control_socket}.metering.wal" "$run_dir/ka-producer-final.wal" || cleanup_status=1
+	fi
 	set -e
 	if ((status == 0 && cleanup_status != 0)); then
 		status=$cleanup_status
@@ -596,6 +608,17 @@ if state.get("connect_count", 0) < 1 or state.get("forwarded", 0) < 1:
 producer = next(iter(fingerprints), "none")
 print(f"T4 route tap {path.name}: zero retired route state, zero spontaneous fatal protocol errors, producer={producer[:12]}")
 PYT4AUDIT
+}
+
+capture_t4_final_audit() {
+	local url=${1:?missing tap URL} evidence=${2:?missing audit output}
+	if [[ ${DATAPLANE_T4_ROW:-} == M9 ]]; then
+		# M9 has its own multi-restart oracle; keep that contract unchanged.
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 "$url" -o "$evidence"
+	else
+		python3 "$script_dir/write-t4-row-receipt.py" --capture-url "$url" --output "$evidence"
+	fi
+	validate_t4_route_audit "$evidence"
 }
 
 if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ]]; then
@@ -3797,10 +3820,8 @@ PYM9RECEIPT
 		echo "T4 keyspace/redirect route tap is not alive at final audit" >&2
 		exit 1
 	fi
-	curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-		"http://127.0.0.1:$ka_drop_admin_port/state" \
-		-o "$run_dir/t4-route-audit-ka-final.json"
-	validate_t4_route_audit "$run_dir/t4-route-audit-ka-final.json"
+	capture_t4_final_audit "http://127.0.0.1:$ka_drop_admin_port/state" \
+		"$run_dir/t4-route-audit-ka-final.json"
 fi
 if [[ $mode == rust ]]; then
 	kill -s INT "$KA_RUST_PID" 2>/dev/null || true
@@ -4114,10 +4135,8 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ]]; then
 		echo "T4 full-run route tap is not alive at the final audit" >&2
 		exit 1
 	fi
-	curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-		"http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" \
-		-o "$run_dir/t4-route-audit-final.json"
-	validate_t4_route_audit "$run_dir/t4-route-audit-final.json"
+	capture_t4_final_audit "http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" \
+		"$run_dir/t4-route-audit-final.json"
 	if [[ ${DATAPLANE_T4_ROW:-} != M9 ]]; then
 		# The evidence writer validates the already-completed cell from its
 		# immutable ledgers, route audits, phase receipts, lineage, and the

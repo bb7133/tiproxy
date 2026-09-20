@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +113,10 @@ def validate_ledger(path: Path) -> dict[str, Any]:
     }
 
 
+class PendingMeteringAck(ValueError):
+    """An otherwise valid live snapshot has a suffix of unacknowledged batches."""
+
+
 def validate_route_audit(path: Path) -> dict[str, Any]:
     state = load_json(path)
     audit = state.get("route_audit")
@@ -136,8 +142,6 @@ def validate_route_audit(path: Path) -> dict[str, Any]:
     acknowledgement_sequences = [event.get("sequence") for event in acknowledgements]
     if not batch_sequences or batch_sequences != list(range(1, len(batch_sequences) + 1)):
         raise ValueError(f"{path.name} metering batch sequence is not contiguous")
-    if acknowledgement_sequences != batch_sequences:
-        raise ValueError(f"{path.name} metering acknowledgements do not conserve batches")
     if (
         audit.get("metering_batches") != len(batches)
         or audit.get("metering_acks") != len(acknowledgements)
@@ -155,6 +159,13 @@ def validate_route_audit(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path.name} was not on the live control path")
     if state.get("armed") is not False or state.get("held") is not False:
         raise ValueError(f"{path.name} retained a control fault at row completion")
+    if acknowledgement_sequences != batch_sequences:
+        error = f"{path.name} metering acknowledgements do not conserve batches"
+        if acknowledgement_sequences == batch_sequences[:len(acknowledgements)]:
+            # Only a missing suffix may settle while the live tap keeps recording.
+            # The receipt writer still rejects it; only the capture loop retries.
+            raise PendingMeteringAck(error)
+        raise ValueError(error)
     return {
         "legacy_body_counts": legacy,
         "protocol_errors": 0,
@@ -166,6 +177,53 @@ def validate_route_audit(path: Path) -> dict[str, Any]:
         "connect_count": state["connect_count"],
         "forwarded": state["forwarded"],
     }
+
+
+def capture_route_audit(url: str, output: Path, *, timeout: float = 5.0,
+                        fetch=None, clock=time.monotonic, sleep=time.sleep) -> None:
+    """Capture a conserved M1-M8 audit before either control peer is stopped.
+
+    This is a live sampling barrier, not a failed-cell rerun. Keep the first
+    sample even when its in-flight ACK arrives later. Protocol/identity/counter
+    failures are terminal; a permanently missing ACK fails at the deadline.
+    """
+    first = output.with_name(output.stem + "-first.json")
+    if output.exists() or first.exists():
+        raise ValueError(f"refusing to overwrite audit capture: {output.name}")
+    if fetch is None:
+        def fetch(remaining):
+            return subprocess.run(
+                ["curl", "--noproxy", "*", "--fail", "--silent", "--show-error",
+                 "--max-time", str(min(1.0, remaining)), url],
+                check=True, stdout=subprocess.PIPE, timeout=remaining,
+            ).stdout
+
+    deadline = clock() + timeout
+    previous_events = []
+    samples = 0
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise ValueError(f"{output.name} ACK conservation timed out after {timeout}s")
+        raw = fetch(remaining)
+        output.write_bytes(raw)
+        samples += 1
+        if samples == 1:
+            first.write_bytes(raw)
+        if clock() >= deadline:
+            raise ValueError(f"{output.name} audit capture exceeded {timeout}s")
+        events = load_json(output).get("route_audit", {}).get("metering_events", [])
+        if events[:len(previous_events)] != previous_events:
+            raise ValueError(f"{output.name} audit history changed while waiting for ACK")
+        previous_events = events
+        try:
+            result = validate_route_audit(output)
+        except PendingMeteringAck:
+            sleep(min(0.1, max(0.0, deadline - clock())))
+            continue
+        print(f"T4 route tap {output.name}: conserved {result['metering_batches']} "
+              f"batches/ACKs after {samples} sample(s); initial snapshot retained")
+        return
 
 
 def validate_phases(path: Path) -> list[str]:
@@ -409,13 +467,22 @@ def write_receipt(run: Path, row: str, variant: str) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", required=True, type=Path)
-    parser.add_argument("--row", required=True)
-    parser.add_argument("--variant", required=True)
+    parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--row")
+    parser.add_argument("--variant")
+    parser.add_argument("--capture-url", help="capture a live M1-M8 final route audit")
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
+        if args.capture_url:
+            if args.output is None or any((args.run_dir, args.row, args.variant)):
+                parser.error("--capture-url requires --output and no row arguments")
+            capture_route_audit(args.capture_url, args.output)
+            return 0
+        if not all((args.run_dir, args.row, args.variant)) or args.output:
+            parser.error("receipt mode requires --run-dir, --row and --variant")
         output = write_receipt(args.run_dir, args.row, args.variant)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f"T4 row receipt refused: {error}\n")
     print(output)
     return 0

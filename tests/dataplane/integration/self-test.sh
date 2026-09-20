@@ -229,6 +229,8 @@ for row_number in range(1, 9):
     # Preserve one lineage fixture per row for that loop below.
     (root / f"lineage-{row}.json").write_text((root / "t4-process-lineage.json").read_text())
 PYT4RECEIPTFIXTURE
+PYTHONDONTWRITEBYTECODE=1 python3 "$script_dir/test-t4-route-audit.py" \
+	"$receipt_dir/t4-route-audit-ka-final.json"
 for row in M1 M2 M3 M4 M5 M6 M7 M8; do
 	cp "$receipt_dir/lineage-$row.json" "$receipt_dir/t4-process-lineage.json"
 	python3 "$script_dir/write-t4-row-receipt.py" \
