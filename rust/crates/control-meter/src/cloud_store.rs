@@ -18,7 +18,7 @@ use std::fmt;
 use std::time::Duration;
 
 use control_config::MeteringConfig;
-use http::{Method, Request, StatusCode, request::Parts};
+use http::{Method, StatusCode};
 use reqsign_core::Context;
 use reqwest::{Client, Url};
 
@@ -28,7 +28,7 @@ use crate::export::{MaintenanceFuture, ObjectStore, UploadFuture};
 
 /// Signed cloud storage transport. No credentials are included in debug output.
 pub struct CloudStore {
-    client: Client,
+    context: Context,
     endpoint: Url,
     prefix: String,
     signer: CloudSigner,
@@ -83,6 +83,7 @@ impl CloudStore {
         if config.bucket.is_empty() {
             return Err(Error::Invalid("cloud bucket is required"));
         }
+        let request_context = context.clone();
         let (endpoint, signer) = match config.provider_type.as_str() {
             "s3" => s3(config, context).await?,
             "oss" => oss(config, context)?,
@@ -95,7 +96,7 @@ impl CloudStore {
             _ => return Err(Error::Invalid("unsupported cloud provider")),
         };
         Ok(Self {
-            client,
+            context: request_context,
             endpoint,
             prefix: config.prefix.clone(),
             signer,
@@ -113,6 +114,17 @@ impl CloudStore {
             )
         };
         let mut url = self.endpoint.clone();
+        if matches!(self.signer, CloudSigner::Azure(_)) {
+            if key.split('/').any(|s| matches!(s, "." | "..")) {
+                return Err(Error::Invalid("cloud object contains dot path segment"));
+            }
+            url.set_path(&format!(
+                "{}/{}",
+                self.endpoint.path().trim_end_matches('/'),
+                crate::cloud_azure::escape_key(&key)
+            ));
+            return Ok(url);
+        }
         if matches!(self.signer, CloudSigner::Oss(_)) {
             let mut encoded = Vec::new();
             for segment in key.split('/') {
@@ -164,30 +176,12 @@ impl CloudStore {
                 .await
                 .map_err(|_| Error::Export("OSS object request failed"));
         }
-        let mut parts = Request::builder()
-            .method(method)
-            .uri(url.as_str())
-            .header(http::header::CONTENT_LENGTH, body.len())
-            .body(())
-            .map_err(|_| Error::Export("invalid cloud request"))?
-            .into_parts()
-            .0;
         if let CloudSigner::Azure(signer) = &self.signer {
-            signer.sign(&mut parts).await?;
-            return self.send(parts, body).await;
+            return signer
+                .request(&self.context, method, url, body.into())
+                .await;
         }
         Err(Error::Export("invalid cloud signer dispatch"))
-    }
-
-    async fn send(&self, parts: Parts, body: Vec<u8>) -> Result<StatusCode, Error> {
-        self.client
-            .request(parts.method, parts.uri.to_string())
-            .headers(parts.headers)
-            .body(body)
-            .send()
-            .await
-            .map(|response| response.status())
-            .map_err(|_| Error::Export("cloud request failed"))
     }
 }
 
@@ -395,6 +389,7 @@ fn cos(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSigner), 
 mod tests {
     use super::*;
     use control_config::{AwsMeteringConfig, AzureMeteringConfig, CloudMeteringConfig};
+    use http::Request;
     use reqsign_core::StaticEnv;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -649,23 +644,22 @@ mod tests {
             let store = CloudStore::with_context(&config, client, ctx)
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
-            let server = tokio::spawn(serve(listener, vec![404, 201]));
+            let server = tokio::spawn(serve(listener, vec![503, 404, 503, 201]));
             store
                 .put_new("metering/ru/60/key.json.gz", vec![1, 2, 3])
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
             let rows = server.await.unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(rows.len(), 4);
             for (i, (head, body)) in rows.iter().enumerate() {
-                assert!(
-                    head.contains(
-                        "/account/bucket/prefix%20space/%25text/metering/ru/60/key.json.gz"
-                    )
-                );
+                assert!(head.contains(
+                    "/account/bucket/prefix%20space%2F%25text%2Fmetering%2Fru%2F60%2Fkey.json.gz"
+                ));
                 assert!(head.contains("x-ms-version: 2025-11-05"));
                 assert_eq!(head.contains("authorization: SharedKey account:"), !sas);
                 assert_eq!(head.contains("?sv=2025-11-05&sig=fake%2Bsignature"), sas);
-                assert_eq!(head.contains("x-ms-blob-type: BlockBlob"), i == 1);
-                assert_eq!(body.as_slice(), if i == 0 { &[] } else { &[1, 2, 3][..] });
+                assert_eq!(head.contains("x-ms-blob-type: BlockBlob"), i >= 2);
+                assert_eq!(body.as_slice(), if i < 2 { &[] } else { &[1, 2, 3][..] });
             }
         }
     }

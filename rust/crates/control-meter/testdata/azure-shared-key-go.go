@@ -16,7 +16,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -50,6 +52,8 @@ func (t *transport) Do(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
 }
 func main() {
+	// Fixed entropy is confined to this fake-credential signature probe.
+	rand.Reader = bytes.NewReader(bytes.Repeat([]byte{0x42}, 4096))
 	key := base64.StdEncoding.EncodeToString([]byte("fake-account-key"))
 	credential, err := azblob.NewSharedKeyCredential("account", key)
 	if err != nil {
@@ -65,6 +69,11 @@ func main() {
 		panic(err)
 	}
 	_, err = client.UploadBuffer(context.Background(), "bucket", "prefix space/%text/key.json.gz", []byte("payload"), nil)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = client.ServiceClient().NewContainerClient("bucket").NewBlockBlobClient("prefix space/%text/key.json.gz").UploadStream(context.Background(), bytes.NewReader(bytes.Repeat([]byte{'p'}, 1048577)), nil)
 	if err != nil {
 		panic(err)
 	}

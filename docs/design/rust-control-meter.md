@@ -488,10 +488,39 @@ fixture from the repository root with:
 go run rust/crates/control-meter/testdata/cos-sts-go.go
 ```
 
-Azure SharedKey signatures match actual HEAD/PUT requests from the pinned Go
-azblob SDK. This proves signature canonicalization; Azure treats the Go SDK
-URL escaped blob separators and Rust literal separators as the same blob.
-SharedKey takes precedence over SAS; SAS query strings survive
+Azure object requests follow the production provider's azblob v1.6.3
+`UploadStream` path. Bodies below 1 MiB use a direct PUT, including empty bodies;
+bodies at or above 1 MiB stage sequential 1 MiB blocks and commit their ordered
+XML block list. Each upload uses fresh UUID-based 64-byte block identifiers;
+retries preserve the same identifier and bytes. The content types, block type
+header and Go-escaped entire blob name match the actual wire requests.
+
+Each HEAD, direct PUT, StageBlock and CommitBlockList has four attempts for
+408/429/500/502/503/504 and transport errors, with fresh signatures. Backoff uses
+the pinned exponential jitter. Retry-After milliseconds/seconds/date precedence
+matches azcore; a server delay above 60 seconds stops retries. Exists maps the
+final 404 or exact BlobNotFound/ResourceNotFound/ContainerNotFound header to
+absence. HEAD must otherwise return 200 and upload operations 201. Success
+metadata date, boolean, integer and base64 decoding errors fail after the retry
+policy, without retrying a successful HTTP response. These checks decode the
+server CRC header; the SDK default does not compare its CRC to the payload.
+
+Ninety-five actual production-provider loopback HTTP cases compare full request
+trajectories, block identity/order, commit XML, payload lengths/hashes, headers,
+SAS preservation and Exists/Upload results. Only the public retry delay option is
+shortened to 1ns; status classification, retry counts and SDK source are unchanged.
+UUID bytes are normalized only for commit XML comparison. Real socket closes
+exercise transport retries. A native CloudStore HTTP test also covers signed
+HEAD 503→404 and PUT 503→201. Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-object-go.sh
+```
+
+Five fixed-time Azure SharedKey signatures match actual HEAD, direct PUT,
+StageBlock and CommitBlockList requests from the pinned Go azblob SDK. This
+proves signature canonicalization, including the stage/commit query parameters
+and headers. SharedKey takes precedence over SAS; SAS query strings survive
 container/prefix/key assembly. A metering-specific transport and bounded command
 executor serve the official Azure identity SDK. Environment secret, encrypted
 PEM/PFX certificate, username/password, workload assertion, managed identity, CLI,
@@ -541,10 +570,11 @@ go run rust/crates/control-meter/testdata/azure-managed-go.go
 go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
-Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including Azure object HEAD/PUT retries and the declared HTTP date
-local-zone edge. Export failure retains the pending window for the next metering
-attempt.
+Full default-credential/endpoint edge parity remains in progress. Azure bearer
+401 challenge handling and unusual RFC1123 named-zone metadata dates are not
+qualified by the SharedKey/SAS object fixtures. The declared general HTTP date,
+endpoint and platform transport edges remain open. Export failure retains the
+pending window for the next metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would
