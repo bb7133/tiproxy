@@ -124,6 +124,28 @@ compare those attempts/outcomes. Regenerate with:
 go run rust/crates/control-meter/testdata/aws-sts-retry-go.go
 ```
 
+STS clock-skew correction follows the pinned STS v1.38.0 client: response
+`Date` adjusts the next attempt within one operation; a new operation starts at
+zero skew. This service version does not wire the core SDK's persistent
+`ClientSkew`. Absent, malformed and transport-failure metadata clear the next
+attempt's offset. AssumeRole re-signs at the corrected time; WebIdentity remains
+unsigned. The three definite clock-error codes retry unconditionally, while
+`InvalidSignatureException`, `SignatureDoesNotMatch` and `AuthFailure` require
+the previous attempt's positive skew to exceed four minutes.
+
+Sixty-four actual Go service trajectories cover both operations and legacy/2026
+retry behavior, the threshold, negative correction, missing dates and repeated
+operations. Twenty-three Smithy date observations cover IMF-fixdate, RFC850,
+ANSIC and malformed inputs; two fixed-time Go signatures compare authorization
+bytes for plain and custom path/query endpoints. Native signing reuses reqsign's
+canonicalization and HMAC helpers. The date parser treats RFC850 named zones as
+UTC, matching the fixture's `TZ=UTC`; recognition of a non-GMT zone from the host's
+local timezone remains a declared edge difference. Regenerate with:
+
+```sh
+rust/crates/control-meter/testdata/aws-sts-clock-go.sh
+```
+
 AWS SSO uses a native adapter for both legacy cached-token profiles and modern
 `sso-session` profiles. It validates the same required fields and session/profile
 consistency at construction, hashes the start URL or session name for the cache
@@ -420,8 +442,8 @@ go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
 Full default-credential/endpoint edge parity remains in progress. Provider retry-policy and default-chain edge comparisons remain
-open, including cloud object HEAD/PUT retries and STS clock-skew
-correction. Export failure retains the pending window for the next metering
+open, including cloud object HEAD/PUT retries and the declared HTTP date
+local-zone edge. Export failure retains the pending window for the next metering
 attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,

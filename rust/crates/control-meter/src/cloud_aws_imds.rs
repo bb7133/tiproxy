@@ -472,11 +472,18 @@ mod tests {
     }
     fn assert_expiration(value: Option<Timestamp>, expected: &str, name: &str) {
         let value = value.unwrap_or_else(|| unreachable!("{name} lacks expiry"));
-        let seconds = value.as_second() - Timestamp::now().as_second();
+        let now = Timestamp::now();
+        let seconds = value.as_second() - now.as_second();
         match expected {
             "NOW_PLUS_3600" => assert!((3590..=3600).contains(&seconds), "{name}: {seconds}"),
             "EXTENDED_5_TO_15_MINUTES" => {
-                assert!((299..900).contains(&seconds), "{name}: {seconds}");
+                // Compare complete timestamps: flooring each to seconds can turn
+                // an actual 899.x-second extension into a difference of 900.
+                assert!(
+                    value >= now + Duration::from_secs(299)
+                        && value < now + Duration::from_secs(900),
+                    "{name}: {value} vs {now}"
+                );
             }
             _ => assert_eq!(value.to_string(), expected, "{name}"),
         }

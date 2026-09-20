@@ -355,15 +355,18 @@ impl WebIdentity {
                 encoded.query().ok_or_else(failed)?.to_owned(),
             ))
             .map_err(|_| failed())?;
+        let clock = crate::cloud_aws_clock::Skew::default();
         self.retry
             .run(|| async {
                 use crate::cloud_aws_retry::Failure;
+                let skew = clock.take();
                 let response = ctx
                     .http_send(request.clone())
                     .await
                     .map_err(Failure::transport)?;
+                clock.observe(&response);
                 if response.status() != http::StatusCode::OK {
-                    return Err(Failure::sts(&response, true));
+                    return Err(Failure::sts(&response, true, skew));
                 }
                 decode_web(response.body()).map_err(Failure::terminal)
             })
@@ -1067,3 +1070,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_aws_clock_tests.rs"]
+mod clock_tests;

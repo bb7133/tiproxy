@@ -19,6 +19,7 @@
 
 mod cloud_aws;
 mod cloud_aws_adaptive;
+mod cloud_aws_clock;
 mod cloud_aws_container;
 mod cloud_aws_identity;
 mod cloud_aws_imds;

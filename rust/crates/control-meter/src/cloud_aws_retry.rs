@@ -96,7 +96,7 @@ impl Failure {
         failure.retry_after = retry_after(response);
         failure
     }
-    pub(crate) fn sts(response: &http::Response<bytes::Bytes>, web: bool) -> Self {
+    pub(crate) fn sts(response: &http::Response<bytes::Bytes>, web: bool, skew: i64) -> Self {
         #[derive(Default, Deserialize)]
         struct Envelope {
             #[serde(rename = "Error", default)]
@@ -116,7 +116,16 @@ impl Failure {
         failure.error = reqsign_core::Error::credential_invalid("AWS STS request failed");
         failure.status = Some(response.status().as_u16());
         failure.retryable |= matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
-            || (web && code.eq_ignore_ascii_case("InvalidIdentityToken"));
+            || (web && code.eq_ignore_ascii_case("InvalidIdentityToken"))
+            || matches!(
+                code.as_str(),
+                "RequestExpired" | "RequestInTheFuture" | "RequestTimeTooSkewed"
+            )
+            || (skew > 240_000_000_000
+                && matches!(
+                    code.as_str(),
+                    "InvalidSignatureException" | "SignatureDoesNotMatch" | "AuthFailure"
+                ));
         failure.retry_after = retry_after(response);
         failure
     }

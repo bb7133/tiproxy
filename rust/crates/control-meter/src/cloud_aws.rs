@@ -176,21 +176,28 @@ pub(crate) async fn assume_role(
     };
     let _operation = AssumeRoleOperation::new(authority, &grant, Some(role.duration))?;
     source.expires_in = None;
+    let clock = crate::cloud_aws_clock::Skew::default();
     retry
         .run(|| async {
+            // The pinned STS client starts each operation with zero skew.
+            let skew = clock.take();
             // Sign each attempt anew, keeping the session/body fixed per Retrieve.
             let request = role_request(&endpoint, role).map_err(Failure::terminal)?;
             let (mut parts, body) = request.into_parts();
-            RequestSigner::new("sts", region)
-                .sign_request(context, &mut parts, Some(&source), None)
-                .await
-                .map_err(Failure::terminal)?;
+            crate::cloud_aws_clock::sign_at(
+                &mut parts,
+                &source,
+                region,
+                crate::cloud_aws_clock::signing_time(skew),
+            )
+            .map_err(Failure::terminal)?;
             let response = context
                 .http_send(Request::from_parts(parts, body))
                 .await
                 .map_err(Failure::transport)?;
+            clock.observe(&response);
             if response.status() != http::StatusCode::OK {
-                return Err(Failure::sts(&response, false));
+                return Err(Failure::sts(&response, false, skew));
             }
             decode_role(response.body()).map_err(Failure::terminal)
         })
