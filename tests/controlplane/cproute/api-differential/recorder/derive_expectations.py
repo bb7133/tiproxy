@@ -219,8 +219,9 @@ class Session:
 
 
 class State:
-    def __init__(self, config, provenance=None):
+    def __init__(self, config, provenance=None, engine="go"):
         provenance = provenance or {}
+        self.engine = engine  # the recording's engine: raw effects validate under its contract
         # Preserve the conservative flag on older recorded traces. New whole
         # publications below also mark actual data directly from public inputs;
         # removable provenance cannot hide their replay dependency.
@@ -248,7 +249,7 @@ class State:
         self.unique_history = True
         self.requires = set()
         self.retained_version = ""
-        self.recorded_connections = _RUNNER.PublicConnections(config)
+        self.recorded_connections = _RUNNER.PublicConnections(config, engine=engine)
         self.group_last_redirect = {}  # only accepted requests advance a group's cadence
         self.ambiguous_group_clocks = set()
         self.redirect_operations = {}  # public accepted operation handles and their settlement
@@ -915,6 +916,27 @@ def derive_tick_effects(state, refused, refuse_next=0):
     return out, refuse_next
 
 
+def declared_close_contracts(state, event, due, refusal_budget):
+    """Resolve the due closes under each declared engine contract.
+
+    The accepted T3 contract keeps the Rust ForceClose FIFO quiet for a bounded
+    cooldown after a refusal while the Go worker retries on the next due tick.
+    Both are computed from the same public connection model; when they differ
+    the retry is engine-relative, the expectation is published as the public
+    due-backend set, and the engine-aware runner resolves each recording.
+    """
+    connections = state.recorded_connections
+    saved_engine = connections.engine
+    try:
+        connections.engine = "go"
+        go_closes, go_remaining = connections._force_close_effects(event, due, refusal_budget)
+        connections.engine = "rust"
+        rust_closes, rust_remaining = connections._force_close_effects(event, due, refusal_budget)
+    finally:
+        connections.engine = saved_engine
+    return go_closes, rust_closes, go_remaining, rust_remaining
+
+
 def route_once(state, session, excluded):
     """One routeOnce with a concrete excluded identity set. Returns (legal, error)."""
     if state.observer_error is not None:
@@ -1559,8 +1581,16 @@ def set_backend_expectation(expect, targets):
         expect["legal_backends"] = sorted(targets)
 
 
-def derive(trace, rows, args):
-    state = State(trace["config"], trace.get("provenance"))
+def derive(trace, rows, args, engine="go"):
+    """Derive the engine-independent expectation from one engine's recording.
+
+    ``engine`` names the recording's engine ("go" by default, or "rust"). Raw
+    effects and refusal budgets are validated strictly under that engine's
+    declared contract; the published expectation never embeds either history.
+    """
+    if engine not in ("go", "rust"):
+        raise Refuse(f"unknown recording engine {engine!r}")
+    state = State(trace["config"], trace.get("provenance"), engine)
     events = trace["events"]
     if len(rows) != len(events):
         raise Refuse(f"rows {len(rows)} != events {len(events)}")
@@ -1789,14 +1819,23 @@ def derive(trace, rows, args):
                 state.requires.add("effects-v2")
             relative_close = (relative_history
                               and (not migration_possible or relative_model is not None))
+            due = sorted(due_failover_backends(state))
+            go_closes, rust_closes, go_refusal, rust_refusal = declared_close_contracts(state, event, due, refusal_budget)
+            engine_closes, model_refusal = ((rust_closes, rust_refusal) if state.engine == "rust"
+                                            else (go_closes, go_refusal))
+            cooldown_relative = key_effects(go_closes) != key_effects(rust_closes)
+            if cooldown_relative:
+                # Post-refusal retries differ by declared engine contract (T3
+                # cooldown vs Go retry): publish the due set, resolve per engine.
+                relative_close = True
             if relative_close:
                 # The due backend set is defined by public config/health/time.
                 # Each engine resolves its own owners and accepted-close history;
                 # only Go's own rows are used to validate this recording here.
-                due = sorted(due_failover_backends(state))
                 expect["force_close_due"] = due
-                derived, remaining_refusal = state.recorded_connections._force_close_effects(
-                    event, due, refusal_budget)
+                # This recording is validated strictly under its own engine's
+                # contract; the published due set stays engine-independent.
+                derived, remaining_refusal = engine_closes, model_refusal
             else:
                 derived, remaining_refusal = derive_tick_effects(state, refused, refusal_budget)
             if relative_model is not None:
@@ -1804,7 +1843,7 @@ def derive(trace, rows, args):
                 if not any(_RUNNER.causal(recorded) == _RUNNER.causal(candidate) for candidate in alternatives):
                     raise Refuse(f"seq {seq}: effects contradict the engine-relative connection cadence: recorded {recorded}, expected one of {alternatives[:4]}, counts {state.recorded_connections.counts()}, last {state.recorded_connections.group_last_redirect}")
             elif key_effects(leftover) != key_effects(derived):
-                raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the failover-timeout derivation {derived}")
+                raise Refuse(f"seq {seq}: recorded force_close effects {leftover} differ from the {state.engine} failover-timeout derivation {derived}")
             state.refuse_next = remaining_refusal
             if derived and not relative_close:
                 expect["effects"] = derived

@@ -142,6 +142,41 @@ class RelativeCloseTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 8"):
             runner.observe(boundary, late, "rust")   # eligible again at exactly 3s
 
+    def test_derivation_publishes_the_refusal_cooldown_as_engine_relative(self):
+        # Inside the T3 cooldown the two engines legitimately differ. Each
+        # recording is validated strictly under its own engine's contract and
+        # the published expectation is the engine-independent due set.
+        trace, go_rows = example(A)
+        rust_rows = copy.deepcopy(go_rows)
+        rust_rows[7]["effects"] = []
+        rust_rows[8]["effects"] = []
+        derived_go, requires_go = derive.derive(trace, go_rows, None)
+        derived_rust, requires_rust = derive.derive(trace, rust_rows, None, engine="rust")
+        self.assertEqual((requires_go, requires_rust), ([], []))
+        self.assertEqual(derived_go, derived_rust)
+        for i in (7, 8):
+            self.assertEqual(derived_go["events"][i]["expect"].get("force_close_due"), [A])
+            self.assertNotIn("effects", derived_go["events"][i]["expect"])
+        self.assertEqual(derive.compare_with_reference(derived_go, trace, requires_go), ([], []))
+        runner.observe(derived_go, go_rows, "go")
+        runner.observe(derived_go, rust_rows, "rust")
+        # The wrong engine and a mixed history are refused by the deriver
+        # itself; the runner independently rejects them as well.
+        with self.assertRaisesRegex(derive.Refuse, "seq 7: .*rust failover-timeout derivation"):
+            derive.derive(trace, go_rows, None, engine="rust")
+        with self.assertRaisesRegex(derive.Refuse, "seq 7: .*go failover-timeout derivation"):
+            derive.derive(trace, rust_rows, None)
+        mixed = copy.deepcopy(rust_rows)
+        mixed[8]["effects"] = [effect(A, 2, True)]
+        with self.assertRaisesRegex(derive.Refuse, "seq 8: recorded force_close effects"):
+            derive.derive(trace, mixed, None, engine="rust")
+        with self.assertRaisesRegex(derive.Refuse, "seq 7: recorded force_close effects"):
+            derive.derive(trace, mixed, None)
+        with self.assertRaisesRegex(runner.Difference, "EFFECTS: rust event 8"):
+            runner.observe(derived_go, mixed, "rust")
+        with self.assertRaisesRegex(derive.Refuse, "unknown recording engine"):
+            derive.derive(trace, go_rows, None, engine="corrupt")
+
     def test_accepted_close_survives_clear_and_reentry(self):
         live = runner.PublicConnections({"policy":"connection","selection":"random"})
         live.apply({"op":"rehydrate","session":"s"},

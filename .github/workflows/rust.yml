@@ -450,7 +450,7 @@ jobs:
           derivations = []
           for engine in ("go", "rust"):
               rows = json.loads((output / f"{engine}.json").read_text())
-              derived, requires = derive.derive(trace, rows, None)
+              derived, requires = derive.derive(trace, rows, None, engine=engine)
               assert not requires, (engine, requires)
               assert derive.compare_with_reference(derived, trace, requires) == ([], [])
               derive._RUNNER.validate(derived)
@@ -495,7 +495,7 @@ jobs:
               go = json.loads((output / "go.json").read_text())
               rust = json.loads((output / "rust.json").read_text())
               derived, requires = derive.derive(trace, go, None)
-              other, other_requires = derive.derive(trace, rust, None)
+              other, other_requires = derive.derive(trace, rust, None, engine="rust")
               assert not requires and not other_requires, (requires, other_requires)
               assert derived == other
               assert derive.compare_with_reference(derived, trace, requires) == ([], [])
@@ -565,7 +565,7 @@ jobs:
               go = json.loads((output / "go.json").read_text())
               rust = json.loads((output / "rust.json").read_text())
               derived, requires = derive.derive(trace, go, None)
-              other, other_requires = derive.derive(trace, rust, None)
+              other, other_requires = derive.derive(trace, rust, None, engine="rust")
               assert not requires and not other_requires, (requires, other_requires)
               assert derived == other
               assert derive.compare_with_reference(derived, trace, requires) == ([], [])
@@ -594,7 +594,7 @@ jobs:
           for engine in ("go", "rust"):
               rows = json.loads((root / f"{engine}.json").read_text())
               assert [row["backend"] for row in rows if row["op"] == "next"] == ["127.0.0.1:4000", "127.0.0.1:4000", "127.0.0.1:4001"]
-              derived, requires = derive.derive(trace, rows, None)
+              derived, requires = derive.derive(trace, rows, None, engine=engine)
               assert not requires
               derive._RUNNER.validate(derived)
               derive._RUNNER.observe(derived, rows, engine)
