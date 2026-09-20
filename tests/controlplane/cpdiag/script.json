@@ -161,7 +161,6 @@
     "^kernel\\.random\\.(uuid|entropy_avail)$",
     "^kernel\\.pty\\.nr$",
     "^net\\.netfilter\\.nf_conntrack_count$",
-    "^dev\\.cdrom\\.info$",
     "^fs\\.quota\\.syncs$"
   ],
   "server_info_declared": {

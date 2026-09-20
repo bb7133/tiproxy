@@ -20,15 +20,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use std::io::Read;
-
 use super::{CpuInfo, CpuTimes, DiskCounters, Interface, Memory, NicCounters, Partition, Swap};
 
 /// Go `common.ReadLines`: the file split at `\n`, each line without its
 /// leading/trailing `\n`, a final unterminated line kept.
 fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+    let bytes = super::go_read_file(path)?;
     let text = String::from_utf8_lossy(&bytes);
     Ok(text
         .split_inclusive('\n')
@@ -47,7 +44,7 @@ fn sys(rel: &str) -> PathBuf {
 /// gopsutil `load.Avg`: `/proc/loadavg`, else `sysinfo(2)`.
 pub(super) fn load_avg() -> Option<(f64, f64, f64)> {
     let from_file = || -> Option<(f64, f64, f64)> {
-        let content = std::fs::read(proc("loadavg")).ok()?;
+        let content = super::go_read_file(&proc("loadavg")).ok()?;
         let text = String::from_utf8_lossy(&content);
         let mut fields = text.split_whitespace();
         let one_minute = fields.next()?.parse().ok()?;

@@ -171,6 +171,44 @@ pub(crate) fn go_f2(value: f64) -> String {
     }
 }
 
+/// Go `os.ReadFile`: the first read uses a buffer of at least 512 bytes (the
+/// stat size plus one when larger), later reads fill the spare capacity, the
+/// buffer grows only when full, and a read of zero bytes ends the file. This
+/// matters for `procfs` entries such as `/proc/sys/dev/cdrom/info`, which
+/// answer only a read at offset zero: Rust's `read_to_end` probes with 32
+/// bytes and would keep just those.
+pub(crate) fn go_read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file
+        .metadata()
+        .ok()
+        .and_then(|meta| usize::try_from(meta.len()).ok())
+        .unwrap_or(0);
+    go_read_all(&mut file, size)
+}
+
+/// The `os.ReadFile` loop over any reader.
+pub(crate) fn go_read_all(reader: &mut impl Read, size_hint: usize) -> std::io::Result<Vec<u8>> {
+    let mut data: Vec<u8> = Vec::with_capacity(size_hint.saturating_add(1).max(512));
+    loop {
+        if data.len() >= data.capacity() {
+            data.reserve(data.capacity().max(1));
+        }
+        let len = data.len();
+        let spare = data.capacity() - len;
+        data.resize(len + spare, 0);
+        match reader.read(&mut data[len..]) {
+            Ok(0) => {
+                data.truncate(len);
+                return Ok(data);
+            }
+            Ok(read) => data.truncate(len + read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => data.truncate(len),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn pair(key: &str, value: String) -> ServerInfoPair {
     ServerInfoPair {
         key: key.to_owned(),
@@ -530,7 +568,7 @@ fn walk_dir(dir: &Path, prefix: &str, pairs: &mut Vec<ServerInfoPair>) -> std::i
             continue;
         }
         // Go ioutil.ReadFile: unreadable entries are ignored.
-        let Ok(content) = std::fs::read(&path) else {
+        let Ok(content) = go_read_file(&path) else {
             continue;
         };
         let text = String::from_utf8_lossy(&content);
@@ -586,7 +624,7 @@ pub(crate) fn combined_output(program: &str, args: &[&str]) -> Option<String> {
 
 /// Go `getTransparentHugepageEnabled`.
 fn transparent_hugepage() -> Vec<ServerInfoItem> {
-    match std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled") {
+    match go_read_file(Path::new("/sys/kernel/mm/transparent_hugepage/enabled")) {
         Ok(content) => vec![item(
             "system",
             "kernel",
@@ -692,5 +730,63 @@ mod tests {
         assert_eq!(text.as_deref(), Some("out\nerr\nout2\n"));
         assert_eq!(combined_output("sh", &["-c", "exit 3"]), None);
         assert_eq!(combined_output("/nonexistent/binary-xyz", &[]), None);
+    }
+
+    /// A reader that answers only at offset zero (like `cdrom_sysctl_info`)
+    /// and one that answers one byte at a time both yield the whole content;
+    /// a 600-byte offset-zero-only reader keeps Go's first 512 bytes.
+    #[test]
+    fn go_read_file_follows_os_readfile_buffering() {
+        struct OffsetZeroOnly {
+            content: Vec<u8>,
+            served: bool,
+        }
+        impl Read for OffsetZeroOnly {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.served {
+                    return Ok(0);
+                }
+                self.served = true;
+                let count = buf.len().min(self.content.len());
+                buf[..count].copy_from_slice(&self.content[..count]);
+                Ok(count)
+            }
+        }
+        struct OneByte(std::vec::IntoIter<u8>);
+        impl Read for OneByte {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match (self.0.next(), buf.first_mut()) {
+                    (Some(byte), Some(slot)) => {
+                        *slot = byte;
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let content =
+            b"CD-ROM information, Id: cdrom.c 3.20 2003/12/17\n\ndrive name:\ndrive speed:\n"
+                .to_vec();
+        let mut once = OffsetZeroOnly {
+            content: content.clone(),
+            served: false,
+        };
+        assert_eq!(go_read_all(&mut once, 0).unwrap_or_default(), content);
+        let mut bytes = OneByte(content.clone().into_iter());
+        assert_eq!(go_read_all(&mut bytes, 0).unwrap_or_default(), content);
+        let long = vec![b'x'; 600];
+        let mut once = OffsetZeroOnly {
+            content: long.clone(),
+            served: false,
+        };
+        assert_eq!(
+            go_read_all(&mut once, 0).unwrap_or_default(),
+            long[..512].to_vec()
+        );
+        let mut sized = OffsetZeroOnly {
+            content: long.clone(),
+            served: false,
+        };
+        assert_eq!(go_read_all(&mut sized, 600).unwrap_or_default(), long);
     }
 }
