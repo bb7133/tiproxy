@@ -77,7 +77,10 @@ credentials. A failed refresh or cache write returns an error without identity
 fallback. Nineteen actual Go cases compare configuration failures, request URLs,
 headers and bodies, China endpoints, persisted cache fields, invalid responses
 and cache-write failure. The Rust test also verifies restart reuse of the newly
-persisted token and mode 0600 retention. Regenerate with:
+persisted token and mode 0600 retention. After a failed cache rename Rust removes
+its own temporary file; Go leaves that orphan file behind. Endpoint mapping
+currently covers commercial, GovCloud and China SSO regions; isolated AWS
+partitions are not yet supported. Regenerate with:
 
 ```sh
 go run rust/crates/control-meter/testdata/aws-sso-go.go
@@ -86,8 +89,23 @@ go run rust/crates/control-meter/testdata/aws-sso-go.go
 For a profile's `credential_source`, missing Environment keys fail during
 retrieval; EcsContainer without either container URI fails during construction.
 Both timings match the Go resolver, including explicit-static overrides.
-Configured AWS service endpoint overrides and detailed metadata/process
-retry/cache parity remain open. The extra signed
+`credential_process` invokes the complete configured command through the platform
+shell, preserving quoted arguments. Strict decoding follows Go's known field
+types, case-insensitive names, duplicate order and null handling. Invalid expiry
+fails; a provider response with an already elapsed expiry is returned once and
+retrieved again on the next call, as in Go's credential cache. Sixteen actual Go
+process cases compare command arguments, credentials, failures and cache calls;
+a real bounded-shell test verifies the quoted command path. Regenerate with:
+
+```sh
+go run rust/crates/control-meter/testdata/aws-process-go.go
+```
+
+The shared command adapter retains its 10-second deadline and 4 MiB output cap,
+closes stdin and captures stderr; Go defaults to one minute and inherited
+stdin/stderr. Interactive or long-running helpers are outside this adapter's
+supported boundary. Configured AWS service endpoint overrides and detailed
+metadata retry/cache parity remain open. The extra signed
 `x-amz-content-sha256` header on AWS AssumeRole is accepted SigV4 metadata that
 Go omits. OSS refresh holds the cache lock through STS, matching Go's blocking
 lock scope; Rust rechecks under that lock and coalesces concurrent refreshes

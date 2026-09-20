@@ -108,7 +108,7 @@ impl AwsSigner {
                 .provide_credential(&self.context)
                 .await?
                 .ok_or_else(failed)?;
-            if !base.is_valid_at(Timestamp::now()) {
+            if base.access_key_id.is_empty() || base.secret_access_key.is_empty() {
                 return Err(failed());
             }
             state.base = Some(base);

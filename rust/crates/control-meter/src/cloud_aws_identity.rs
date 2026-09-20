@@ -17,9 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use reqsign_aws_v4::{
-    Credential, ECSCredentialProvider, IMDSv2CredentialProvider, ProcessCredentialProvider,
-};
+use reqsign_aws_v4::{Credential, ECSCredentialProvider, IMDSv2CredentialProvider};
 use reqsign_core::time::Timestamp;
 use reqsign_core::{Context, ProvideCredential, ProvideCredentialDyn, SigningCredential};
 use tokio::sync::{Mutex, OnceCell};
@@ -145,7 +143,10 @@ impl GoDefaultProvider {
                 cached: Mutex::new(None),
             }
         } else if let Some(command) = get("credential_process") {
-            Source::sdk(ProcessCredentialProvider::new().with_command(command))
+            Source {
+                kind: Kind::Process(command.to_owned()),
+                cached: Mutex::new(None),
+            }
         } else if env(ctx, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
             || env(ctx, "AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
         {
@@ -195,6 +196,7 @@ struct Source {
 }
 enum Kind {
     Static(Credential),
+    Process(String),
     Sso(crate::cloud_aws_sso::Sso),
     Sdk(Box<dyn ProvideCredentialDyn<Credential = Credential>>),
     Web(WebIdentity),
@@ -230,6 +232,7 @@ impl Source {
         }
         let value = match &self.kind {
             Kind::Static(value) => value.clone(),
+            Kind::Process(command) => crate::cloud_aws_process::retrieve(ctx, command).await?,
             Kind::Sso(provider) => provider.retrieve(ctx).await?,
             Kind::Web(web) => web.retrieve(ctx).await?,
             Kind::Sdk(provider) => provider
@@ -260,7 +263,7 @@ impl Source {
                 .await?
             }
         };
-        if !value.is_valid_at(Timestamp::now()) {
+        if value.access_key_id.is_empty() || value.secret_access_key.is_empty() {
             return Err(failed());
         }
         *cached = Some(value.clone());
