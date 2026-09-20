@@ -473,15 +473,18 @@ async fn run(options: Options) -> Result<(), String> {
     );
     {
         // Line contract (slice 4a): the Go header of the configured encoder
-        // on every line, and the configured level filter. `log.encoder` is
-        // restart-required; `log.level` follows the config reload below.
+        // on every line, and the configured level filter. `log.encoder` and
+        // `log.simple` are restart-required; `log.level` follows the config
+        // reload below. Like Go's `BuildLogger`, a level zap rejects fails
+        // startup.
         let effective = config_owner.handle.source().current();
-        process_logging::set_encoder(process_logging::Encoder::from_config(
-            effective.effective().log_encoder(),
-        ));
-        process_logging::set_level(process_logging::Level::from_config(
-            effective.effective().log_level(),
-        ));
+        let level = process_logging::Level::parse(effective.effective().log_level())
+            .map_err(|error| format!("build logger: {error}"))?;
+        process_logging::set_format(
+            process_logging::Encoder::from_config(effective.effective().log_encoder()),
+            effective.effective().log_simple(),
+        );
+        process_logging::set_level(level);
     }
     process_logging::configure(initial_log_file.as_ref())?;
     install_session_log_writer(session_log_line);
@@ -1420,21 +1423,32 @@ async fn run_log_reload(
 ) {
     while updates.changed().await.is_ok() {
         let snapshot = updates.borrow_and_update().clone();
-        // `log.level` is reloadable in Go; apply it before the file settings.
-        process_logging::set_level(process_logging::Level::from_config(
-            snapshot.effective().log_level(),
-        ));
+        // Go `updateLoggerCfg`: rebuild the file output first; only when that
+        // succeeded parse and apply `log.level`, and a level zap rejects
+        // leaves the running level untouched (the failure is logged).
         let next = log_file_settings(log_file.as_deref(), snapshot.as_ref());
-        if next == current {
-            continue;
+        if next != current {
+            match process_logging::configure(next.as_ref()) {
+                Ok(()) => current = next,
+                Err(error) => {
+                    process_logging::emit(
+                        process_logging::Level::Error,
+                        &format!(
+                            "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
+                            error.replace('\\', "\\\\").replace('"', "\\\"")
+                        ),
+                    );
+                    continue;
+                }
+            }
         }
-        match process_logging::configure(next.as_ref()) {
-            Ok(()) => current = next,
+        match process_logging::Level::parse(snapshot.effective().log_level()) {
+            Ok(level) => process_logging::set_level(level),
             Err(error) => process_logging::emit(
                 process_logging::Level::Error,
                 &format!(
-                    "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
-                    error.replace('\\', "\\\\").replace('"', "\\\"")
+                    "{{\"component\":\"tiproxy-rs\",\"event\":\"log_level_reload_rejected\",\"error\":\"{}\"}}",
+                    error.to_string().replace('\\', "\\\\").replace('"', "\\\"")
                 ),
             ),
         }

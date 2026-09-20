@@ -746,10 +746,18 @@ impl EffectiveConfig {
         &self.log.online.level
     }
 
-    /// Returns the `log.encoder` spelling (`tidb` or `json`; restart-required).
+    /// Returns the `log.encoder` spelling (restart-required; Go selects
+    /// `json`/`console` case-sensitively and treats anything else as `tidb`).
     #[must_use]
     pub fn log_encoder(&self) -> &str {
         &self.log.encoder
+    }
+
+    /// Returns `log.simple` (restart-required): the Go encoders drop the
+    /// time, level, caller and message keys.
+    #[must_use]
+    pub const fn log_simple(&self) -> bool {
+        self.log.simple
     }
 
     /// Returns the canonical effective work directory.

@@ -205,20 +205,35 @@ certificate.
   tombstones, Go issuer deleted, `last_drain_command_sequence` kept as a
   Rust diagnostic).
 - **Slice 4a (log line contract)** — done: every Rust log line carries the
-  Go `pingcap/log` header, so `sysutil`-style readers parse Rust and Go logs
-  alike. `log.encoder = "tidb"` (default) renders
-  `[2006/01/02 15:04:05.000 -07:00] [LEVEL] <json body>`; `log.encoder =
-  "json"` renders the zap object shape `{"level","ts",...body fields}`.
+  Go logger's header, so `sysutil`-style readers parse Rust and Go logs
+  alike. The encoder follows Go's `buildEncoder` case-sensitively:
+  `log.encoder = "json"` renders the zap object shape
+  `{"level","ts",...body fields}`, `"console"` renders zap's
+  `ts<TAB>LEVEL<TAB><body>`, and every other spelling (including the default
+  `tidb`, `JSON`, `Console`, empty) renders
+  `[2006/01/02 15:04:05.000 -07:00] [LEVEL] <json body>`. `log.simple`
+  drops the header (Go drops the time, level, caller and message keys).
+  `log.level` is parsed exactly like zap's `ParseLevel` (exact spelling, then
+  lowercase; empty is `info`; no trimming; `dpanic`/`panic`/`fatal` are
+  thresholds above `error` that suppress every line this process emits; a
+  rejected spelling fails startup like Go's `BuildLogger`). Reload follows Go's
+  `updateLoggerCfg`: the file output is rebuilt first, and only then is the
+  level parsed and applied, so a failed file switch keeps the old level and a
+  rejected level keeps the running one (both are logged as errors).
   Levels: lifecycle events are `INFO` (`ERROR` when they carry an error
   class), dataplane session records `INFO`, admin access records for
   non-success responses `WARN` (gin's error branch), rejected persistent
-  candidates `WARN`, a failed log reload `ERROR`; `log.level` filters like
-  the Go logger and follows the config reload, `log.encoder` is
-  restart-required as in Go. **Declared format difference:** the message
-  part stays the structured JSON object the Rust process always produced;
-  it is not a byte-level reproduction of Go's `[key=value]` field rendering.
-  Rotation, reload and the retention gate are unchanged (the header counts
-  toward `max-size` like any other bytes).
+  candidates `WARN`, failed log reloads `ERROR`. These rules are pinned by
+  `rust/crates/control-plane/testdata/log-format-go.json`, recorded from the
+  production Go builder by `tests/controlplane/cplog/format-probe` (18 level
+  spellings with their emitted-line matrix, 8 encoder spellings with and
+  without `simple`); `make controlplane-cplog-evidence` regenerates and
+  compares it. **Declared format differences:** the message part stays the
+  structured JSON object the Rust process always produced (Go renders a
+  bracketed message and `[key=value]` fields, and with `simple` an empty
+  `[]` caller bracket); Rust lines carry no caller. Rotation, reload and the
+  retention gate are unchanged (the header counts toward `max-size` like any
+  other bytes).
 - **Slice 4 (remaining)** — diagnostics gRPC (`SearchLog` over the B0 log rotation,
   `ServerInfo` with a pinned minimal host-information dependency after listing
   the Go `sysutil` fields) and `tiproxyctl` compatibility.

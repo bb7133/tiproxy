@@ -52,3 +52,16 @@ for zone in UTC Asia/Shanghai America/Los_Angeles; do
   echo "TZ=$zone: Go and Rust keep the same backups"
 done
 echo "PASS: lumberjack retention parity (local-time names, UTC age parse)"
+
+# Line-format contract (slice 4a): the production Go builder's level, encoder
+# and header behaviour must still match the checked-in fixture the Rust logger
+# tests compare against.
+fixture="rust/crates/control-plane/testdata/log-format-go.json"
+regen="$build_dir/log-format-go.json"
+"${GO:-go}" run ./tests/controlplane/cplog/format-probe >"$regen"
+if ! cmp -s "$regen" "$fixture"; then
+  echo "log format fixture differs from the production Go builder; regenerate $fixture" >&2
+  diff "$fixture" "$regen" >&2 || true
+  exit 1
+fi
+echo "PASS: log line format fixture matches the production Go builder"
