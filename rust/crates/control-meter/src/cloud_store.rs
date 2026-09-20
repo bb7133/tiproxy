@@ -249,7 +249,9 @@ async fn s3(config: &MeteringConfig, context: Context) -> Result<(Url, CloudSign
     } else {
         Some(endpoint(&config.endpoint)?)
     };
-    let signer = crate::cloud_aws::AwsSigner::new(&cfg, region, sts_endpoint, context);
+    let signer = crate::cloud_aws::AwsSigner::new(&cfg, region, sts_endpoint, context)
+        .await
+        .map_err(|_| Error::Invalid("invalid AWS credential configuration"))?;
     Ok((url, CloudSigner::S3(signer)))
 }
 

@@ -27,6 +27,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
 type defaultRequest struct {
@@ -37,14 +38,17 @@ type defaultRequest struct {
 	Token      string `json:"token"`
 }
 type defaultCase struct {
-	Name       string            `json:"name"`
-	Env        map[string]string `json:"env"`
-	Files      map[string]string `json:"files"`
-	Denied     bool              `json:"denied"`
-	Credential string            `json:"credential"`
-	Secret     string            `json:"secret"`
-	Error      bool              `json:"error"`
-	Requests   []defaultRequest  `json:"requests"`
+	LoadRequests int               `json:"load_requests"`
+	Static       bool              `json:"static"`
+	LoadError    bool              `json:"load_error"`
+	Name         string            `json:"name"`
+	Env          map[string]string `json:"env"`
+	Files        map[string]string `json:"files"`
+	Denied       bool              `json:"denied"`
+	Credential   string            `json:"credential"`
+	Secret       string            `json:"secret"`
+	Error        bool              `json:"error"`
+	Requests     []defaultRequest  `json:"requests"`
 }
 type defaultTransport func(*http.Request) (*http.Response, error)
 
@@ -79,6 +83,25 @@ func main() {
 		{Name: "literal-ini-quotes-colon-comments", Files: map[string]string{"config": "[ default ] ; profile comment\nAWS_ACCESS_KEY_ID : 'literal-id' # comment\n  AWS_SECRET_ACCESS_KEY = \"literal-secret\\path\" ; comment\n"}},
 		{Name: "prefixed-default-wins", Files: map[string]string{"config": "[profile default]\naws_access_key_id=prefixed-id\naws_secret_access_key=prefixed-secret\n[default]\naws_access_key_id=plain-id\naws_secret_access_key=plain-secret\n"}},
 	}
+	// Explicit keys skip credential-source resolution, but shared config must
+	// still load and validate before the SDK constructs the S3 client.
+	for _, name := range []string{"environment-before-profile", "env-still-validates-profile-conflict", "env-still-requires-named-profile", "credential-source-requires-role", "profile-cycle-rejected", "partial-file-keys-cannot-merge", "missing-web-token-never-falls-back", "failed-process-never-falls-back"} {
+		for _, original := range cases {
+			if original.Name == name {
+				original.Name = "static-" + name
+				original.Static = true
+				cases = append(cases, original)
+				break
+			}
+		}
+	}
+	cases = append(cases,
+		defaultCase{Name: "web-missing-role-fails-at-load", Env: map[string]string{"AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"}, Files: map[string]string{"token": "fake-token"}},
+		defaultCase{Name: "static-web-missing-role-ignored", Static: true, Env: map[string]string{"AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"}, Files: map[string]string{"token": "fake-token"}},
+		defaultCase{Name: "mfa-fails-at-load", Files: map[string]string{"config": profile + "role_arn=arn:aws:iam::123456789012:role/mfa\nmfa_serial=fixture\n"}},
+		defaultCase{Name: "static-mfa-resolution-skipped", Static: true, Files: map[string]string{"config": profile + "role_arn=arn:aws:iam::123456789012:role/mfa\nmfa_serial=fixture\n"}},
+	)
+
 	for i := range cases {
 		row := &cases[i]
 		for _, key := range os.Environ() {
@@ -125,7 +148,13 @@ func main() {
 			}
 			return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response)), Request: req}, nil
 		})
-		cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion("us-east-1"), config.WithHTTPClient(transport), config.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} }))
+		opts := []func(*config.LoadOptions) error{config.WithRegion("us-east-1"), config.WithHTTPClient(transport), config.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} })}
+		if row.Static {
+			opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("explicit-id", "explicit-secret", "")))
+		}
+		cfg, err := config.LoadDefaultConfig(context.Background(), opts...)
+		row.LoadError = err != nil
+		row.LoadRequests = len(row.Requests)
 		if err == nil {
 			var credential aws.Credentials
 			credential, err = cfg.Credentials.Retrieve(context.Background())

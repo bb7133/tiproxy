@@ -52,13 +52,14 @@ impl fmt::Debug for AwsSigner {
 }
 
 impl AwsSigner {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         config: &AwsMeteringConfig,
         region: String,
         endpoint: Option<Url>,
         context: Context,
-    ) -> Self {
+    ) -> reqsign_core::Result<Self> {
         let base = if !config.access_key.is_empty() && !config.secret_access_key.is_empty() {
+            crate::cloud_aws_identity::validate_profile(&context).await?;
             let mut provider =
                 StaticCredentialProvider::new(&config.access_key, &config.secret_access_key);
             if !config.session_token.is_empty() {
@@ -66,17 +67,18 @@ impl AwsSigner {
             }
             ProvideCredentialChain::new().push(provider)
         } else {
-            ProvideCredentialChain::new()
-                .push(crate::cloud_aws_identity::GoDefaultProvider::new(&region))
+            let provider = crate::cloud_aws_identity::GoDefaultProvider::new(&region);
+            provider.prepare(&context).await?;
+            ProvideCredentialChain::new().push(provider)
         };
-        Self {
+        Ok(Self {
             context,
             base,
             region,
             endpoint,
             role: config.assume_role_arn.clone(),
             state: Mutex::new(State::default()),
-        }
+        })
     }
 
     pub(crate) async fn sign(&self, parts: &mut Parts) -> reqsign_core::Result<()> {
@@ -89,7 +91,7 @@ impl AwsSigner {
             .await
     }
 
-    async fn credential(&self) -> reqsign_core::Result<Credential> {
+    pub(super) async fn credential(&self) -> reqsign_core::Result<Credential> {
         let mut state = self.state.lock().await;
         let now = Timestamp::now();
         let cached = if self.role.is_empty() {
@@ -310,7 +312,9 @@ mod tests {
         };
         let endpoint = Url::parse("http://sts.fixture.invalid:9000/prefix")
             .unwrap_or_else(|e| unreachable!("{e}"));
-        let signer = AwsSigner::new(&cfg, "us-east-1".into(), Some(endpoint.clone()), ctx);
+        let signer = AwsSigner::new(&cfg, "us-east-1".into(), Some(endpoint.clone()), ctx)
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
         let (one, two) = tokio::join!(signer.credential(), signer.credential());
         assert_eq!(
             one.unwrap_or_else(|e| unreachable!("{e}")).access_key_id,

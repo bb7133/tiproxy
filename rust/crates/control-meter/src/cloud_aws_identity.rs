@@ -60,19 +60,14 @@ impl GoDefaultProvider {
         }
     }
 
+    /// Resolve config at client construction; credential I/O stays lazy.
+    pub(crate) async fn prepare(&self, ctx: &Context) -> reqsign_core::Result<()> {
+        self.selected.get_or_try_init(|| self.resolve(ctx)).await?;
+        Ok(())
+    }
+
     async fn resolve(&self, ctx: &Context) -> reqsign_core::Result<Source> {
-        // LoadDefaultConfig validates the active shared profile before it
-        // chooses environment credentials, even when those credentials win.
-        let profiles = read_profiles(ctx).await?;
-        let name = env(ctx, "AWS_PROFILE").or_else(|| env(ctx, "AWS_DEFAULT_PROFILE"));
-        if name
-            .as_ref()
-            .is_some_and(|name| !profiles.contains_key(name))
-        {
-            return Err(failed());
-        }
-        let name = name.as_deref().unwrap_or("default");
-        let profile = normalize_profile(&profiles, name, &mut BTreeSet::new())?;
+        let profile = load_profile(ctx).await?;
         // Complete environment keys, then environment web identity, then the
         // merged active profile. Authentication errors never change identity.
         if let Some(credential) = environment(ctx) {
@@ -336,6 +331,29 @@ struct WebCredential {
     secret_access_key: String,
     session_token: String,
     expiration: String,
+}
+
+/// Explicit static credentials still run the Go shared-config validation,
+/// but skip resolution of the profile's credential provider.
+pub(crate) async fn validate_profile(ctx: &Context) -> reqsign_core::Result<()> {
+    load_profile(ctx).await?;
+    Ok(())
+}
+
+async fn load_profile(ctx: &Context) -> reqsign_core::Result<Profile> {
+    let profiles = read_profiles(ctx).await?;
+    let name = env(ctx, "AWS_PROFILE").or_else(|| env(ctx, "AWS_DEFAULT_PROFILE"));
+    if name
+        .as_ref()
+        .is_some_and(|name| !profiles.contains_key(name))
+    {
+        return Err(failed());
+    }
+    normalize_profile(
+        &profiles,
+        name.as_deref().unwrap_or("default"),
+        &mut BTreeSet::new(),
+    )
 }
 
 fn environment(ctx: &Context) -> Option<Credential> {
@@ -613,11 +631,15 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Debug, Deserialize)]
+    #[allow(clippy::struct_excessive_bools)] // Mirrors independent Go fixture inputs/outcomes.
     struct Case {
         name: String,
         env: Option<BTreeMap<String, String>>,
         files: BTreeMap<String, String>,
         denied: bool,
+        r#static: bool,
+        load_error: bool,
+        load_requests: usize,
         credential: String,
         secret: String,
         error: bool,
@@ -746,19 +768,56 @@ mod tests {
     #[tokio::test]
     async fn default_sources_and_sts_requests_match_actual_go() {
         let rows = fixtures();
-        assert_eq!(rows.len(), 24);
+        assert_eq!(rows.len(), 36);
         for row in rows {
+            assert_eq!(row.load_requests, 0, "{}: Go constructor is lazy", row.name);
             let (ctx, io) = context(&row);
-            let provider = GoDefaultProvider::new("us-east-1");
-            let result = provider.provide_credential(&ctx).await;
+            let config = if row.r#static {
+                control_config::AwsMeteringConfig {
+                    access_key: "explicit-id".into(),
+                    secret_access_key: "explicit-secret".into(),
+                    ..Default::default()
+                }
+            } else {
+                control_config::AwsMeteringConfig::default()
+            };
+            let signer =
+                crate::cloud_aws::AwsSigner::new(&config, "us-east-1".into(), None, ctx).await;
+            assert_eq!(
+                signer.is_err(),
+                row.load_error,
+                "{} at construction",
+                row.name
+            );
+            {
+                let state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
+                assert!(
+                    state.requests.is_empty(),
+                    "{}: no credential HTTP at construction",
+                    row.name
+                );
+                assert_eq!(
+                    state.commands, 0,
+                    "{}: no credential process at construction",
+                    row.name
+                );
+            }
+            let result = match signer.as_ref() {
+                Ok(signer) => signer.credential().await,
+                Err(_) => Err(failed()),
+            };
             assert_eq!(result.is_err(), row.error, "{}", row.name);
             if !row.error {
-                let credential = result
-                    .unwrap_or_else(|e| unreachable!("{}: {e}", row.name))
-                    .unwrap_or_else(|| unreachable!());
+                let credential = result.unwrap_or_else(|e| unreachable!("{}: {e}", row.name));
                 assert_eq!(credential.access_key_id, row.credential, "{}", row.name);
                 assert_eq!(credential.secret_access_key, row.secret, "{}", row.name);
-                assert!(provider.provide_credential(&ctx).await.is_ok());
+                assert!(
+                    signer
+                        .unwrap_or_else(|e| unreachable!("{e}"))
+                        .credential()
+                        .await
+                        .is_ok()
+                );
             }
             let state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
             assert_eq!(
@@ -781,6 +840,17 @@ mod tests {
             .unwrap_or_else(|| unreachable!());
         let (ctx, io) = context(&row);
         let provider = GoDefaultProvider::new("us-east-1");
+        provider
+            .prepare(&ctx)
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        io.0.lock()
+            .unwrap_or_else(|e| unreachable!("{e}"))
+            .files
+            .insert(
+                "/fixture/config".into(),
+                "[default]\ncredential_source=Environment\n".into(),
+            );
         let (one, two) = tokio::join!(
             provider.provide_credential(&ctx),
             provider.provide_credential(&ctx)

@@ -1,5 +1,8 @@
 [
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "environment-before-profile",
     "env": {
       "AWS_ACCESS_KEY_ID": "env-id",
@@ -15,6 +18,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "legacy-environment-aliases",
     "env": {
       "AWS_ACCESS_KEY": "legacy-id",
@@ -30,6 +36,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "partial-env-allows-profile",
     "env": {
       "AWS_ACCESS_KEY_ID": "partial-id"
@@ -44,6 +53,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "web-identity-before-profile",
     "env": {
       "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
@@ -69,6 +81,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "missing-web-token-never-falls-back",
     "env": {
       "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
@@ -84,6 +99,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "denied-web-never-falls-back",
     "env": {
       "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
@@ -109,6 +127,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "credentials-file-over-config",
     "env": null,
     "files": {
@@ -122,6 +143,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "named-source-profile-role",
     "env": {
       "AWS_PROFILE": "target"
@@ -144,6 +168,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "profile-cycle-rejected",
     "env": {
       "AWS_PROFILE": "a"
@@ -158,6 +185,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "failed-process-never-falls-back",
     "env": {
       "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1/credentials"
@@ -172,6 +202,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "env-still-validates-profile-conflict",
     "env": {
       "AWS_ACCESS_KEY_ID": "env-id",
@@ -187,6 +220,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "env-still-requires-named-profile",
     "env": {
       "AWS_ACCESS_KEY_ID": "env-id",
@@ -203,6 +239,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "credential-source-requires-role",
     "env": null,
     "files": {
@@ -215,6 +254,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "partial-file-keys-cannot-merge",
     "env": null,
     "files": {
@@ -228,6 +270,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "complete-file-overrides-partial-config",
     "env": null,
     "files": {
@@ -241,6 +286,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "prefixed-credentials-section-ignored",
     "env": null,
     "files": {
@@ -254,6 +302,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "role-self-source-static",
     "env": null,
     "files": {
@@ -274,6 +325,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "mfa-without-role-ignored",
     "env": null,
     "files": {
@@ -286,6 +340,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "unrecognized-ini-lines-ignored",
     "env": {
       "AWS_ACCESS_KEY_ID": "env-id",
@@ -301,6 +358,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
     "name": "profile-process-collision-rejected",
     "env": null,
     "files": {
@@ -313,6 +373,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "profile-web-ignores-duration",
     "env": null,
     "files": {
@@ -334,6 +397,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "profile-role-short-duration-default",
     "env": null,
     "files": {
@@ -354,6 +420,9 @@
     ]
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "literal-ini-quotes-colon-comments",
     "env": null,
     "files": {
@@ -366,6 +435,9 @@
     "requests": null
   },
   {
+    "load_requests": 0,
+    "static": false,
+    "load_error": false,
     "name": "prefixed-default-wins",
     "env": null,
     "files": {
@@ -374,6 +446,208 @@
     "denied": false,
     "credential": "prefixed-id",
     "secret": "prefixed-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-environment-before-profile",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": true,
+    "name": "static-env-still-validates-profile-conflict",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\nrole_arn=arn:aws:iam::123456789012:role/profile\nsource_profile=base\ncredential_process=false\n[profile base]\naws_access_key_id=base-id\naws_secret_access_key=base-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": true,
+    "name": "static-env-still-requires-named-profile",
+    "env": {
+      "AWS_ACCESS_KEY_ID": "env-id",
+      "AWS_PROFILE": "missing",
+      "AWS_SECRET_ACCESS_KEY": "env-secret"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": true,
+    "name": "static-credential-source-requires-role",
+    "env": null,
+    "files": {
+      "config": "[default]\ncredential_source=Environment\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": true,
+    "name": "static-profile-cycle-rejected",
+    "env": {
+      "AWS_PROFILE": "a"
+    },
+    "files": {
+      "config": "[profile a]\nrole_arn=arn:aws:iam::123456789012:role/a\nsource_profile=b\n[profile b]\nrole_arn=arn:aws:iam::123456789012:role/b\nsource_profile=a\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": true,
+    "name": "static-partial-file-keys-cannot-merge",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=config-id\n",
+      "credentials": "[default]\naws_secret_access_key=file-secret\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-missing-web-token-never-falls-back",
+    "env": {
+      "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/web",
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/missing"
+    },
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-failed-process-never-falls-back",
+    "env": {
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1/credentials"
+    },
+    "files": {
+      "config": "[default]\ncredential_process=false\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
+    "name": "web-missing-role-fails-at-load",
+    "env": {
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"
+    },
+    "files": {
+      "token": "fake-token"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-web-missing-role-ignored",
+    "env": {
+      "AWS_WEB_IDENTITY_TOKEN_FILE": "/fixture/token"
+    },
+    "files": {
+      "token": "fake-token"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
+    "error": false,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": false,
+    "load_error": true,
+    "name": "mfa-fails-at-load",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\nrole_arn=arn:aws:iam::123456789012:role/mfa\nmfa_serial=fixture\n"
+    },
+    "denied": false,
+    "credential": "",
+    "secret": "",
+    "error": true,
+    "requests": null
+  },
+  {
+    "load_requests": 0,
+    "static": true,
+    "load_error": false,
+    "name": "static-mfa-resolution-skipped",
+    "env": null,
+    "files": {
+      "config": "[default]\naws_access_key_id=profile-id\naws_secret_access_key=profile-secret\nrole_arn=arn:aws:iam::123456789012:role/mfa\nmfa_serial=fixture\n"
+    },
+    "denied": false,
+    "credential": "explicit-id",
+    "secret": "explicit-secret",
     "error": false,
     "requests": null
   }

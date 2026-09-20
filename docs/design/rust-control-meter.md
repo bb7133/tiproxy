@@ -50,9 +50,15 @@ Web Identity uses unsigned POST, preserves the complete token-file bytes and
 regenerates the default numeric session name per retrieval. Go does not apply
 profile `duration_seconds` to Web Identity; regular profile roles use the Go
 integer-minute threshold before overriding the 900-second default. The new
-fixture compares 24 actual Go resolver outcomes and STS requests, including
+fixture compares 36 actual Go resolver outcomes and STS requests, including
 configuration validation even when environment credentials win, source-profile
 signatures, self-links, file precedence and failed process/Web Identity sources.
+Client construction resolves and validates this configuration before the service
+opens the consumer/outbox files. Even explicit static credentials validate the
+shared profile, while skipping default credential-source resolution. STS, token
+file reads and credential processes remain lazy until retrieval; all 36 Go
+constructor captures make zero HTTP requests. The resolved profile is retained
+if its file changes before the first export.
 The Go fixture disables retries to isolate source selection. A separate test
 covers concurrent acquisition, actual-expiry caching, failed refresh, profile
 changes and token rotation. Regenerate with:
