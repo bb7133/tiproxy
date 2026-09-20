@@ -34,8 +34,9 @@
 //! authentication payload can enter an observation or a log field.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_proto::control_transport::{ControlClient, TransportError};
@@ -77,6 +78,466 @@ const fn exponential_buckets<const N: usize>(start: f64, factor: f64) -> [f64; N
         index += 1;
     }
     buckets
+}
+
+/// Maximum distinct series the process-local registry retains, matching the Go
+/// consumer's `maxRustMetricSeries`. Beyond it new series are shed and counted.
+const MAX_REGISTRY_SERIES: usize = 4_096;
+
+/// Prometheus metric kind of one catalog entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    /// Monotonic counter published as deltas.
+    Counter,
+    /// Absolute gauge published on every interval.
+    Gauge,
+    /// Cumulative histogram with fixed buckets.
+    Histogram,
+}
+
+impl MetricKind {
+    const fn exposition_type(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+        }
+    }
+}
+
+/// One closed-catalog metric family. Names, help text, label keys, and
+/// buckets mirror `pkg/metrics` so the native exposition is byte-compatible
+/// with the Go `promhttp` output for the same series.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricSpec {
+    /// Fully qualified metric name.
+    pub name: &'static str,
+    /// `# HELP` text.
+    pub help: &'static str,
+    /// Metric kind.
+    pub kind: MetricKind,
+    /// Label keys in exposition order (alphabetical, matching Go).
+    pub labels: &'static [&'static str],
+    /// Finite histogram bucket upper bounds; empty for counters and gauges.
+    pub buckets: &'static [f64],
+}
+
+/// The closed metric catalog, sorted by name (the order the Go gatherer uses).
+pub const METRIC_SPECS: [MetricSpec; 20] = [
+    MetricSpec {
+        name: "tiproxy_backend_dial_backend_fail",
+        help: "Counter of failing to dial backends.",
+        kind: MetricKind::Counter,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_get_backend",
+        help: "Counter of getting backend.",
+        kind: MetricKind::Counter,
+        labels: &["res"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_get_backend_duration_seconds",
+        help: "Bucketed histogram of time (s) for getting an available backend.",
+        kind: MetricKind::Histogram,
+        labels: &[],
+        buckets: &GET_BACKEND_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_backend_keepalive_update_total",
+        help: "Counter of health-driven backend keepalive policy updates.",
+        kind: MetricKind::Counter,
+        labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_connections",
+        help: "Number of connections.",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_create_connection_total",
+        help: "Number of create connections.",
+        kind: MetricKind::Counter,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_disconnection_total",
+        help: "Number of disconnections.",
+        kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_err",
+        help: "Counter of server error.",
+        kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_event",
+        help: "Counter of TiProxy event.",
+        kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_reject_connection_total",
+        help: "Number of rejected connections.",
+        kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_session_conn_lifetime_seconds",
+        help: "Bucketed histogram of connection lifetime (s).",
+        kind: MetricKind::Histogram,
+        labels: &[],
+        buckets: &CONN_LIFETIME_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_session_handshake_duration_seconds",
+        help: "Bucketed histogram of processing time (s) of handshakes.",
+        kind: MetricKind::Histogram,
+        labels: &["backend"],
+        buckets: &HANDSHAKE_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_session_query_duration_seconds",
+        help: "Bucketed histogram of processing time (s) of handled queries.",
+        kind: MetricKind::Histogram,
+        labels: &["backend", "cmd_type"],
+        buckets: &QUERY_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_session_query_time_since_conn_creation_seconds",
+        help: "Bucketed histogram of query start time (s) since connection creation.",
+        kind: MetricKind::Histogram,
+        labels: &[],
+        buckets: &QUERY_AGE_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_session_query_total",
+        help: "Counter of queries.",
+        kind: MetricKind::Counter,
+        labels: &["backend", "cmd_type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_traffic_cross_location_bytes",
+        help: "Counter of bytes between TiProxy and cross-location backends.",
+        kind: MetricKind::Counter,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_traffic_inbound_bytes",
+        help: "Counter of bytes from backends.",
+        kind: MetricKind::Counter,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_traffic_inbound_packets",
+        help: "Counter of packets from backends.",
+        kind: MetricKind::Counter,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_traffic_outbound_bytes",
+        help: "Counter of bytes to backends.",
+        kind: MetricKind::Counter,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_traffic_outbound_packets",
+        help: "Counter of packets to backends.",
+        kind: MetricKind::Counter,
+        labels: &["backend"],
+        buckets: &[],
+    },
+];
+
+/// Formats a float exactly like Go's `strconv.FormatFloat(f, 'g', -1, 64)`,
+/// which is what `expfmt` uses for sample values and `le` bucket labels: the
+/// shortest round-trip digits, exponent form when the decimal exponent is
+/// below -4 or at least 6, and a signed two-digit-minimum exponent.
+#[must_use]
+pub fn format_go_float(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "+Inf" } else { "-Inf" }.to_owned();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .unwrap_or((scientific.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if !(-4..6).contains(&exponent) {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        let _ = write!(out, "{:02}", exponent.abs());
+    } else if exponent < 0 {
+        out.push_str("0.");
+        for _ in 0..(-exponent - 1) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else {
+        let point = usize::try_from(exponent).unwrap_or(0) + 1;
+        if digits.len() <= point {
+            out.push_str(&digits);
+            for _ in 0..(point - digits.len()) {
+                out.push('0');
+            }
+        } else {
+            out.push_str(&digits[..point]);
+            out.push('.');
+            out.push_str(&digits[point..]);
+        }
+    }
+    out
+}
+
+fn escape_help(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+fn escape_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistogramState {
+    count: u64,
+    sum: f64,
+    cumulative_buckets: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    counters: BTreeMap<MetricKey, u64>,
+    histograms: BTreeMap<MetricKey, HistogramState>,
+    gauges: BTreeMap<&'static str, f64>,
+    series_dropped: u64,
+}
+
+impl RegistryState {
+    fn series_count(&self) -> usize {
+        self.counters.len() + self.histograms.len()
+    }
+}
+
+/// Process-local cumulative store behind the native Prometheus exposition.
+///
+/// The exporter feeds it through the same [`Aggregator`] mapping that produces
+/// the bridge deltas, so the `/metrics` text rendered here and the Go-side
+/// merge of those deltas describe the same series. Counters and histograms
+/// reset with the process, which is ordinary Prometheus counter semantics.
+#[derive(Debug, Default)]
+pub struct MetricsRegistry {
+    state: Mutex<RegistryState>,
+}
+
+impl MetricsRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn add_counter(&self, key: &MetricKey, delta: u64) {
+        let mut state = self.lock();
+        if !state.counters.contains_key(key) && state.series_count() >= MAX_REGISTRY_SERIES {
+            state.series_dropped = state.series_dropped.saturating_add(1);
+            return;
+        }
+        let value = state.counters.entry(key.clone()).or_insert(0);
+        *value = value.saturating_add(delta);
+    }
+
+    fn observe_histogram(&self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
+        let mut state = self.lock();
+        if !state.histograms.contains_key(key) && state.series_count() >= MAX_REGISTRY_SERIES {
+            state.series_dropped = state.series_dropped.saturating_add(1);
+            return;
+        }
+        let entry = state
+            .histograms
+            .entry(key.clone())
+            .or_insert_with(|| HistogramState {
+                cumulative_buckets: vec![0; buckets.len()],
+                ..HistogramState::default()
+            });
+        entry.count = entry.count.saturating_add(1);
+        entry.sum += seconds;
+        for (upper, bucket) in buckets.iter().zip(entry.cumulative_buckets.iter_mut()) {
+            if seconds <= *upper {
+                *bucket = bucket.saturating_add(1);
+            }
+        }
+    }
+
+    fn set_gauge(&self, name: &'static str, value: f64) {
+        self.lock().gauges.insert(name, value);
+    }
+
+    /// Number of new series shed because the registry reached its bound.
+    #[must_use]
+    pub fn series_dropped(&self) -> u64 {
+        self.lock().series_dropped
+    }
+
+    /// Renders the Prometheus text exposition (`text/plain; version=0.0.4`)
+    /// for every catalog family, in the Go gatherer's name order. Unlabeled
+    /// families are always present (with zero values, like Go's plain
+    /// collectors); labeled families appear once they have a series.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn render_prometheus_text(&self) -> String {
+        let state = self.lock();
+        let mut out = String::new();
+        for spec in &METRIC_SPECS {
+            let mut lines = String::new();
+            match spec.kind {
+                MetricKind::Counter => {
+                    let mut any = false;
+                    for (key, value) in state.counters.range(family_range(spec.name)) {
+                        any = true;
+                        push_sample(&mut lines, spec.name, "", &key.labels, None, *value as f64);
+                    }
+                    if !any && spec.labels.is_empty() {
+                        push_sample(&mut lines, spec.name, "", &[], None, 0.0);
+                    }
+                }
+                MetricKind::Gauge => {
+                    let value = state.gauges.get(spec.name).copied().unwrap_or(0.0);
+                    push_sample(&mut lines, spec.name, "", &[], None, value);
+                }
+                MetricKind::Histogram => {
+                    let mut any = false;
+                    for (key, value) in state.histograms.range(family_range(spec.name)) {
+                        any = true;
+                        push_histogram(&mut lines, spec, &key.labels, value);
+                    }
+                    if !any && spec.labels.is_empty() {
+                        let zero = HistogramState {
+                            cumulative_buckets: vec![0; spec.buckets.len()],
+                            ..HistogramState::default()
+                        };
+                        push_histogram(&mut lines, spec, &[], &zero);
+                    }
+                }
+            }
+            if lines.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+            let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+            out.push_str(&lines);
+        }
+        out
+    }
+}
+
+/// The `BTreeMap` key range covering every label combination of one family.
+fn family_range(name: &'static str) -> std::ops::RangeInclusive<MetricKey> {
+    MetricKey::new(name, Vec::new())..=MetricKey::new(name, vec![("\u{10ffff}", String::new())])
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn push_histogram(
+    out: &mut String,
+    spec: &MetricSpec,
+    labels: &[(&'static str, String)],
+    value: &HistogramState,
+) {
+    for (upper, count) in spec.buckets.iter().zip(&value.cumulative_buckets) {
+        push_sample(
+            out,
+            spec.name,
+            "_bucket",
+            labels,
+            Some(*upper),
+            *count as f64,
+        );
+    }
+    push_sample(
+        out,
+        spec.name,
+        "_bucket",
+        labels,
+        Some(f64::INFINITY),
+        value.count as f64,
+    );
+    push_sample(out, spec.name, "_sum", labels, None, value.sum);
+    push_sample(out, spec.name, "_count", labels, None, value.count as f64);
+}
+
+fn push_sample(
+    out: &mut String,
+    name: &str,
+    suffix: &str,
+    labels: &[(&'static str, String)],
+    le: Option<f64>,
+    value: f64,
+) {
+    out.push_str(name);
+    out.push_str(suffix);
+    if !labels.is_empty() || le.is_some() {
+        out.push('{');
+        let mut first = true;
+        for (key, label_value) in labels {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            let _ = write!(out, "{key}=\"{}\"", escape_label_value(label_value));
+        }
+        if let Some(upper) = le {
+            if !first {
+                out.push(',');
+            }
+            let _ = write!(out, "le=\"{}\"", format_go_float(upper));
+        }
+        out.push('}');
+    }
+    out.push(' ');
+    out.push_str(&format_go_float(value));
+    out.push('\n');
 }
 
 /// Packet and byte deltas attributed to one backend-facing exchange.
@@ -242,13 +703,29 @@ enum PendingMetric {
     },
 }
 
-#[derive(Default)]
 struct Aggregator {
     pending: BTreeMap<MetricKey, PendingMetric>,
     overflow_dropped: u64,
+    /// Cumulative twin of `pending`: every accepted delta is also folded into
+    /// the process-local registry that backs the native `/metrics` exposition.
+    registry: Arc<MetricsRegistry>,
+}
+
+impl Default for Aggregator {
+    fn default() -> Self {
+        Self::with_registry(Arc::new(MetricsRegistry::new()))
+    }
 }
 
 impl Aggregator {
+    fn with_registry(registry: Arc<MetricsRegistry>) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            overflow_dropped: 0,
+            registry,
+        }
+    }
+
     fn counter(&mut self, key: MetricKey, delta: u64) {
         if delta == 0 {
             return;
@@ -256,6 +733,7 @@ impl Aggregator {
         if !self.ensure_series(&key) {
             return;
         }
+        self.registry.add_counter(&key, delta);
         match self.pending.entry(key).or_insert(PendingMetric::Counter(0)) {
             PendingMetric::Counter(value) => *value = value.saturating_add(delta),
             PendingMetric::Histogram { .. } => {
@@ -269,6 +747,7 @@ impl Aggregator {
             self.overflow_dropped = self.overflow_dropped.saturating_add(1);
             return;
         }
+        self.registry.observe_histogram(&key, seconds, buckets);
         let entry = self
             .pending
             .entry(key)
@@ -665,6 +1144,7 @@ pub fn spawn_metrics_exporter(
     recorder: &MetricsRecorder,
     observations: mpsc::Receiver<Observation>,
     interval: Duration,
+    registry: Arc<MetricsRegistry>,
 ) -> MetricsExporter {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let dropped = recorder.dropped_counter();
@@ -676,6 +1156,7 @@ pub fn spawn_metrics_exporter(
         dropped,
         shutdown_rx,
         interval,
+        registry,
     ));
     MetricsExporter { shutdown, task }
 }
@@ -689,10 +1170,11 @@ async fn run_exporter(
     dropped: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
     interval: Duration,
+    registry: Arc<MetricsRegistry>,
 ) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(10)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut aggregator = Aggregator::default();
+    let mut aggregator = Aggregator::with_registry(Arc::clone(&registry));
     let mut previous = ExportTotals::default();
     let mut sequence = 1_u64;
     loop {
@@ -717,6 +1199,7 @@ async fn run_exporter(
                 );
                 current.accumulate_delta(previous, &mut aggregator);
                 previous = current;
+                registry.set_gauge("tiproxy_server_connections", active_connections);
                 let metrics = aggregator.wire_metrics(&[(
                     "tiproxy_server_connections",
                     active_connections,
@@ -987,5 +1470,298 @@ mod tests {
         }
         let multibyte = json_field(&"界".repeat(MAX_LABEL_BYTES));
         assert!(multibyte.len() <= MAX_LABEL_BYTES);
+    }
+
+    #[test]
+    fn go_float_formatting_matches_strconv_g_shortest() {
+        for (value, expected) in [
+            (0.0005, "0.0005"),
+            (0.001, "0.001"),
+            (0.5, "0.5"),
+            (1.0, "1"),
+            (32.0, "32"),
+            (100_000.0, "100000"),
+            (1_000_000.0, "1e+06"),
+            (2_097_152.0, "2.097152e+06"),
+            (0.000_001, "1e-06"),
+            (1.5, "1.5"),
+            (123_456_789.0, "1.23456789e+08"),
+            (0.1, "0.1"),
+            (0.4, "0.4"),
+            (1_677_721.6, "1.6777216e+06"),
+            (838_860.8, "838860.8"),
+            (33_554.432, "33554.432"),
+            (1.844_674_407_370_955_2e19, "1.8446744073709552e+19"),
+            (0.0, "0"),
+            (f64::INFINITY, "+Inf"),
+            (-2.5, "-2.5"),
+        ] {
+            assert_eq!(format_go_float(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn registry_is_the_cumulative_twin_of_the_bridge_deltas() {
+        let mut aggregator = Aggregator::default();
+        let registry = Arc::clone(&aggregator.registry);
+        aggregator.observe(Observation::GetBackend {
+            duration: Duration::from_micros(1),
+            succeeded: true,
+        });
+        let _ = aggregator.wire_metrics(&[]);
+        aggregator.clear_sent();
+        aggregator.observe(Observation::GetBackend {
+            duration: Duration::from_micros(3),
+            succeeded: false,
+        });
+        let text = registry.render_prometheus_text();
+        assert!(text.contains("tiproxy_backend_get_backend{res=\"fail\"} 1\n"));
+        assert!(text.contains("tiproxy_backend_get_backend{res=\"succeed\"} 1\n"));
+        assert!(text.contains("tiproxy_backend_get_backend_duration_seconds_count 2\n"));
+        assert!(
+            text.contains("tiproxy_backend_get_backend_duration_seconds_bucket{le=\"1e-06\"} 1\n")
+        );
+        assert!(
+            text.contains("tiproxy_backend_get_backend_duration_seconds_bucket{le=\"+Inf\"} 2\n")
+        );
+        // Families are rendered in name order with HELP/TYPE headers.
+        let help = text.find("# HELP tiproxy_backend_get_backend ");
+        let server = text.find("# HELP tiproxy_server_connections ");
+        assert!(help.is_some() && server.is_some() && help < server);
+        assert!(
+            !text.contains("tiproxy_backend_dial_backend_fail"),
+            "a labeled family without series is absent, like a Go vec with no children"
+        );
+        // Unlabeled families are always present; labeled ones only once used.
+        assert!(text.contains("tiproxy_server_create_connection_total 0\n"));
+        assert!(!text.contains("tiproxy_session_query_total{"));
+    }
+
+    #[test]
+    fn registry_bounds_series_and_escapes_labels() {
+        let registry = MetricsRegistry::new();
+        for index in 0..MAX_REGISTRY_SERIES + 5 {
+            registry.add_counter(
+                &MetricKey::new(
+                    "tiproxy_backend_dial_backend_fail",
+                    vec![("backend", format!("b{index}"))],
+                ),
+                1,
+            );
+        }
+        assert_eq!(registry.series_dropped(), 5);
+        registry.add_counter(
+            &MetricKey::new(
+                "tiproxy_backend_dial_backend_fail",
+                vec![("backend", "quote\"back\\slash\nline".to_owned())],
+            ),
+            1,
+        );
+        assert_eq!(
+            registry.series_dropped(),
+            6,
+            "a bounded registry sheds the escaped series too"
+        );
+        let small = MetricsRegistry::new();
+        small.add_counter(
+            &MetricKey::new(
+                "tiproxy_backend_dial_backend_fail",
+                vec![("backend", "quote\"back\\slash\nline".to_owned())],
+            ),
+            1,
+        );
+        assert!(small.render_prometheus_text().contains(
+            "tiproxy_backend_dial_backend_fail{backend=\"quote\\\"back\\\\slash\\nline\"} 1\n"
+        ));
+    }
+
+    /// The deterministic observation script shared with the Go parity
+    /// generator (`tests/dataplane/metrics/gen`). Durations are dyadic so the
+    /// histogram sums are exact regardless of summation order.
+    #[allow(clippy::too_many_lines)]
+    fn parity_script(aggregator: &mut Aggregator) -> Vec<Vec<MetricDelta>> {
+        let backend_a = "10.0.0.1:4000".to_owned();
+        let backend_b = "10.0.0.2:4000".to_owned();
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: inbound / 50,
+            outbound_bytes: outbound,
+            outbound_packets: outbound / 50,
+        };
+        let mut batches = Vec::new();
+        aggregator.observe(Observation::GetBackend {
+            duration: Duration::from_micros(1),
+            succeeded: true,
+        });
+        aggregator.observe(Observation::GetBackend {
+            duration: Duration::from_millis(250),
+            succeeded: false,
+        });
+        aggregator.observe(Observation::DialBackendFailed {
+            backend: backend_a.clone(),
+        });
+        aggregator.observe(Observation::BackendKeepaliveUpdated {
+            backend: backend_a.clone(),
+            healthy: false,
+            succeeded: true,
+        });
+        aggregator.observe(Observation::HandshakeCompleted {
+            backend: backend_a.clone(),
+            duration: Duration::from_millis(500),
+            traffic: traffic(100, 50),
+            local: true,
+        });
+        aggregator.observe(Observation::CommandCompleted {
+            backend: backend_a.clone(),
+            command: Command::Query,
+            duration: Duration::from_millis(125),
+            since_connection: Duration::from_secs(3),
+            traffic: traffic(1_000, 200),
+            local: false,
+        });
+        ExportTotals {
+            registered: 2,
+            rejected_max: 1,
+            accept_errors: 1,
+            reconnect_attempts: 1,
+            ..ExportTotals::default()
+        }
+        .accumulate_delta(ExportTotals::default(), aggregator);
+        aggregator
+            .registry
+            .set_gauge("tiproxy_server_connections", 2.0);
+        batches.push(aggregator.wire_metrics(&[("tiproxy_server_connections", 2.0)]));
+        aggregator.clear_sent();
+
+        aggregator.observe(Observation::CommandCompleted {
+            backend: backend_b.clone(),
+            command: Command::StmtExecute,
+            duration: Duration::from_millis(62),
+            since_connection: Duration::from_secs(70),
+            traffic: traffic(300, 150),
+            local: true,
+        });
+        aggregator.observe(Observation::CommandCompleted {
+            backend: backend_a,
+            command: Command::Query,
+            duration: Duration::from_secs(2),
+            since_connection: Duration::from_secs(4),
+            traffic: traffic(50, 50),
+            local: false,
+        });
+        aggregator.observe(Observation::SessionClosed {
+            source: QuitSource::ClientNetwork,
+            lifetime: Duration::from_millis(12_500),
+            traffic: TrafficTotals::default(),
+        });
+        aggregator.observe(Observation::BackendKeepaliveUpdated {
+            backend: backend_b,
+            healthy: true,
+            succeeded: false,
+        });
+        ExportTotals {
+            registered: 3,
+            rejected_max: 1,
+            accept_errors: 1,
+            reconnect_attempts: 1,
+            dispatch_stale: 2,
+            ..ExportTotals::default()
+        }
+        .accumulate_delta(
+            ExportTotals {
+                registered: 2,
+                rejected_max: 1,
+                accept_errors: 1,
+                reconnect_attempts: 1,
+                ..ExportTotals::default()
+            },
+            aggregator,
+        );
+        aggregator
+            .registry
+            .set_gauge("tiproxy_server_connections", 1.0);
+        batches.push(aggregator.wire_metrics(&[("tiproxy_server_connections", 1.0)]));
+        aggregator.clear_sent();
+        batches
+    }
+
+    fn batches_json(batches: &[Vec<MetricDelta>]) -> String {
+        let mut out = String::from("[\n");
+        for (index, batch) in batches.iter().enumerate() {
+            let _ = write!(out, "  {{\"sequence\": {}, \"metrics\": [", index + 1);
+            for (position, metric) in batch.iter().enumerate() {
+                if position > 0 {
+                    out.push(',');
+                }
+                out.push_str("\n    {\"name\": \"");
+                out.push_str(&metric.name);
+                out.push_str("\", \"labels\": {");
+                let mut first = true;
+                for (key, value) in &metric.labels {
+                    if !first {
+                        out.push_str(", ");
+                    }
+                    first = false;
+                    let _ = write!(out, "\"{key}\": \"{}\"", escape_label_value(value));
+                }
+                let _ = write!(
+                    out,
+                    "}}, \"counter_delta\": {}, \"gauge\": {}, \"histogram_bucket_deltas\": [",
+                    metric.counter_delta,
+                    format_go_float(metric.gauge)
+                );
+                let buckets: Vec<String> = metric
+                    .histogram_bucket_deltas
+                    .iter()
+                    .map(u64::to_string)
+                    .collect();
+                out.push_str(&buckets.join(", "));
+                out.push_str("]}");
+            }
+            out.push_str("\n  ]}");
+            if index + 1 < batches.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str("]\n");
+        out
+    }
+
+    /// Golden parity with the Go `promhttp` exposition of the same deltas.
+    /// `tests/dataplane/metrics/parity-expected.txt` is produced by
+    /// `go run ./tests/dataplane/metrics/gen` from `parity-batches.json`;
+    /// setting `TIPROXY_UPDATE_METRICS_PARITY=1` rewrites the batches and the
+    /// Rust rendering instead of asserting.
+    #[test]
+    fn native_exposition_matches_go_golden() {
+        let mut aggregator = Aggregator::default();
+        let batches = parity_script(&mut aggregator);
+        let rendered = aggregator.registry.render_prometheus_text();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/dataplane/metrics");
+        if std::env::var_os("TIPROXY_UPDATE_METRICS_PARITY").is_some() {
+            assert!(
+                std::fs::write(root.join("parity-batches.json"), batches_json(&batches)).is_ok()
+            );
+            assert!(std::fs::write(root.join("parity-rust.txt"), &rendered).is_ok());
+            return;
+        }
+        let Ok(expected) = std::fs::read_to_string(root.join("parity-expected.txt")) else {
+            unreachable!("missing tests/dataplane/metrics/parity-expected.txt")
+        };
+        assert_eq!(
+            rendered, expected,
+            "native exposition diverged from the Go golden; regenerate with \
+             TIPROXY_UPDATE_METRICS_PARITY=1 and go run ./tests/dataplane/metrics/gen"
+        );
+        let Ok(recorded) = std::fs::read_to_string(root.join("parity-batches.json")) else {
+            unreachable!("missing tests/dataplane/metrics/parity-batches.json")
+        };
+        assert_eq!(
+            batches_json(&batches),
+            recorded,
+            "the recorded delta batches no longer match the observation script"
+        );
     }
 }

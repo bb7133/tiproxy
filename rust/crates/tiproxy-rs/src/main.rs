@@ -18,6 +18,7 @@
 
 mod config_composition;
 mod health;
+mod metrics_http;
 mod startup;
 mod tls_material;
 mod topology_composition;
@@ -25,6 +26,7 @@ mod topology_composition;
 use std::env;
 use std::fmt::Display;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -60,7 +62,8 @@ use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsExporter, MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
+    MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
+    spawn_metrics_exporter,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -98,6 +101,7 @@ struct Options {
     tls_roots: Vec<PathBuf>,
     drain_grace: Option<Duration>,
     health_port: u16,
+    metrics_addr: Option<SocketAddr>,
 }
 
 enum Command {
@@ -226,6 +230,7 @@ struct RunningProcess<R, E, S, H> {
     metrics_exporter: E,
     metering_sampler: S,
     health_task: Option<H>,
+    metrics_http_task: Option<JoinHandle<()>>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -250,6 +255,8 @@ struct StartupGuard<R, E, S, H> {
     metrics_exporter: Option<E>,
     metering_sampler: Option<S>,
     health_task: Option<H>,
+    /// Native `/metrics` responder; a concrete task because no test fakes it.
+    metrics_http_task: Option<JoinHandle<()>>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -271,6 +278,7 @@ where
             metrics_exporter: None,
             metering_sampler: None,
             health_task: None,
+            metrics_http_task: None,
             routing_shadow: None,
         }
     }
@@ -306,6 +314,12 @@ where
         }
     }
 
+    fn set_metrics_http_task(&mut self, task: JoinHandle<()>) {
+        if self.metrics_http_task.replace(task).is_some() {
+            unreachable!("the metrics HTTP task was set twice");
+        }
+    }
+
     /// Stops and joins every acquired resource in reverse order and returns the
     /// original error unchanged.
     async fn rollback(mut self, error: String) -> String {
@@ -327,6 +341,9 @@ where
         }
         if let Some(health_task) = self.health_task.take() {
             steps.push(("health_task", health_task.teardown()));
+        }
+        if let Some(task) = self.metrics_http_task.take() {
+            steps.push(("metrics_http_task", startup::Teardown::teardown(task)));
         }
         let _order = startup::run_teardowns_in_reverse(steps).await;
         // The owner and its modules were acquired first, so they retire last.
@@ -357,6 +374,7 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task,
             routing_shadow,
         } = self;
         let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
@@ -371,6 +389,7 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task,
             routing_shadow,
         }
     }
@@ -476,6 +495,7 @@ async fn run(options: Options) -> Result<(), String> {
     let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
     let loop_config = session_loop_config(in_process_config.drain_grace());
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
+    let metrics_registry = Arc::new(MetricsRegistry::new());
     let runtime_handle = in_process.handle();
     let modules = ControlModuleSet::new(&runtime_handle);
     // Arm the startup guard before the first module is spawned. From here every
@@ -713,6 +733,7 @@ async fn run(options: Options) -> Result<(), String> {
         &metrics,
         observations,
         Duration::from_secs(1),
+        Arc::clone(&metrics_registry),
     ));
     guard.set_metering_sampler(MeteringSampler {
         task: tokio::spawn(async move {
@@ -743,6 +764,13 @@ async fn run(options: Options) -> Result<(), String> {
         Ok(None) => {}
         Err(error) => return Err(guard.rollback(error).await),
     }
+    // Native Prometheus exposition (B0): bound before ready so a bad address
+    // fails fast; the task is owned by the guard and aborted at exit.
+    match spawn_metrics_http(options.metrics_addr, Arc::clone(&metrics_registry)).await {
+        Ok(Some(task)) => guard.set_metrics_http_task(task),
+        Ok(None) => {}
+        Err(error) => return Err(guard.rollback(error).await),
+    }
     if let Err(error) = in_process.mark_ready() {
         return Err(guard
             .rollback(format!("mark in-process control runtime ready: {error}"))
@@ -759,6 +787,7 @@ async fn run(options: Options) -> Result<(), String> {
                 shutdown: _,
             },
         health_task,
+        metrics_http_task,
         routing_shadow,
     } = guard.commit();
 
@@ -881,6 +910,10 @@ async fn run(options: Options) -> Result<(), String> {
     }
     let module_executor_result = join_modules(&mut modules).await;
     if let Some(task) = health_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = metrics_http_task {
         task.abort();
         let _ = task.await;
     }
@@ -1204,6 +1237,21 @@ async fn wait_for_termination_signal() {
     }
 }
 
+/// Binds the native `/metrics` listener when an address was configured.
+async fn spawn_metrics_http(
+    address: Option<SocketAddr>,
+    registry: Arc<MetricsRegistry>,
+) -> Result<Option<JoinHandle<()>>, String> {
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("bind metrics endpoint {address}: {error}"))?;
+    Ok(Some(tokio::spawn(metrics_http::serve(listener, registry))))
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let mut config_file = env::var_os(CONFIG_FILE_ENV).map(PathBuf::from);
@@ -1217,6 +1265,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         .unwrap_or_default();
     let mut drain_grace = None;
     let mut health_port: u16 = 0;
+    let mut metrics_addr: Option<SocketAddr> = None;
     let mut routing_shadow_socket = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1262,6 +1311,15 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                     .parse()
                     .map_err(|_| format!("health port must be a u16, got {value:?}"))?;
             }
+            "--metrics-addr" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--metrics-addr requires host:port".to_owned())?;
+                metrics_addr =
+                    Some(value.parse().map_err(|_| {
+                        format!("metrics address must be host:port, got {value:?}")
+                    })?);
+            }
             "--drain-grace-seconds" => {
                 let value = arguments
                     .next()
@@ -1304,6 +1362,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         tls_roots,
         drain_grace,
         health_port,
+        metrics_addr,
     }))
 }
 
@@ -1323,7 +1382,7 @@ impl startup::Teardown for legacy_router_shadow::consumer::Task {
 
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--routing-shadow-socket <absolute-path>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -1333,6 +1392,7 @@ fn version_output() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::path::PathBuf;
 
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
@@ -1711,6 +1771,7 @@ mod tests {
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task: _,
             routing_shadow,
         } = guard.commit();
         // Tearing the transferred handles down proves they were moved out of the
@@ -1932,6 +1993,7 @@ mod tests {
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
                 drain_grace: None,
                 health_port: 0,
+                metrics_addr: None,
             }
         );
     }
@@ -1989,6 +2051,7 @@ mod tests {
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
             drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
+            metrics_addr: None,
         };
         let source = ConfigNamespaceStore::from_toml(
             b"enable-traffic-replay = false\n",
@@ -2123,6 +2186,7 @@ pd-addrs = "routing-pd:2379"
             unreachable!("valid operational arguments")
         };
         assert_eq!(options.health_port, 8081);
+        assert_eq!(options.metrics_addr, None);
         assert!(
             parse_options([
                 "--config".to_owned(),
@@ -2136,6 +2200,41 @@ pd-addrs = "routing-pd:2379"
         );
     }
 
+    #[test]
+    fn parses_metrics_addr() {
+        let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--metrics-addr".to_owned(),
+            "0.0.0.0:3081".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.metrics_addr,
+            "0.0.0.0:3081".parse::<SocketAddr>().ok(),
+            "the metrics address is a plain socket address"
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--control-uid".to_owned(),
+                "42".to_owned(),
+                "--metrics-addr".to_owned(),
+                "3081".to_owned(),
+            ])
+            .is_err(),
+            "a bare port is not a socket address"
+        );
+    }
     #[test]
     fn rejects_over_bound_drain_grace() {
         let Err(error) = parse_options([

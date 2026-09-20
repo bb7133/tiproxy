@@ -242,6 +242,10 @@ dataplane-t4-qualification:
 dataplane-integration-go:
 	./tests/dataplane/integration/run.sh --mode go --variant all
 
+dataplane-metrics-parity:
+	go run ./tests/dataplane/metrics/gen > /tmp/tiproxy-metrics-parity-expected.txt
+	diff -u tests/dataplane/metrics/parity-expected.txt /tmp/tiproxy-metrics-parity-expected.txt
+
 dataplane-integration-self-test:
 	./tests/dataplane/integration/self-test.sh
 
