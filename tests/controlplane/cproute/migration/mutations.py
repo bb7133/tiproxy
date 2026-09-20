@@ -37,6 +37,14 @@ def main():
         baseline()
         source = root / "rust/crates/control-router/src"
         originals = {name: (source / name).read_text() for name in ["ledger.rs", "selector.rs", "factors.rs"]}
+        # Inline the actual helper into its guard-owning caller for this fault.
+        # Dropping the helper's &mut State would not release the mutex at all.
+        selector = originals["selector.rs"]
+        helper = selector.split("    fn offer_redirect_locked(", 1)[1].split("    fn prepare_offer_locked(", 1)[0]
+        helper = helper.split(") -> Result<bool, RouteError> {", 1)[1].rsplit("    }", 1)[0]
+        unlock_offer = helper.replace("self.prepare_offer_locked(state,", "self.prepare_offer_locked(&mut state,")
+        unlock_offer = unlock_offer.replace("        let accepted = match sender.try_send", "        drop(state);\n        let accepted = match sender.try_send", 1)
+        unlock_offer = unlock_offer.replace("        state.ledger.admit_redirect", "        let mut state = self.lock();\n        state.ledger.admit_redirect", 1)
         # Restrict edits to one method so the fault's semantic boundary is explicit.
         cases = [
             ("success-does-not-move-physical", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("if success {", "if false {", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
@@ -48,10 +56,15 @@ def main():
             ("failure-cooldown-starts-at-terminal", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("Some(redirect.issued_at)", "Some(_now)", 1)], "redirect_delayed_failure_does_not_restart_issuance_cooldown"),
             ("rejected-offer-consumes-sequence", "ledger.rs", "pub(crate) fn admit_redirect", "pub(crate) fn finish_redirect", [("if admitted {\n            self.next_redirect += 1;", "self.next_redirect += 1;\n        if admitted {", 1)], "redirect_rejected_offer_records_cooldown_without_consuming_watermark_or_capacity"),
             ("final-offer-skips-source-validation", "selector.rs", "fn prepare_offer_locked", "pub(crate) fn finish_redirect", [("self.sources.validate(&prepared.candidate)?;", "", 4)], "migration_final_lock_rechecks_config_routing_and_health"),
-            ("offer-releases-lock-before-commit", "selector.rs", "pub(crate) fn offer_redirect", "pub(crate) fn finish_redirect", [("let accepted = sender.try_send(redirect.clone()).is_ok();", "drop(state); let accepted = sender.try_send(redirect.clone()).is_ok();", 1), ("state.ledger.admit_redirect(redirect, accepted, now);", "let mut state = self.lock(); state.ledger.admit_redirect(redirect, accepted, now);", 1)], "migration_immediate_terminal_waits_for_accepted_ledger_commit"),
+            ("offer-releases-lock-before-commit", "selector.rs", "pub(crate) fn offer_redirect", "fn offer_redirect_locked", [("self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected)", unlock_offer, 1)], "migration_immediate_terminal_waits_for_accepted_ledger_commit"),
             ("connection-factor-uses-physical", "factors.rs", "fn score(", "fn advice_values(", [("connections: input.counts.connection_score(),", "connections: if factor == Factor::Connection { input.counts.active() } else { input.counts.connection_score() },", 1)], "redirect_connection_factor_reads_transferred_score_not_physical_count"),
             ("outgoing-score-zero-pruned", "ledger.rs", "pub(crate) fn prune", "fn account(", [("self.counts(identity) != Some(Accounting::default())", "self.counts(identity).map(Accounting::connection_score) != Some(0)", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
         ]
+        requested = set(sys.argv[1:])
+        unknown = requested - {case[0] for case in cases}
+        if unknown:
+            raise RuntimeError(f"unknown migration mutations: {sorted(unknown)}")
+        cases = [case for case in cases if not requested or case[0] in requested]
         for name, file, begin, end, changes, expected in cases:
             original = originals[file]
             start = original.index(begin)

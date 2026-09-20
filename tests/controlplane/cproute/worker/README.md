@@ -27,8 +27,8 @@ at the source physical population. NaN and nonpositive rates issue nothing.
 
 The single bounded FIFO yields opaque `MigrationCommand::Redirect` or
 `MigrationCommand::ForceClose` tokens through `take_command`. Close admission
-marks closing without changing physical or score counts. Rejected close remains
-retryable. Only the exact observed-close token settles the current retained
+marks closing without changing physical or score counts. Rejected close records a three-second cooldown without pending work and remains
+retryable at the deadline. This T3 rule differs from legacy Go immediate retry. Only the exact observed-close token settles the current retained
 memberships, including a redirect that completed after close admission. A close
 that arrives first invalidates a later redirect result. Foreign, duplicate and
 wrong-sequence closes cannot settle; sequence exhaustion fails before admission.
@@ -44,11 +44,16 @@ They carry diagnostics only and cannot authorize a command.
 
 ## Evidence
 
-- `events.json` drives 18 scenarios / 94 observations through actual Go
+- `events.json` drives 18 scenarios / 96 observations through actual Go
   `FactorBasedBalance`, `Group.Balance`, timeout closure and terminal handlers,
   and then the Rust worker. The Go overlay substitutes only `time.Now()` reads
   in `group.go`. It does not replace algorithms or expected decisions.
-- Every observation compares physical/score counts, bounded FIFO order,
+- The 17 unchanged scenarios compare every observation against actual Go.
+  `close-rejection-retry` instead checks both complete engine histories against
+  `rust/crates/control-router/src/tests/worker_close_rejection.json`, including
+  retry one nanosecond before and exactly at the T3 three-second deadline.
+  No failed-time, pending, queue, or accounting fields are discarded.
+- Every observation checks physical/score counts, bounded FIFO order,
   pending/closing sessions, failure times, accepted group timestamp and refusal
   counts. Rates around 20ms and 10ms, fractional rates, exact cooldown/deadline
   equality, full queues, both close/result orders, fail-list ABA, repeated

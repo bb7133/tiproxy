@@ -1,0 +1,25 @@
+{
+  "reason": "T3 ForceClose FIFO rejection records cooldown without pending work; legacy Go retries immediately. Both full observations remain asserted.",
+  "go": [
+    {"label":"close-rejection-retry/disabled","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c1"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/full","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c1"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/drain","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,-1,-1,-1,-1,-1],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/retry","counts":[6,6,0,0],"pending":[],"closing":[1,2],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c2"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/drain2","counts":[6,6,0,0],"pending":[],"closing":[1,2],"failed":[-1,-1,-1,-1,-1,-1],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/observed","counts":[5,5,0,0],"pending":[],"closing":[2],"failed":[-1,-1,-1,-1,-1,-1],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/retry2","counts":[5,5,0,0],"pending":[],"closing":[2,3],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c3"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/before-cooldown","counts":[5,5,0,0],"pending":[],"closing":[2,3],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c3"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/equal-cooldown","counts":[5,5,0,0],"pending":[],"closing":[2,3],"failed":[-1,-1,-1,-1,-1,-1],"queue":["c3"],"watermark":-1,"refusals":0,"records":0}
+  ],
+  "rust": [
+    {"label":"close-rejection-retry/disabled","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,0,0,0,0,0],"queue":["c1"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/full","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,0,0,0,0,0],"queue":["c1"],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/drain","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/retry","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/drain2","counts":[6,6,0,0],"pending":[],"closing":[1],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/observed","counts":[5,5,0,0],"pending":[],"closing":[],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/retry2","counts":[5,5,0,0],"pending":[],"closing":[],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/before-cooldown","counts":[5,5,0,0],"pending":[],"closing":[],"failed":[-1,0,0,0,0,0],"queue":[],"watermark":-1,"refusals":0,"records":0},
+    {"label":"close-rejection-retry/equal-cooldown","counts":[5,5,0,0],"pending":[],"closing":[2],"failed":[-1,0,3000000000,3000000000,3000000000,3000000000],"queue":["c2"],"watermark":-1,"refusals":0,"records":0}
+  ]
+}

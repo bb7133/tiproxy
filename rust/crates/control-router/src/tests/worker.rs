@@ -69,7 +69,10 @@ async fn shared_go_worker_clock_events() -> TestResult {
     if let Ok(output) = std::env::var("CPROUTE_WORKER_OUTPUT") {
         std::fs::write(output, serde_json::to_string_pretty(&rows)? + "\n")?;
     }
-    println!("CP-ROUTE worker actual Go events matched: {}", rows.len());
+    println!(
+        "CP-ROUTE worker observations checked: {} (including explicit T3 close-rejection contract)",
+        rows.len()
+    );
     Ok(())
 }
 
@@ -334,16 +337,36 @@ async fn observe_case(
             &sim.sender,
             &format!("{}/{}", text(case, "name"), text(e, "label")),
         );
-        assert_eq!(
-            row,
-            expected[rows.len()],
-            "WORKER_GO_CLOCK {}",
-            row["label"]
-        );
+        check_worker_observation(case, &row, &expected[rows.len()], rows.len())?;
         rows.push(row);
     }
     check_refusal_record(case, &sim)?;
     Ok(rows)
+}
+
+fn check_worker_observation(
+    case: &serde_json::Value,
+    row: &serde_json::Value,
+    expected: &serde_json::Value,
+    index: usize,
+) -> TestResult {
+    if text(case, "name") == "close-rejection-retry" {
+        // T3 intentionally adds rejection cooldown to force-close admission.
+        // Assert both complete histories; never normalize away the mismatch.
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("worker_close_rejection.json"))?;
+        assert_eq!(
+            *expected, contract["go"][index],
+            "WORKER_GO_CLOCK legacy close rejection"
+        );
+        assert_eq!(
+            row, &contract["rust"][index],
+            "WORKER_GO_CLOCK T3 close rejection"
+        );
+    } else {
+        assert_eq!(row, expected, "WORKER_GO_CLOCK {}", row["label"]);
+    }
+    Ok(())
 }
 
 fn check_refusal_record(case: &serde_json::Value, sim: &MigrationSimulation) -> TestResult {

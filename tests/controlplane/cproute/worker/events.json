@@ -498,6 +498,18 @@
         "op": "tick",
         "at": 6,
         "enabled": false
+      },
+      {
+        "label": "before-cooldown",
+        "op": "tick",
+        "at": 2999999999,
+        "enabled": false
+      },
+      {
+        "label": "equal-cooldown",
+        "op": "tick",
+        "at": 3000000000,
+        "enabled": false
       }
     ]
   },

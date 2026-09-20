@@ -17,10 +17,11 @@ CASES = [
     ("rate-equal-deadline", "scheduler.rs", "since(last) >= interval", "since(last) > interval", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("queue-extra-slot", "scheduler.rs", "entries.len() >= self.capacity", "entries.len() > self.capacity", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("refusal-record-boundary", "scheduler.rs", "since(last) >= Duration::from_secs(10)", "since(last) > Duration::from_secs(10)", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
-    ("rejected-offer-advances-watermark", "selector/scheduler.rs", "Ok(false)\n                                | Err(", "Ok(false) => { state.schedules.entry(*group).or_default().accepted(now); }, Err(", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
+    ("rejected-offer-advances-watermark", "selector/scheduler.rs", "Ok(false)\n                                        | Err(", "Ok(false) => { state.schedules.entry(*group).or_default().accepted(now); }, Err(", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("close-uses-old-balance-clock", "selector/scheduler.rs", "let now = clock.close_now();", "let now = clock.balance_now();", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
-    ("close-needs-redirect-capability", "selector/scheduler.rs", "self.close_timed_out(&mut state, candidate, sender, stop, clock)", "if redirects_enabled { self.close_timed_out(&mut state, candidate, sender, stop, clock) } else { Ok(()) }", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
-    ("close-rejection-admitted", "selector/scheduler.rs", "if sender.try_send(close.clone()).is_ok() {", "if sender.try_send(close.clone()).is_ok() || true {", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
+    ("close-needs-redirect-capability", "selector/scheduler.rs", "self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected)", "if redirects_enabled { self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected) } else { Ok(()) }", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
+    ("close-rejection-admitted", "selector/scheduler.rs", "state.ledger.reject_close(&session, now)?;", "state.ledger.admit_close(close);", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
+    ("close-cooldown-equal-deadline", "ledger.rs", "since(failed) < Duration::from_secs(3))\n        {\n            return Err(LedgerError::CoolingDown);\n        }\n        self.next_close", "since(failed) <= Duration::from_secs(3))\n        {\n            return Err(LedgerError::CoolingDown);\n        }\n        self.next_close", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("close-admission-settles", "selector/scheduler.rs", "state.ledger.admit_close(close);", "state.ledger.admit_close(close.clone()); state.ledger.observe_close(&close);", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("failover-first-time-reset", "selector/scheduler.rs", "backend.failover_since.get_or_insert(now);", "backend.failover_since = Some(now);", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
     ("failover-never-clears", "selector/scheduler.rs", "backend.failover_since = None;", "", "shared_go_worker_clock_events", "WORKER_GO_CLOCK"),
@@ -65,8 +66,13 @@ def main():
                 raise RuntimeError("worker live baseline failed:\n" + r.stdout)
         baseline()
         source = root / "rust/crates/control-router/src"
+        requested = set(sys.argv[1:])
+        unknown = requested - {case[0] for case in CASES}
+        if unknown:
+            raise RuntimeError(f"unknown worker mutations: {sorted(unknown)}")
+        cases = [case for case in CASES if not requested or case[0] in requested]
         missed = []
-        for name, file, before, after, selection, marker in CASES:
+        for name, file, before, after, selection, marker in cases:
             path = source / file
             original = path.read_text()
             if before not in original:
@@ -85,7 +91,7 @@ def main():
         baseline()
         if missed:
             raise RuntimeError(f"undetected worker mutations: {missed}")
-        print(f"CP-ROUTE worker restored baseline passed: {len(CASES)} mutations", flush=True)
+        print(f"CP-ROUTE worker restored baseline passed: {len(cases)} mutations", flush=True)
 
 if __name__ == "__main__":
     main()

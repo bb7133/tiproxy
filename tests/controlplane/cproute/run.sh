@@ -22,15 +22,16 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 cd "$repo_root"
 
 if grep -R -n -E 'control_proto|control-proto' \
-    rust/crates/control-routing rust/crates/control-router rust/crates/dataplane/src/route.rs; then
+    rust/crates/control-routing rust/crates/control-router \
+    rust/crates/dataplane/src/route.rs rust/crates/dataplane/src/route_local.rs; then
     echo "CP-ROUTE domain leaks the legacy protocol dependency" >&2
     exit 1
 fi
-# T1 composes the Rust route owner at the process root, while the session
-# dataplane remains behind the route-channel abstraction and cannot take a
-# direct dependency on the owner crate.
-if grep -n -E 'control-router|control_router' rust/crates/dataplane/Cargo.toml; then
-    echo "CP-ROUTE owner leaked into the session dataplane" >&2
+# T1 constructs the owner at the process root; T2/T3 bind each session's
+# LocalRouteChannel and exact command/lease tokens directly to that owner.
+# The local channel must remain independent of the legacy wire protocol above.
+if ! grep -q -E '^control-router\.workspace = true$' rust/crates/dataplane/Cargo.toml; then
+    echo "CP-ROUTE local session route owner dependency is missing" >&2
     exit 1
 fi
 if ! grep -q -E '^control-router\.workspace = true$' rust/crates/tiproxy-rs/Cargo.toml; then
