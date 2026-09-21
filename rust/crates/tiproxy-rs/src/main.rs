@@ -65,9 +65,9 @@ use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsExporter, MetricsRecorder, MetricsRegistry, MigrationMetrics, ServerError,
-    SystemMemoryProbe, SystemTimeMonitor, install_session_log_writer, spawn_metrics_exporter,
-    spawn_system_time_monitor,
+    MetricsExporter, MetricsRecorder, MetricsRegistry, MigrationMetrics, PlaneMigrationState,
+    ServerError, SystemMemoryProbe, SystemTimeMonitor, install_session_log_writer,
+    spawn_metrics_exporter, spawn_system_time_monitor,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -771,6 +771,11 @@ async fn run(options: Options) -> Result<(), String> {
     // the same non-blocking recorder the SQL path uses, before the plane runs
     // so no router incarnation is built without a sink.
     route_plane.set_migration_sink(Arc::new(MigrationMetrics::new(metrics.clone())));
+    // The three migration families are served from router and process state
+    // at scrape time, not accumulated from those notifications.
+    metrics_registry.set_migration_state_source(Arc::new(PlaneMigrationState::new(
+        route_plane_handle.clone(),
+    )));
     // CP-ADMIN's debug redirect sweeps every current router.
     let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {

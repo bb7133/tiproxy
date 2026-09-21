@@ -392,15 +392,43 @@ impl RegistryState {
     }
 }
 
+/// Supplies the authoritative migration state at render time.
+///
+/// The three session-migration families are not accumulated from
+/// notifications: a bounded queue drops observations by design, and a lost one
+/// would make a delta permanently wrong. They are read from router and
+/// process state instead, so a missed notification costs at most staleness.
+///
+/// Implementations take router locks, so this is called with **no** registry
+/// lock held: the settlement path runs router lock then registry, and
+/// inverting that here would deadlock against it.
+pub trait MigrationStateSource: Send + Sync {
+    /// In-flight counts summed over live incarnations, plus the process-level
+    /// cumulative history.
+    fn migration_state(&self) -> control_router::MigrationSnapshot;
+}
+
 /// Process-local cumulative store behind the native Prometheus exposition.
 ///
-/// The exporter feeds it through the same [`Aggregator`] mapping that produces
-/// the bridge deltas, so the `/metrics` text rendered here and the Go-side
-/// merge of those deltas describe the same series. Counters and histograms
-/// reset with the process, which is ordinary Prometheus counter semantics.
-#[derive(Debug, Default)]
+/// Counters and histograms reset with the process, which is ordinary
+/// Prometheus counter semantics. The three session-migration families are the
+/// exception: nothing about them is stored here, they are read from
+/// authoritative state when the exposition renders.
+#[derive(Default)]
 pub struct MetricsRegistry {
     state: Mutex<RegistryState>,
+    /// Deliberately not inside `state`: reading it must not need the lock
+    /// that rendering takes, so the snapshot can be fetched before it.
+    migrations: Mutex<Option<Arc<dyn MigrationStateSource>>>,
+}
+
+impl std::fmt::Debug for MetricsRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetricsRegistry")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MetricsRegistry {
@@ -408,6 +436,27 @@ impl MetricsRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs the authoritative source for the migration families.
+    pub fn set_migration_state_source(&self, source: Arc<dyn MigrationStateSource>) {
+        *self
+            .migrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads migration state while holding no registry lock: the source is
+    /// cloned out and its guard dropped before the provider runs.
+    fn migration_state(&self) -> control_router::MigrationSnapshot {
+        let source = self
+            .migrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.migration_state())
+            .unwrap_or_default()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
@@ -477,9 +526,18 @@ impl MetricsRegistry {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn render_prometheus_text(&self) -> String {
+        // Fetched first, holding nothing: the provider takes router locks and
+        // the settlement path already runs router lock then registry.
+        let migrations = self.migration_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_migration_family(spec, &migrations) {
+                // Served from authoritative state, never from anything this
+                // registry accumulated.
+                out.push_str(&rendered);
+                continue;
+            }
             let mut lines = String::new();
             match spec.kind {
                 MetricKind::Counter => {
@@ -560,6 +618,128 @@ fn push_histogram(
     );
     push_sample(out, spec.name, "_sum", labels, None, value.sum);
     push_sample(out, spec.name, "_count", labels, None, value.count as f64);
+}
+
+/// Renders one of the three session-migration families from authoritative
+/// state, or `None` for any other family.
+///
+/// Label order matches Go's exposition, which sorts label pairs by name.
+fn render_migration_family(
+    spec: &MetricSpec,
+    state: &control_router::MigrationSnapshot,
+) -> Option<String> {
+    let mut lines = String::new();
+    match spec.name {
+        "tiproxy_balance_pending_migrate" => {
+            // Every label set ever seen is emitted, so a series that has
+            // returned to zero keeps reporting instead of disappearing.
+            for (from, to, reason) in &state.history.known_pending {
+                let labels = control_router::MigrationLabels {
+                    from: from.clone(),
+                    to: to.clone(),
+                    reason: *reason,
+                };
+                let value = state.pending.get(&labels).copied().unwrap_or(0);
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[
+                        ("from", from.clone()),
+                        ("reason", reason.metric_name().to_owned()),
+                        ("to", to.clone()),
+                    ],
+                    None,
+                    counter_as_f64(value),
+                );
+            }
+        }
+        "tiproxy_balance_migrate_total" => {
+            for (key, count) in &state.history.terminals {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[
+                        ("from", key.from.clone()),
+                        ("migrate_res", migrate_result(key.succeeded).to_owned()),
+                        ("reason", key.reason.metric_name().to_owned()),
+                        ("to", key.to.clone()),
+                    ],
+                    None,
+                    counter_as_f64(*count),
+                );
+            }
+        }
+        "tiproxy_balance_migrate_duration_seconds" => {
+            for (key, series) in &state.history.durations {
+                let labels = [
+                    ("from", key.from.clone()),
+                    ("migrate_res", migrate_result(key.succeeded).to_owned()),
+                    ("to", key.to.clone()),
+                ];
+                for (count, bound) in series
+                    .buckets
+                    .iter()
+                    .zip(control_router::MIGRATE_DURATION_BUCKETS)
+                {
+                    push_sample(
+                        &mut lines,
+                        spec.name,
+                        "_bucket",
+                        &labels,
+                        Some(bound),
+                        counter_as_f64(*count),
+                    );
+                }
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "_bucket",
+                    &labels,
+                    Some(f64::INFINITY),
+                    counter_as_f64(series.count),
+                );
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a summed latency never approaches 2^53 nanoseconds"
+                )]
+                let sum = series.sum_nanos as f64 / 1e9;
+                push_sample(&mut lines, spec.name, "_sum", &labels, None, sum);
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "_count",
+                    &labels,
+                    None,
+                    counter_as_f64(series.count),
+                );
+            }
+        }
+        _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// Counters are rendered as floats, as Prometheus text exposition requires.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a migration counter never approaches 2^53"
+)]
+const fn counter_as_f64(value: u64) -> f64 {
+    value as f64
+}
+
+/// Go `succeedToLabel`.
+const fn migrate_result(succeeded: bool) -> &'static str {
+    if succeeded { "succeed" } else { "fail" }
 }
 
 fn push_sample(
@@ -728,6 +908,25 @@ impl MigrationMetrics {
     }
 }
 
+/// Reads migration state from the route plane for the exposition.
+pub struct PlaneMigrationState {
+    handle: control_router::RoutePlaneHandle,
+}
+
+impl PlaneMigrationState {
+    /// Wraps the route-plane handle as the exposition's state source.
+    #[must_use]
+    pub const fn new(handle: control_router::RoutePlaneHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl MigrationStateSource for PlaneMigrationState {
+    fn migration_state(&self) -> control_router::MigrationSnapshot {
+        self.handle.migration_snapshot()
+    }
+}
+
 impl control_router::MigrationSink for MigrationMetrics {
     fn record(&self, observation: control_router::MigrationObservation) {
         let reason = observation.reason.metric_name();
@@ -830,10 +1029,6 @@ enum PendingMetric {
 
 struct Aggregator {
     pending: BTreeMap<MetricKey, PendingMetric>,
-    /// Running count per `pending_migrate` label set. The registry stores an
-    /// absolute gauge value, so the +1/-1 that Go applies to its gauge is
-    /// tracked here and written out as the resulting total.
-    migrations_in_flight: BTreeMap<MetricKey, i64>,
     overflow_dropped: u64,
     /// Cumulative twin of `pending`: every accepted delta is also folded into
     /// the process-local registry that backs the native `/metrics` exposition.
@@ -850,35 +1045,9 @@ impl Aggregator {
     fn with_registry(registry: Arc<MetricsRegistry>) -> Self {
         Self {
             pending: BTreeMap::new(),
-            migrations_in_flight: BTreeMap::new(),
             overflow_dropped: 0,
             registry,
         }
-    }
-
-    /// Applies Go's +1 on an accepted offer / -1 on settlement to the
-    /// `pending_migrate` gauge. The count is clamped at zero so an unmatched
-    /// settlement can never publish a negative number of pending migrations.
-    fn migration_in_flight(&mut self, from: &str, to: &str, reason: &'static str, delta: i64) {
-        let key = MetricKey::new(
-            "tiproxy_balance_pending_migrate",
-            vec![
-                ("from", from.to_owned()),
-                ("reason", reason.to_owned()),
-                ("to", to.to_owned()),
-            ],
-        );
-        if !self.ensure_series(&key) {
-            return;
-        }
-        let count = self.migrations_in_flight.entry(key.clone()).or_insert(0);
-        *count = count.saturating_add(delta).max(0);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a pending-migration count never approaches 2^53"
-        )]
-        let value = *count as f64;
-        self.registry.set_labeled_gauge(&key, value);
     }
 
     fn get_backend(&mut self, duration: Duration, succeeded: bool) {
@@ -893,46 +1062,6 @@ impl Aggregator {
                 vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
             ),
             1,
-        );
-    }
-
-    /// Go `addMigrateMetrics`: decrement the pending gauge, count the result,
-    /// and observe the elapsed time. The duration series is labelled without
-    /// the reason, exactly as Go labels it.
-    fn migration_settled(
-        &mut self,
-        from: String,
-        to: String,
-        reason: &'static str,
-        succeeded: bool,
-        elapsed: Duration,
-    ) {
-        self.migration_in_flight(&from, &to, reason, -1);
-        // Go's `succeedToLabel`.
-        let result = if succeeded { "succeed" } else { "fail" };
-        self.counter(
-            MetricKey::new(
-                "tiproxy_balance_migrate_total",
-                vec![
-                    ("from", from.clone()),
-                    ("migrate_res", result.to_owned()),
-                    ("reason", reason.to_owned()),
-                    ("to", to.clone()),
-                ],
-            ),
-            1,
-        );
-        self.histogram(
-            MetricKey::new(
-                "tiproxy_balance_migrate_duration_seconds",
-                vec![
-                    ("from", from),
-                    ("migrate_res", result.to_owned()),
-                    ("to", to),
-                ],
-            ),
-            elapsed.as_secs_f64(),
-            &MIGRATE_BUCKETS,
         );
     }
 
@@ -999,16 +1128,10 @@ impl Aggregator {
                 duration,
                 succeeded,
             } => self.get_backend(duration, succeeded),
-            Observation::MigrationIssued { from, to, reason } => {
-                self.migration_in_flight(&from, &to, reason, 1);
-            }
-            Observation::MigrationSettled {
-                from,
-                to,
-                reason,
-                succeeded,
-                elapsed,
-            } => self.migration_settled(from, to, reason, succeeded, elapsed),
+            // The three migration families render from authoritative router
+            // and process state, so accumulating them here would double
+            // count. These observations remain a notification path only.
+            Observation::MigrationIssued { .. } | Observation::MigrationSettled { .. } => {}
             Observation::DialBackendFailed { backend } => self.counter(
                 MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
@@ -1838,21 +1961,84 @@ mod tests {
     /// batch. Must equal the generator's constants.
     const FIXED_KEEP_ALIVES: u32 = 3;
     const FIXED_TIME_JUMPS: u32 = 2;
-    /// (from, to, reason, succeeded, seconds, settled) — mirrors
-    /// `fixedMigrations` in `tests/dataplane/metrics/gen/main.go`. Two pairs
-    /// settle back to a zero pending gauge; the third stays in flight.
-    const FIXED_MIGRATIONS: &[(&str, &str, &str, bool, f64, bool)] = &[
-        ("10.0.0.1:4000", "10.0.0.2:4000", "conn", true, 0.25, true),
-        ("10.0.0.1:4000", "10.0.0.2:4000", "conn", false, 0.5, true),
-        (
-            "10.0.0.1:4000",
-            "10.0.0.3:4000",
-            "status",
-            false,
-            0.0,
-            false,
-        ),
-    ];
+    /// The duration bounds exist in two crates: the router buckets a
+    /// settlement when it records it, and this catalogue declares the same
+    /// bounds for the exposition. They must stay identical or the rendered
+    /// histogram would not match the counts behind it.
+    #[test]
+    fn migrate_buckets_match_the_router_that_fills_them() {
+        assert_eq!(
+            MIGRATE_BUCKETS.as_slice(),
+            control_router::MIGRATE_DURATION_BUCKETS.as_slice()
+        );
+    }
+
+    /// Mirrors `fixedMigrations` in `tests/dataplane/metrics/gen/main.go`:
+    /// one succeeded and one failed migration whose pending series return to
+    /// zero, and a third still in flight.
+    struct FixedMigrations;
+
+    impl MigrationStateSource for FixedMigrations {
+        fn migration_state(&self) -> control_router::MigrationSnapshot {
+            let (from, to) = ("10.0.0.1:4000".to_owned(), "10.0.0.2:4000".to_owned());
+            let settled_reason =
+                control_router::RedirectReason::Balance(control_router::Factor::Connection);
+            let flight_reason =
+                control_router::RedirectReason::Balance(control_router::Factor::Status);
+            let flight_to = "10.0.0.3:4000".to_owned();
+            let mut snapshot = control_router::MigrationSnapshot::default();
+            snapshot.pending.insert(
+                control_router::MigrationLabels {
+                    from: from.clone(),
+                    to: flight_to.clone(),
+                    reason: flight_reason,
+                },
+                1,
+            );
+            snapshot
+                .history
+                .known_pending
+                .insert((from.clone(), to.clone(), settled_reason));
+            snapshot
+                .history
+                .known_pending
+                .insert((from.clone(), flight_to, flight_reason));
+            for (succeeded, seconds) in [(true, 0.25_f64), (false, 0.5_f64)] {
+                snapshot.history.terminals.insert(
+                    control_router::TerminalKey {
+                        from: from.clone(),
+                        to: to.clone(),
+                        reason: settled_reason,
+                        succeeded,
+                    },
+                    1,
+                );
+                let mut series = control_router::DurationSeries {
+                    count: 1,
+                    sum_nanos: Duration::from_secs_f64(seconds).as_nanos(),
+                    buckets: [0; 26],
+                };
+                for (count, bound) in series
+                    .buckets
+                    .iter_mut()
+                    .zip(control_router::MIGRATE_DURATION_BUCKETS)
+                {
+                    if seconds <= bound {
+                        *count = 1;
+                    }
+                }
+                snapshot.history.durations.insert(
+                    control_router::DurationKey {
+                        from: from.clone(),
+                        to: to.clone(),
+                        succeeded,
+                    },
+                    series,
+                );
+            }
+            snapshot
+        }
+    }
 
     /// Go's monitor counts a jump only when the clock reads earlier after the
     /// wait than before it, calls back every tenth tick, and the keepalive
@@ -2182,25 +2368,12 @@ mod tests {
                 1,
             );
         }
-        // The same migration fixture the Go oracle applies, driven through the
-        // real observation path rather than written straight to the registry.
-        for (from, to, reason, succeeded, seconds, settled) in FIXED_MIGRATIONS {
-            aggregator.observe(Observation::MigrationIssued {
-                from: (*from).to_owned(),
-                to: (*to).to_owned(),
-                reason,
-            });
-            if !settled {
-                continue;
-            }
-            aggregator.observe(Observation::MigrationSettled {
-                from: (*from).to_owned(),
-                to: (*to).to_owned(),
-                reason,
-                succeeded: *succeeded,
-                elapsed: Duration::from_secs_f64(*seconds),
-            });
-        }
+        // The same migration fixture the Go oracle applies. These families are
+        // rendered from authoritative state, so the fixture is installed as
+        // that state rather than pushed through the observation path.
+        aggregator
+            .registry
+            .set_migration_state_source(Arc::new(FixedMigrations));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");
