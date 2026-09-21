@@ -40,6 +40,7 @@
 //! against the process owner AND the caller's source [`GenerationGate`]; a
 //! fence failure is terminal and wins over any coincident I/O error.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -125,6 +126,27 @@ impl From<ClusterConnectError> for SqlGreetingError {
         }
     }
 }
+
+/// One observed SQL-port dial.
+///
+/// Carries when the dial finished as well as how long it took, because the
+/// order these are published in is the dial-completion order, not the order
+/// the surrounding probes finish -- a slow greeting inverts those. `sequence`
+/// breaks ties between dials that finish at the same instant, so the order is
+/// total rather than merely mostly-defined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlDialObservation {
+    /// How long the connect took: Go's `ping_duration_seconds`.
+    pub duration: Duration,
+    /// When the connect returned, frozen at the same point as `duration`.
+    pub completed_at: Instant,
+    /// Monotonic within this process, assigned at the same point, so two
+    /// dials sharing an instant still have a deterministic order.
+    pub sequence: u64,
+}
+
+/// Assigns `SqlDialObservation::sequence`.
+static DIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// An owner-fenced, single-attempt SQL-greeting probe for one backend cluster's
 /// material and generation. Reusable across probes within one
@@ -223,15 +245,22 @@ impl SqlGreetingProbe {
         host: &str,
         port: u16,
         source_gate: &GenerationGate,
-    ) -> (Duration, Result<(), SqlGreetingError>) {
+    ) -> (SqlDialObservation, Result<(), SqlGreetingError>) {
         let started = Instant::now();
         let dialed = tokio::time::timeout(
             self.dial_timeout,
             self.connector.connect_once(host, port, source_gate),
         )
         .await;
-        // Measured here: the dial is done, the greeting is not yet read.
-        let dial = started.elapsed();
+        // Frozen here: the dial is done, the greeting is not yet read. The
+        // completion instant is taken at the same point, because ordering
+        // these by when their probes finish would let a slow greeting put a
+        // later dial first.
+        let dial = SqlDialObservation {
+            duration: started.elapsed(),
+            completed_at: Instant::now(),
+            sequence: DIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        };
         let mut stream = match dialed {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => return (dial, Err(error.into())),

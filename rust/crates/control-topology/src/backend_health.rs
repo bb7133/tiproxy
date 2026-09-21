@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use control_external::{
     ClusterHttpClient, ClusterHttpConfigError, EtcdClientConfig, HttpProbePolicy,
-    SqlGreetingConfigError, SqlGreetingProbe,
+    SqlDialObservation, SqlGreetingConfigError, SqlGreetingProbe,
 };
 use control_plane::OwnerToken;
 use serde::Deserialize;
@@ -98,14 +98,18 @@ pub struct BackendHealth {
     /// round uses Go's `setLocal` rule (no proxy zone → `true`; equal `zone`
     /// labels → `true`; otherwise `false`), a disabled round leaves it `false`.
     pub local: bool,
-    /// Duration of the last SQL-port dial attempt: Go's
+    /// The last SQL-port dial this stage observed: Go's
     /// `ping_duration_seconds`.
     ///
     /// Go times only `DialContext`, inside its retry loop, and sets the gauge
     /// on every attempt including failures. The value is therefore the last
     /// attempt alone -- not the whole health check, and not the retries plus
-    /// their backoff. `None` when this stage dialled the SQL port not at all.
-    pub sql_dial: Option<Duration>,
+    /// their backoff. It carries its completion instant because publication
+    /// order is dial-completion order; ordering by when the surrounding
+    /// probes finish would let a slow greeting reverse two dials. `None` when
+    /// this stage dialled the SQL port not at all, which must never be taken
+    /// as a reason to zero a value already published.
+    pub sql_dial: Option<SqlDialObservation>,
 }
 
 impl BackendHealth {
@@ -487,7 +491,7 @@ impl ClusterHealthNetwork {
         backend: &MergedBackend,
         max_retries: u32,
         retry_interval: Duration,
-    ) -> (bool, Option<Duration>) {
+    ) -> (bool, Option<SqlDialObservation>) {
         if !handle.still_current(source) {
             return (false, None);
         }
@@ -1458,7 +1462,7 @@ mod tests {
             "the fixture must actually retry for this to mean anything"
         );
         assert!(
-            err_dial < SQL_RETRY_INTERVAL,
+            err_dial.duration < SQL_RETRY_INTERVAL,
             "the recorded dial is one attempt ({err_dial:?}), not the retries plus backoff"
         );
         let _ = dial;
@@ -1589,7 +1593,7 @@ mod tests {
             "the fixture must actually spend the read budget ({whole_check:?})"
         );
         assert!(
-            recorded < dial_budget / 4,
+            recorded.duration < dial_budget / 4,
             "the recorded dial is the connect alone ({recorded:?}), not the greeting read \
              that took {whole_check:?}"
         );
@@ -1857,6 +1861,67 @@ mod tests {
         );
     }
 
+    /// Ordering must follow dial completion, not probe completion. A backend
+    /// that connects first but greets slowly finishes its probe last, so
+    /// ordering by probe completion would publish its dial as the newer one
+    /// and overwrite a dial that actually happened later.
+    #[tokio::test]
+    async fn a_slow_greeting_does_not_reorder_the_dials() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+
+        // Connects first, greets after a long pause: its probe finishes last.
+        let slow = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let slow_addr = slow
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("address: {e}"));
+        let slow_server = tokio::spawn(async move {
+            let (mut stream, _) = slow
+                .accept()
+                .await
+                .unwrap_or_else(|e| unreachable!("accept: {e}"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = stream.write_all(&[3, 0, 0, 0, 0x0a, b'8', 0]).await;
+        });
+
+        let (_, first) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &slow_addr.to_string()),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let first = first.unwrap_or_else(|| unreachable!("the slow backend was dialled"));
+
+        // Dialled afterwards, greets at once: its probe finishes first.
+        let (port, _accepted, _first) = bind_greeter(Greeting::V10).await;
+        let (_, second) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let second = second.unwrap_or_else(|| unreachable!("the fast backend was dialled"));
+
+        assert!(
+            second.completed_at >= first.completed_at,
+            "the later dial must not be ordered before the earlier one"
+        );
+        assert!(
+            second.sequence > first.sequence,
+            "and the sequence breaks any tie deterministically"
+        );
+        let _ = slow_server.await;
+    }
+
     /// Dial timing excludes waiting for the `MySQL` greeting after TCP accepts.
     #[tokio::test]
     async fn review_sql_dial_excludes_delayed_greeting() {
@@ -1902,7 +1967,7 @@ mod tests {
         );
         assert!(elapsed >= delay, "fixture must await the delayed greeting");
         assert!(
-            sql_dial < delay / 2,
+            sql_dial.duration < delay / 2,
             "SQL dial metric must exclude the scripted 400ms greeting wait: {sql_dial:?}"
         );
     }
