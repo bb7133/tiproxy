@@ -434,19 +434,35 @@ something real from Rust's own state in a later slice.** Go keeps no listener
 for them, and they are not carried over the control bridge: that path is the
 `MetricsBatch` body this slice retires, so reviving it would undo slice 5c.
 
-Scope of the later slice, 13 of the 15:
+Scope of the later slice, 12 of the 15:
 
-- `backend`, `monitor` and `server` (8 families) still have live Go producers
-  behind them (the health-check loop, the process monitor, owner election), so
-  Rust reproduces the same observations from its own topology and process state.
+- `backend` (4 families) come from the health-check loop, so Rust reproduces
+  them from its own topology state.
 - `balance` (5 families) must be re-sourced rather than copied. The Go values
   stopped describing real routing when Rust took ownership under capability 6:
   no Go `RouterAdapter` is constructed, so its connection ledger is never fed.
   The observables themselves remain meaningful and Rust holds the data — the
   route ledger carries per-session `sessions`/`active`/`incoming`/`outgoing`
   counts and the migration and redirect paths run in Rust.
-- `replay` (2 families) stays retired: traffic capture and replay are
-  unsupported in Rust mode, so the series has no producer on either side.
+- `monitor` (2 families) come from one loop, not two sources. Go samples the
+  wall clock every 100ms, counts a jump when it reads earlier than before the
+  wait, calls back every tenth tick and raises the keepalive every fifth
+  callback, so the keepalive is that monitor's heartbeat rather than a lease.
+  Rust reproduces the loop and both counters together.
+- `server_owner` is read from live local ownership, not from a snapshot or a
+  peer record, and follows Go in *deleting* the series when the process
+  retires rather than zeroing it, so a retired owner leaves the exposition.
+  Go's family also covers `vip/<address>` elections; whether Rust has an
+  equivalent producer for those is not yet established.
+
+Two families are retired outright rather than reimplemented:
+
+- `server_maxprocs` reports `GOMAXPROCS`, a Go runtime concept with no Rust
+  equivalent. Reusing the name for the async runtime's worker count would keep
+  the name while changing its meaning, so the name retires with the Go
+  process. A worker-count gauge, if wanted later, gets a name of its own.
+- `replay` (2 families): traffic capture and replay are unsupported in Rust
+  mode, so the series has no producer on either side.
 
 Until that slice lands, these observations are absent; this document is their
 declaration, not an implementation.
