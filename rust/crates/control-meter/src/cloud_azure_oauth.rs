@@ -57,6 +57,8 @@ impl std::fmt::Debug for Credential {
 impl Credential {
     pub(super) fn new(source: Source, mut options: ClientOptions) -> azure_core::Result<Arc<Self>> {
         options.per_call_policies.push(Arc::new(ClaimsPolicy));
+        // AzureHttp owns Go-compatible retries; avoid a second SDK retry loop.
+        options.retry = azure_core::http::RetryOptions::none();
         let value = Arc::new(Self {
             source,
             options,
@@ -251,6 +253,8 @@ mod tests {
         assertion: String,
         username: bool,
         password: bool,
+        #[serde(default)]
+        body_stable: Option<bool>,
     }
     #[derive(Deserialize, Clone)]
     struct ObjectStep {
@@ -264,12 +268,26 @@ mod tests {
         challenge: String,
         tokens: Vec<String>,
     }
+    #[derive(Clone, Default, Deserialize)]
+    struct Reply {
+        status: u16,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default)]
+        drop: bool,
+    }
     #[derive(Deserialize)]
     struct Row {
         source: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        cancel_on_retry: bool,
+        #[serde(default)]
+        responses: Vec<Reply>,
         steps: Vec<Step>,
         requests: Vec<Observation>,
-        objects: Vec<ObjectStep>,
+        objects: Option<Vec<ObjectStep>>,
     }
     #[derive(Clone)]
     struct Io {
@@ -278,10 +296,41 @@ mod tests {
         key: openssl::pkey::PKey<openssl::pkey::Private>,
         requests: Arc<StdMutex<Vec<Observation>>>,
         object: Arc<StdMutex<ObjectState>>,
+        replies: Vec<Reply>,
+        first_body: Arc<StdMutex<Option<Bytes>>>,
     }
     impl std::fmt::Debug for Io {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("OAuthFixtureIo")
+        }
+    }
+    impl Io {
+        fn token_response(&self, request_count: usize) -> reqsign_core::Result<Response<Bytes>> {
+            let reply = if self.replies.is_empty() {
+                Reply::default()
+            } else {
+                self.replies[(request_count - 1).min(self.replies.len() - 1)].clone()
+            };
+            if reply.drop {
+                return Err(reqsign_core::Error::unexpected("fixture token disconnect"));
+            }
+            let status = if reply.status == 0 { 200 } else { reply.status };
+            let body = if status == 204 {
+                String::new()
+            } else if !(200..300).contains(&status) {
+                r#"{"error":"synthetic_token_failure"}"#.into()
+            } else {
+                serde_json::json!({"access_token":format!("fake-{request_count}"),"expires_in":3600,"token_type":"Bearer"}).to_string()
+            };
+            let mut response = Response::builder()
+                .status(status)
+                .header("content-type", "application/json");
+            for (name, value) in reply.headers {
+                response = response.header(name, value);
+            }
+            response
+                .body(body.into())
+                .map_err(|_| reqsign_core::Error::unexpected("fixture response"))
         }
     }
     impl reqsign_core::FileRead for Io {
@@ -378,15 +427,19 @@ mod tests {
                 assertion: assertion.into(),
                 username: get("username") == "fake@fixture.invalid",
                 password: get("password") == "fake-password",
+                body_stable: if self.replies.is_empty() {
+                    None
+                } else {
+                    let mut first = self
+                        .first_body
+                        .lock()
+                        .unwrap_or_else(|e| unreachable!("{e}"));
+                    Some(first.get_or_insert_with(|| request.body().clone()) == request.body())
+                },
             };
             let mut requests = self.requests.lock().unwrap_or_else(|e| unreachable!("{e}"));
             requests.push(row);
-            let body=serde_json::json!({"access_token":format!("fake-{}",requests.len()),"expires_in":3600,"token_type":"Bearer"}).to_string();
-            Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(body.into())
-                .map_err(|_| reqsign_core::Error::unexpected("fixture response"))
+            self.token_response(requests.len())
         }
     }
     fn source_env(source: &str, client: String) -> HashMap<String, String> {
@@ -429,10 +482,23 @@ mod tests {
     }
     #[tokio::test]
     async fn oauth_claims_and_resource_caches_match_actual_go_credentials() {
-        let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-oauth-go.json"))
-            .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 4);
+        replay(include_str!("../testdata/azure-oauth-go.json"), 4, 13, 4).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn oauth_http_retries_match_actual_go_credentials() {
+        replay(
+            include_str!("../testdata/azure-oauth-retry-go.json"),
+            112,
+            2,
+            0,
+        )
+        .await;
+    }
+    async fn replay(fixture: &str, rows_count: usize, steps_count: usize, objects_count: usize) {
+        let rows: Vec<Row> = serde_json::from_str(fixture).unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(rows.len(), rows_count);
         for (index, row) in rows.into_iter().enumerate() {
+            let label = format!("{} {}", row.source, row.name);
             let (key, cert) = super::super::tests::key_cert();
             let mut pem = cert.to_pem().unwrap_or_else(|e| unreachable!("{e}"));
             pem.extend(
@@ -445,6 +511,8 @@ mod tests {
                 key,
                 requests: Arc::new(StdMutex::new(Vec::new())),
                 object: Arc::new(StdMutex::new(ObjectState::default())),
+                replies: row.responses,
+                first_body: Arc::new(StdMutex::new(None)),
             };
             let envs = source_env(&row.source, io.client.clone());
             let context = Context::new()
@@ -457,19 +525,20 @@ mod tests {
             let source = super::super::AzureDefault::new(reqwest::Client::new(), context.clone())
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}"));
-            assert_eq!(row.steps.len(), 13);
+            assert_eq!(row.steps.len(), steps_count);
             for (step_index, step) in row.steps.into_iter().enumerate() {
-                let result = source
-                    .token_for(&step.scope, step.claims.into_bytes())
-                    .await;
-                assert_eq!(
-                    result.is_err(),
-                    step.error,
-                    "{} step{step_index}",
-                    row.source
-                );
+                *io.first_body.lock().unwrap_or_else(|e| unreachable!("{e}")) = None;
+                let get = source.token_for(&step.scope, step.claims.into_bytes());
+                let result = if row.cancel_on_retry && step_index == 0 {
+                    tokio::time::timeout(std::time::Duration::from_millis(1), get)
+                        .await
+                        .unwrap_or(Err(crate::Error::Export("fixture caller cancelled")))
+                } else {
+                    get.await
+                };
+                assert_eq!(result.is_err(), step.error, "{label} step{step_index}");
                 if let Ok(token) = result {
-                    assert_eq!(token, step.token, "{} step{step_index}", row.source);
+                    assert_eq!(token, step.token, "{label} step{step_index}");
                 }
             }
             let signer = crate::cloud_azure::AzureSigner::Bearer(
@@ -477,8 +546,9 @@ mod tests {
             );
             let url = reqwest::Url::parse("https://login.microsoftonline.com/bucket/blob")
                 .unwrap_or_else(|e| unreachable!("{e}"));
-            assert_eq!(row.objects.len(), 4);
-            for (index, step) in row.objects.into_iter().enumerate() {
+            let objects = row.objects.unwrap_or_default();
+            assert_eq!(objects.len(), objects_count);
+            for (index, step) in objects.into_iter().enumerate() {
                 {
                     let mut state = io.object.lock().unwrap_or_else(|e| unreachable!("{e}"));
                     state.challenge = step.challenge;
@@ -499,8 +569,7 @@ mod tests {
                         .unwrap_or_else(|e| unreachable!("{e}"))
                         .tokens,
                     step.tokens,
-                    "{} object{index}",
-                    row.source
+                    "{label} object{index}"
                 );
             }
             assert_eq!(

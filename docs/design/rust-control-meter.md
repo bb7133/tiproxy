@@ -666,17 +666,42 @@ Regenerate with:
 bash rust/crates/control-meter/testdata/azure-oauth-go.sh
 ```
 
+OAuth token HTTP exchanges use one retry owner with the pinned azcore defaults:
+four total attempts for send failures and 408/429/500/502/503/504, shared
+Retry-After parsing, and a 60-second cap. The maintained SDK retry loop is
+disabled so it cannot multiply attempts. Token responses accept exactly 200
+and 201; the adapter normalizes 201 only for the SDK decoder. Password token
+requests follow the same policy. Request bytes survive retries, cancellation
+interrupts the backoff, and a later call can recover without a cached failure.
+
+The additional HTTP fixture records 112 real Go credential trajectories across
+the four sources, with 224 token steps and 232 normalized token POSTs. It covers
+terminal and retryable statuses, exhaustion followed by recovery, send errors,
+retry-header precedence/caps, stable request bodies, success caching and caller
+cancellation during retry sleep. The public per-call retry option reduces only
+ordinary backoff to 1ns; a public SDK retry-log listener cancels the caller
+context in cancellation cases. No SDK source, clock or cache is patched. The
+native replay uses paused Tokio time. Regenerate this fixture with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-oauth-go.sh --retry
+```
+
 These fixtures qualify token request fields, scope/claims/cache and object
 challenge behavior for the isolated managed authority. Native SDK instance and
 OpenID discovery, authority alias validation, federated password user realms,
-OAuth retry/error classification and refresh-token reuse are not covered by this
+OAuth semantic error classification and refresh-token reuse are not covered by this
 increment and remain open. The regex and permissive base64 dependencies reuse
 package versions already in Cargo.lock; this OAuth increment adds no dependency.
 
-Full default-credential/endpoint edge parity remains in progress, including
-general HTTP date and non-UTC host-zone Retry-After interpretation, endpoint
-and platform transport edges. Export failure retains the pending
-window for the next metering attempt.
+The remaining default-credential/endpoint boundaries have basic smoke coverage
+for default credential selection, fatal authentication, retry recovery, signed
+object writes and retained exports after failure. This does not establish full
+parity for the discovery/federation/refresh-token cases above, general HTTP dates,
+non-UTC host-zone Retry-After interpretation, or endpoint/platform transport
+edges. These remain declared limitations rather than additional exhaustive
+qualification gates. Export failure retains the pending window for the next
+metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would

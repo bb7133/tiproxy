@@ -295,43 +295,59 @@ impl Managed {
     }
 
     async fn send(&self, request: Request<Bytes>) -> azure_core::Result<Response<Bytes>> {
-        let imds = self.source == Source::Imds;
-        let max_retries = if imds { 6 } else { 3 };
-        for attempt in 0..=max_retries {
-            let result = self.context.http_send(request.clone()).await;
-            if let Ok(response) = &result {
-                let status = response.status().as_u16();
-                let retry = if imds {
-                    matches!(status, 404 | 410 | 429 | 500..=511) && status != 509
-                } else {
-                    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-                };
-                if !retry || attempt == max_retries {
-                    return result.map_err(|_| failure());
-                }
-            } else if attempt == max_retries {
-                return Err(failure());
-            }
-            let maximum = Duration::from_secs(if imds { 25 } else { 60 });
-            let server_delay = result.as_ref().ok().and_then(|r| retry_after(r.headers()));
-            if server_delay.is_some_and(|delay| delay > maximum) {
+        send_with_retry(&self.context, request, self.source == Source::Imds).await
+    }
+}
+
+/// OAuth uses the same azcore defaults as non-IMDS managed identity. Keep one
+/// retry owner so the maintained Rust SDK cannot multiply these attempts.
+pub(crate) async fn send_oauth(
+    context: &Context,
+    request: Request<Bytes>,
+) -> azure_core::Result<Response<Bytes>> {
+    send_with_retry(context, request, false).await
+}
+
+async fn send_with_retry(
+    context: &Context,
+    request: Request<Bytes>,
+    imds: bool,
+) -> azure_core::Result<Response<Bytes>> {
+    let max_retries = if imds { 6 } else { 3 };
+    for attempt in 0..=max_retries {
+        let result = context.http_send(request.clone()).await;
+        if let Ok(response) = &result {
+            let status = response.status().as_u16();
+            let retry = if imds {
+                matches!(status, 404 | 410 | 429 | 500..=511) && status != 509
+            } else {
+                matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+            };
+            if !retry || attempt == max_retries {
                 return result.map_err(|_| failure());
             }
-            // Go uses (2^try - 1) * base with [0.8, 1.3) jitter, then caps it.
-            let mut random = [0; 2];
-            let jitter = if getrandom::getrandom(&mut random).is_ok() {
-                0.8 + f64::from(u16::from_ne_bytes(random)) / 131_072.0
-            } else {
-                1.0
-            };
-            let factor = (1_u32 << (attempt + 1)) - 1;
-            let base = Duration::from_millis(if imds { 2000 } else { 800 });
-            let delay = (base * factor).mul_f64(jitter).min(maximum);
-            // CloudIo and the export operation supply outer request/operation deadlines.
-            tokio::time::sleep(server_delay.unwrap_or(delay)).await;
+        } else if attempt == max_retries {
+            return Err(failure());
         }
-        Err(failure())
+        let maximum = Duration::from_secs(if imds { 25 } else { 60 });
+        let server_delay = result.as_ref().ok().and_then(|r| retry_after(r.headers()));
+        if server_delay.is_some_and(|delay| delay > maximum) {
+            return result.map_err(|_| failure());
+        }
+        // Go uses (2^try - 1) * base with [0.8, 1.3) jitter, then caps it.
+        let mut random = [0; 2];
+        let jitter = if getrandom::getrandom(&mut random).is_ok() {
+            0.8 + f64::from(u16::from_ne_bytes(random)) / 131_072.0
+        } else {
+            1.0
+        };
+        let factor = (1_u32 << (attempt + 1)) - 1;
+        let base = Duration::from_millis(if imds { 2000 } else { 800 });
+        let delay = (base * factor).mul_f64(jitter).min(maximum);
+        // CloudIo and the export operation supply outer request/operation deadlines.
+        tokio::time::sleep(server_delay.unwrap_or(delay)).await;
     }
+    Err(failure())
 }
 
 #[async_trait::async_trait]

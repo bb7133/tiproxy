@@ -312,11 +312,12 @@ impl azure_core::http::HttpClient for AzureHttp {
         let azure_core::http::Body::Bytes(body) = request.body() else {
             return Err(error());
         };
-        let response = self
-            .0
-            .http_send(req.body(body.clone()).map_err(|_| error())?)
-            .await
-            .map_err(|_| error())?;
+        let response = crate::cloud_azure_managed::send_oauth(
+            &self.0,
+            req.body(body.clone()).map_err(|_| error())?,
+        )
+        .await
+        .map_err(|_| error())?;
         let (parts, body) = response.into_parts();
         let mut headers = azure_core::http::headers::Headers::new();
         for (name, value) in &parts.headers {
@@ -324,10 +325,28 @@ impl azure_core::http::HttpClient for AzureHttp {
                 headers.insert(name.as_str().to_owned(), value.to_owned());
             }
         }
+        if request.url().path().ends_with("/token")
+            && parts.status.is_success()
+            && !matches!(
+                parts.status,
+                http::StatusCode::OK | http::StatusCode::CREATED
+            )
+        {
+            // The certificate SDK accepts arbitrary 2xx; Go MSAL doesn't.
+            return Err(identity_error());
+        }
+        // Go MSAL accepts both 200 and 201 token responses. The maintained
+        // Rust secret/assertion decoders require 200; normalize this accepted
+        // status at the credential adapter without changing the HTTP exchange.
+        let status = if parts.status == http::StatusCode::CREATED
+            && request.url().path().ends_with("/token")
+        {
+            azure_core::http::StatusCode::Ok
+        } else {
+            parts.status.as_u16().into()
+        };
         Ok(azure_core::http::BufResponse::from_bytes(
-            parts.status.as_u16().into(),
-            headers,
-            body,
+            status, headers, body,
         ))
     }
 }
@@ -555,12 +574,13 @@ impl AuxiliaryCredential {
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(body)
                     .map_err(|_| identity_error())?;
-                let response = self
-                    .context
-                    .http_send(request)
+                let response = crate::cloud_azure_managed::send_oauth(&self.context, request)
                     .await
                     .map_err(|_| identity_error())?;
-                if !response.status().is_success() {
+                if !matches!(
+                    response.status(),
+                    http::StatusCode::OK | http::StatusCode::CREATED
+                ) {
                     return Err(identity_error());
                 }
                 response.into_body().to_vec()

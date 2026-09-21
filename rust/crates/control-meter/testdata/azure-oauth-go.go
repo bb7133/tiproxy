@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/log"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -69,14 +70,15 @@ type step struct {
 	Token  string `json:"token"`
 }
 type request struct {
-	Grant     string          `json:"grant"`
-	Scope     string          `json:"scope"`
-	Claims    json.RawMessage `json:"claims"`
-	Client    bool            `json:"client"`
-	Secret    bool            `json:"secret"`
-	Assertion string          `json:"assertion"`
-	Username  bool            `json:"username"`
-	Password  bool            `json:"password"`
+	Grant      string          `json:"grant"`
+	Scope      string          `json:"scope"`
+	Claims     json.RawMessage `json:"claims"`
+	Client     bool            `json:"client"`
+	Secret     bool            `json:"secret"`
+	Assertion  string          `json:"assertion"`
+	Username   bool            `json:"username"`
+	Password   bool            `json:"password"`
+	BodyStable *bool           `json:"body_stable,omitempty"`
 }
 type objectStep struct {
 	Method    string   `json:"method"`
@@ -84,12 +86,20 @@ type objectStep struct {
 	Tokens    []string `json:"tokens"`
 	Error     bool     `json:"error"`
 }
+type retryReply struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Drop    bool              `json:"drop,omitempty"`
+}
 type row struct {
-	Source    string       `json:"source"`
-	Steps     []step       `json:"steps"`
-	Requests  []request    `json:"requests"`
-	Discovery []string     `json:"discovery"`
-	Objects   []objectStep `json:"objects"`
+	CancelOnRetry bool         `json:"cancel_on_retry,omitempty"`
+	Name          string       `json:"name,omitempty"`
+	Responses     []retryReply `json:"responses,omitempty"`
+	Source        string       `json:"source"`
+	Steps         []step       `json:"steps"`
+	Requests      []request    `json:"requests"`
+	Discovery     []string     `json:"discovery"`
+	Objects       []objectStep `json:"objects"`
 }
 
 func main() {
@@ -117,9 +127,54 @@ func main() {
 	if e = os.WriteFile(certFile, certBytes, 0600); e != nil {
 		panic(e)
 	}
+
+	retryMode := len(os.Args) == 2 && os.Args[1] == "--retry"
+	var scenarios []row
+	for _, source := range []string{"secret", "workload", "password", "certificate"} {
+		if !retryMode {
+			scenarios = append(scenarios, row{Source: source})
+			continue
+		}
+		add := func(name string, replies ...retryReply) {
+			scenarios = append(scenarios, row{Source: source, Name: name, Responses: replies})
+		}
+		for _, status := range []int{200, 201, 202, 204, 400, 401, 403, 404, 408, 409, 429, 500, 501, 502, 503, 504, 599} {
+			add(fmt.Sprintf("status%d", status), retryReply{Status: status}, retryReply{})
+		}
+		add("exhausted-then-recover", retryReply{Status: 503}, retryReply{Status: 503}, retryReply{Status: 503}, retryReply{Status: 503}, retryReply{})
+		add("retry-then-terminal", retryReply{Status: 503}, retryReply{Status: 400})
+		add("send-error", retryReply{Drop: true}, retryReply{})
+		add("cancel-retry-then-recover", retryReply{Status: 503, Headers: map[string]string{"retry-after-ms": "60000"}}, retryReply{})
+		scenarios[len(scenarios)-1].CancelOnRetry = true
+
+		for _, test := range []struct {
+			name    string
+			headers map[string]string
+		}{
+			{"milliseconds", map[string]string{"retry-after-ms": "1", "retry-after": "61"}},
+			{"cap", map[string]string{"retry-after-ms": "60001"}},
+			{"priority-zero", map[string]string{"retry-after-ms": "0", "x-ms-retry-after-ms": "60001"}},
+			{"priority-wrap", map[string]string{"retry-after-ms": "9223372036854775807", "x-ms-retry-after-ms": "60001"}},
+			{"date", map[string]string{"retry-after": "mon, 02 jan 2100 15:04:05 GMT"}},
+			{"negative", map[string]string{"retry-after": "-1"}},
+			{"invalid", map[string]string{"retry-after": "invalid"}},
+		} {
+			add("retry-"+test.name, retryReply{Status: 503, Headers: test.headers}, retryReply{})
+		}
+	}
+	// Cancel through the public caller context once the real SDK announces
+	// its retry sleep. No SDK clock/source or token cache is changed.
+	var cancelRetry context.CancelFunc
+	log.SetEvents(log.EventRetryPolicy)
+	log.SetListener(func(event log.Event, message string) {
+		if event == log.EventRetryPolicy && strings.HasPrefix(message, "End Try #1, Delay=") && cancelRetry != nil {
+			cancelRetry()
+		}
+	})
 	var rows []row
-	for n, source := range []string{"secret", "workload", "password", "certificate"} {
-		r := row{Source: source}
+	for n, scenario := range scenarios {
+		source := scenario.Source
+		r := scenario
 		for _, p := range []struct{ scope, claims string }{
 			{"https://storage.azure.com/.default", ""}, {"https://storage.azure.com/.default", ""},
 			{"https://other.invalid/.default", ""}, {"https://storage.azure.com/.default", `{"access_token":{"synthetic":"yes"}}`},
@@ -130,6 +185,10 @@ func main() {
 			{"https://storage.azure.com/.default", `invalid`}, {"https://storage.azure.com/.default", `{"id_token":{"synthetic":true}}`},
 		} {
 			r.Steps = append(r.Steps, step{Scope: p.scope, Claims: p.claims})
+		}
+
+		if retryMode {
+			r.Steps = []step{{Scope: "https://storage.azure.com/.default"}, {Scope: "https://storage.azure.com/.default"}}
 		}
 		for _, name := range []string{"AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_SEND_CERTIFICATE_CHAIN", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_USERNAME", "AZURE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE"} {
 			_ = os.Unsetenv(name)
@@ -153,6 +212,7 @@ func main() {
 		}
 		var authority string
 		objectIndex := -1
+		var firstBody []byte
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if req.URL.Path == "/bucket/blob" {
@@ -203,6 +263,12 @@ func main() {
 				_, _ = w.Write([]byte(`{"error":"unexpected fixture path"}`))
 				return
 			}
+
+			rawBody, err := io.ReadAll(req.Body)
+			if err != nil {
+				panic(err)
+			}
+			req.Body = io.NopCloser(bytes.NewReader(rawBody))
 			if e := req.ParseForm(); e != nil {
 				panic(e)
 			}
@@ -231,6 +297,33 @@ func main() {
 				claims = json.RawMessage("null")
 			}
 			r.Requests = append(r.Requests, request{Grant: req.Form.Get("grant_type"), Scope: req.Form.Get("scope"), Claims: claims, Client: req.Form.Get("client_id") == client, Secret: req.Form.Get("client_secret") == "fake-secret", Assertion: a, Username: req.Form.Get("username") == "fake@fixture.invalid", Password: req.Form.Get("password") == "fake-password"})
+
+			if retryMode {
+				if firstBody == nil {
+					firstBody = append([]byte(nil), rawBody...)
+				}
+				stable := bytes.Equal(firstBody, rawBody)
+				r.Requests[len(r.Requests)-1].BodyStable = &stable
+				response := r.Responses[min(len(r.Requests)-1, len(r.Responses)-1)]
+				if response.Drop {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						panic(err)
+					}
+					_ = conn.Close()
+					return
+				}
+				for k, v := range response.Headers {
+					w.Header().Set(k, v)
+				}
+				if response.Status != 0 && response.Status != 200 {
+					w.WriteHeader(response.Status)
+					if response.Status < 200 || response.Status >= 300 {
+						_, _ = w.Write([]byte(`{"error":"synthetic_token_failure"}`))
+						return
+					}
+				}
+			}
 			idPayload, _ := json.Marshal(map[string]any{"aud": client, "preferred_username": "fake@fixture.invalid", "tid": tenant, "oid": "synthetic", "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix()})
 			idToken := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + base64.RawURLEncoding.EncodeToString(idPayload) + ".fake"
 			response := map[string]any{"access_token": fmt.Sprintf("fake-%d", len(r.Requests)), "expires_in": 3600, "token_type": "Bearer", "scope": req.Form.Get("scope")}
@@ -253,32 +346,44 @@ func main() {
 		for i := range r.Steps {
 			s := &r.Steps[i]
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+			firstBody = nil
+
+			cancelRetry = nil
+			if r.CancelOnRetry && i == 0 {
+				cancelRetry = cancel
+			}
+			if retryMode {
+				ctx = policy.WithRetryOptions(ctx, policy.RetryOptions{RetryDelay: 1})
+			}
 			token, e := credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{s.Scope}, Claims: s.Claims, EnableCAE: true})
 			cancel()
 			s.Error = e != nil
 			s.Token = token.Token
 		}
-		r.Objects = []objectStep{
-			{Method: "HEAD"},
-			{Method: "PUT", Challenge: `Bearer resource_id="https://other.invalid"`},
-			{Method: "PUT", Challenge: `Bearer error="insufficient_claims", claims="` + base64.StdEncoding.EncodeToString([]byte(`{"access_token":{"synthetic":"yes"}}`)) + `"`},
-			{Method: "HEAD", Challenge: `Bearer resource_id="https://storage.azure.com"`},
-		}
-		blobClient, err := azblob.NewClient(authority, credential, &azblob.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: guardTransport{client: srv.Client(), host: "login.microsoftonline.com", endpoint: localEndpoint}}})
-		if err != nil {
-			panic(err)
-		}
-		for i := range r.Objects {
-			objectIndex = i
-			step := &r.Objects[i]
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if step.Method == "HEAD" {
-				_, err = blobClient.ServiceClient().NewContainerClient("bucket").NewBlobClient("blob").GetProperties(ctx, nil)
-			} else {
-				_, err = blobClient.UploadStream(ctx, "bucket", "blob", bytes.NewBufferString("payload"), nil)
+		if !retryMode {
+			r.Objects = []objectStep{
+				{Method: "HEAD"},
+				{Method: "PUT", Challenge: `Bearer resource_id="https://other.invalid"`},
+				{Method: "PUT", Challenge: `Bearer error="insufficient_claims", claims="` + base64.StdEncoding.EncodeToString([]byte(`{"access_token":{"synthetic":"yes"}}`)) + `"`},
+				{Method: "HEAD", Challenge: `Bearer resource_id="https://storage.azure.com"`},
 			}
-			cancel()
-			step.Error = err != nil
+			blobClient, err := azblob.NewClient(authority, credential, &azblob.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: guardTransport{client: srv.Client(), host: "login.microsoftonline.com", endpoint: localEndpoint}}})
+			if err != nil {
+				panic(err)
+			}
+			for i := range r.Objects {
+				objectIndex = i
+				step := &r.Objects[i]
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if step.Method == "HEAD" {
+					_, err = blobClient.ServiceClient().NewContainerClient("bucket").NewBlobClient("blob").GetProperties(ctx, nil)
+				} else {
+					_, err = blobClient.UploadStream(ctx, "bucket", "blob", bytes.NewBufferString("payload"), nil)
+				}
+				cancel()
+				step.Error = err != nil
+			}
 		}
 		srv.Close()
 		rows = append(rows, r)
