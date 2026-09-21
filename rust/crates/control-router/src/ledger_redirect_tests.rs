@@ -43,6 +43,113 @@ fn counts(ledger: &Ledger, owner: &Arc<AccountIdentity>) -> (u64, u64, u64, u64,
     )
 }
 
+/// The ledger's own tests are about accounting, not attribution, so they all
+/// issue with one representative factor reason.
+fn redirect(
+    ledger: &Ledger,
+    session: &Session,
+    target: &Arc<AccountIdentity>,
+    assignment: RouteAssignment,
+    now: Instant,
+) -> Result<Redirect, LedgerError> {
+    ledger.prepare_redirect(
+        session,
+        target,
+        assignment,
+        now,
+        RedirectReason::Balance(Factor::Connection),
+    )
+}
+
+fn addressed(id: &str, addr: &str) -> RouteAssignment {
+    RouteAssignment {
+        backend_id: id.into(),
+        backend_address: addr.into(),
+        keyspace: "tenant".into(),
+        ..RouteAssignment::default()
+    }
+}
+
+#[test]
+fn a_settled_migration_reports_the_reason_frozen_at_issue_and_its_elapsed_time() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let issued = Instant::now();
+
+    // The reason is chosen by the factor walk at issue time...
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        issued,
+        RedirectReason::Balance(Factor::Memory),
+    ));
+    ledger.admit_redirect(op.clone(), true, issued);
+    assert!(
+        ledger.drain_migrations().is_empty(),
+        "issue publishes nothing"
+    );
+
+    // ...and is read back at settlement, not recomputed from current scores.
+    let settled = issued + Duration::from_millis(250);
+    assert_eq!(
+        ledger.finish_redirect(&op, true, settled),
+        Settlement::Applied
+    );
+    let observed = ledger.drain_migrations();
+    assert_eq!(
+        observed,
+        vec![MigrationObservation {
+            // Go labels with `backend.addr`, never the opaque routing id.
+            from: "10.0.0.1:4000".to_owned(),
+            to: "10.0.0.2:4000".to_owned(),
+            reason: RedirectReason::Balance(Factor::Memory),
+            success: true,
+            elapsed: Duration::from_millis(250),
+        }]
+    );
+    assert_eq!(observed[0].reason.metric_name(), "memory");
+    // Draining is destructive: a second publication cycle sees nothing.
+    assert!(ledger.drain_migrations().is_empty());
+}
+
+#[test]
+fn a_failed_migration_is_still_observed_and_a_self_redirect_reports_test() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let issued = Instant::now();
+
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        issued,
+        RedirectReason::Balance(Factor::Status),
+    ));
+    ledger.admit_redirect(op.clone(), true, issued);
+    assert_eq!(
+        ledger.finish_redirect(&op, false, issued + Duration::from_millis(10)),
+        Settlement::Applied
+    );
+    let observed = ledger.drain_migrations();
+    assert_eq!(observed.len(), 1);
+    assert!(!observed[0].success, "a failure is counted, not dropped");
+    assert_eq!(observed[0].reason.metric_name(), "status");
+
+    // Go's RedirectConnections labels every migration `test`, whatever the score.
+    let back = must(ledger.prepare_self_redirect(&session, issued));
+    assert_eq!(back.reason(), RedirectReason::Test);
+    assert_eq!(back.reason().metric_name(), "test");
+}
+
 #[test]
 fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     let mut ledger = Ledger::new(8);
@@ -50,7 +157,7 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let op = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let op = must(redirect(&ledger, &s, &b, assignment("b"), now));
     assert_eq!(counts(&ledger, &a), (1, 1, 0, 0, 0));
     ledger.admit_redirect(op.clone(), true, now);
     assert_eq!(counts(&ledger, &a), (0, 1, 0, 0, 1));
@@ -58,7 +165,7 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     assert!(!ledger.prune(&a));
     assert!(!ledger.prune(&b));
     assert!(matches!(
-        ledger.prepare_redirect(&s, &b, assignment("b"), now),
+        redirect(&ledger, &s, &b, assignment("b"), now),
         Err(LedgerError::RedirectPending)
     ));
     assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Applied);
@@ -66,7 +173,7 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     assert_eq!(counts(&ledger, &b), (1, 1, 0, 0, 0));
     assert_eq!(ledger.finish_redirect(&op, false, now), Settlement::Ignored);
     // Success has no extra three-second cooldown.
-    let back = must(ledger.prepare_redirect(&s, &a, assignment("a"), now));
+    let back = must(redirect(&ledger, &s, &a, assignment("a"), now));
     ledger.admit_redirect(back.clone(), true, now);
     assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Ignored);
     assert_eq!(
@@ -76,7 +183,8 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     assert_eq!(counts(&ledger, &a), (0, 0, 0, 0, 0));
     assert_eq!(counts(&ledger, &b), (1, 1, 0, 0, 0));
     assert!(matches!(
-        ledger.prepare_redirect(
+        redirect(
+            &ledger,
             &s,
             &a,
             assignment("a"),
@@ -86,7 +194,13 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
     ));
     assert!(
         ledger
-            .prepare_redirect(&s, &a, assignment("a"), now + Duration::from_secs(3))
+            .prepare_redirect(
+                &s,
+                &a,
+                assignment("a"),
+                now + Duration::from_secs(3),
+                RedirectReason::Balance(Factor::Connection)
+            )
             .is_ok()
     );
     assert_eq!(ledger.close(&s), Settlement::Applied);
@@ -100,7 +214,7 @@ fn redirect_rejected_offer_records_cooldown_without_consuming_watermark_or_capac
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let rejected = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let rejected = must(redirect(&ledger, &s, &b, assignment("b"), now));
     ledger.admit_redirect(rejected.clone(), false, now);
     assert_eq!(ledger.next_redirect, rejected.sequence);
     assert_eq!(counts(&ledger, &a), (1, 1, 0, 0, 0));
@@ -110,10 +224,16 @@ fn redirect_rejected_offer_records_cooldown_without_consuming_watermark_or_capac
         Settlement::Ignored
     );
     assert!(matches!(
-        ledger.prepare_redirect(&s, &b, assignment("b"), now),
+        redirect(&ledger, &s, &b, assignment("b"), now),
         Err(LedgerError::CoolingDown)
     ));
-    let next = must(ledger.prepare_redirect(&s, &b, assignment("b"), now + Duration::from_secs(3)));
+    let next = must(redirect(
+        &ledger,
+        &s,
+        &b,
+        assignment("b"),
+        now + Duration::from_secs(3),
+    ));
     assert_eq!(next.sequence, rejected.sequence);
     ledger.admit_redirect(next.clone(), true, now + Duration::from_secs(3));
     assert_eq!(ledger.next_redirect, next.sequence + 1);
@@ -126,7 +246,7 @@ fn redirect_close_and_retired_equal_name_owners_ignore_all_late_and_foreign_resu
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let op = must(ledger.prepare_redirect(&s, &b, assignment("same-name"), now));
+    let op = must(redirect(&ledger, &s, &b, assignment("same-name"), now));
     ledger.admit_redirect(op.clone(), true, now);
     assert_eq!(ledger.close(&s), Settlement::Applied);
     assert!(ledger.prune(&a));
@@ -145,7 +265,13 @@ fn redirect_close_and_retired_equal_name_owners_ignore_all_late_and_foreign_resu
     let fa = must(foreign.add_account());
     let fb = must(foreign.add_account());
     let fs = active(&mut foreign, &fa);
-    let fop = must(foreign.prepare_redirect(&fs, &fb, assignment("same-name"), now));
+    let fop = must(foreign.prepare_redirect(
+        &fs,
+        &fb,
+        assignment("same-name"),
+        now,
+        RedirectReason::Balance(Factor::Connection),
+    ));
     foreign.admit_redirect(fop, true, now);
     assert_eq!(foreign.finish_redirect(&op, true, now), Settlement::Ignored);
     assert_eq!(counts(&foreign, &fa), (0, 1, 0, 0, 1));
@@ -160,28 +286,28 @@ fn redirect_requires_active_owner_scope_and_capacity_for_every_possible_terminal
     let idle = must(ledger.open());
     let now = Instant::now();
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, assignment("b"), now),
+        redirect(&ledger, &idle, &b, assignment("b"), now),
         Err(LedgerError::NotActive)
     ));
     let pending = must(ledger.reserve(&idle, &a, assignment("a")));
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, assignment("b"), now),
+        redirect(&ledger, &idle, &b, assignment("b"), now),
         Err(LedgerError::NotActive)
     ));
     ledger.finish(&pending, true);
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &a, assignment("a"), now),
+        redirect(&ledger, &idle, &a, assignment("a"), now),
         Err(LedgerError::SameAccount)
     ));
     let mut other = assignment("b");
     other.keyspace.clear();
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, other, now),
+        redirect(&ledger, &idle, &b, other, now),
         Err(LedgerError::CrossKeyspace)
     ));
     ledger.next_redirect = u64::MAX;
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, assignment("b"), now),
+        redirect(&ledger, &idle, &b, assignment("b"), now),
         Err(LedgerError::Exhausted)
     ));
     ledger.next_redirect = 1;
@@ -192,7 +318,7 @@ fn redirect_requires_active_owner_scope_and_capacity_for_every_possible_terminal
         .counts
         .active = u64::MAX;
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, assignment("b"), now),
+        redirect(&ledger, &idle, &b, assignment("b"), now),
         Err(LedgerError::Exhausted)
     ));
     assert_eq!(counts(&ledger, &a), (1, 1, 0, 0, 0));
@@ -208,7 +334,7 @@ fn redirect_requires_active_owner_scope_and_capacity_for_every_possible_terminal
     };
     // A low score is insufficient: an outgoing failure must still fit.
     assert!(matches!(
-        ledger.prepare_redirect(&idle, &b, assignment("b"), now),
+        redirect(&ledger, &idle, &b, assignment("b"), now),
         Err(LedgerError::Exhausted)
     ));
     let fresh = must(ledger.open());
@@ -225,7 +351,7 @@ fn redirect_delayed_failure_does_not_restart_issuance_cooldown() {
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let op = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let op = must(redirect(&ledger, &s, &b, assignment("b"), now));
     ledger.admit_redirect(op.clone(), true, now);
     let late = now + Duration::from_secs(10);
     assert_eq!(
@@ -234,7 +360,13 @@ fn redirect_delayed_failure_does_not_restart_issuance_cooldown() {
     );
     assert!(
         ledger
-            .prepare_redirect(&s, &b, assignment("b"), late)
+            .prepare_redirect(
+                &s,
+                &b,
+                assignment("b"),
+                late,
+                RedirectReason::Balance(Factor::Connection)
+            )
             .is_ok()
     );
 }
@@ -246,7 +378,7 @@ fn redirect_connection_factor_reads_transferred_score_not_physical_count() {
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let op = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let op = must(redirect(&ledger, &s, &b, assignment("b"), now));
     ledger.admit_redirect(op, true, now);
     let inputs: Vec<_> = [("a", a), ("b", b)]
         .into_iter()
@@ -271,7 +403,7 @@ fn redirect_connection_factor_reads_transferred_score_not_physical_count() {
     );
     for row in report.rows {
         let expected = u64::from(row.backend_id.as_ref() == "b");
-        assert!(row.parts.contains(&(crate::Factor::Connection, expected)));
+        assert!(row.parts.contains(&(Factor::Connection, expected)));
     }
 }
 
@@ -315,7 +447,7 @@ fn shared_go_redirect_observation() {
                 } else {
                     (&a, "a")
                 };
-                match ledger.prepare_redirect(&session, target, assignment(id), now) {
+                match redirect(&ledger, &session, target, assignment(id), now) {
                     Ok(next) => {
                         offered += 1;
                         let accepted = row[3] == "1";
@@ -372,16 +504,16 @@ fn redirect_old_same_pair_terminal_cannot_settle_new_operation() {
     let b = must(ledger.add_account());
     let s = active(&mut ledger, &a);
     let now = Instant::now();
-    let old = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let old = must(redirect(&ledger, &s, &b, assignment("b"), now));
     ledger.admit_redirect(old.clone(), true, now);
     assert_eq!(ledger.finish_redirect(&old, true, now), Settlement::Applied);
-    let back = must(ledger.prepare_redirect(&s, &a, assignment("a"), now));
+    let back = must(redirect(&ledger, &s, &a, assignment("a"), now));
     ledger.admit_redirect(back.clone(), true, now);
     assert_eq!(
         ledger.finish_redirect(&back, true, now),
         Settlement::Applied
     );
-    let current = must(ledger.prepare_redirect(&s, &b, assignment("b"), now));
+    let current = must(redirect(&ledger, &s, &b, assignment("b"), now));
     ledger.admit_redirect(current.clone(), true, now);
     assert!(Arc::ptr_eq(&old.source, &current.source));
     assert!(Arc::ptr_eq(&old.target, &current.target));

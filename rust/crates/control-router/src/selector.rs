@@ -28,6 +28,7 @@ use control_topology::metrics::QueryId;
 use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyModuleHandle};
 
 use crate::authority::{Candidate, RouteError, Sources};
+use crate::factors::RedirectReason;
 use crate::ledger::{
     AccountIdentity, Accounting, Ledger, Redirect, Reservation, Session, Settlement,
 };
@@ -663,6 +664,9 @@ impl Router {
             source,
             target: Arc::clone(&target.account),
             target_id: Arc::clone(&target.source.backend_id),
+            // A directly prepared redirect carries no factor decision; Go only
+            // reaches this shape from `RedirectConnections`, which labels `test`.
+            reason: RedirectReason::Test,
         })
     }
 
@@ -754,6 +758,7 @@ impl Router {
             &prepared.target,
             assignment,
             now,
+            prepared.reason,
         ) {
             Ok(redirect) => redirect,
             Err(crate::ledger::LedgerError::CrossKeyspace) => {

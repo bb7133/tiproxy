@@ -29,7 +29,9 @@ mod simulation;
 pub mod shadow;
 
 pub use authority::{Candidate, RouteError, Unsupported};
-pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
+pub use factors::{
+    BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore, RedirectReason,
+};
 pub use ledger::{
     Accounting, ForceClose, Redirect, Reservation, RouteLedgerEvidence, Session, Settlement,
 };

@@ -61,6 +61,7 @@ fn shared_go_physical_arrival_order() {
                     owner,
                     assignment(fields[3]),
                     now,
+                    RedirectReason::Balance(Factor::Connection),
                 ));
                 ledger.admit_redirect(op.clone(), fields[1] == "admit", now);
                 if fields[1] == "admit" {

@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 
 use control_routing::RouteAssignment;
 
+#[cfg(test)]
+use crate::factors::Factor;
+use crate::factors::RedirectReason;
+
 /// Live connection accounting for one backend owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Accounting {
@@ -192,6 +196,7 @@ pub struct Redirect {
     from: RouteAssignment,
     to: RouteAssignment,
     issued_at: Instant,
+    reason: RedirectReason,
 }
 
 impl Redirect {
@@ -208,6 +213,20 @@ impl Redirect {
     #[must_use]
     pub const fn to(&self) -> &RouteAssignment {
         &self.to
+    }
+
+    /// Why this migration was issued, frozen at acceptance. Settlement reads
+    /// it back rather than recomputing, exactly as Go reads
+    /// `connWrapper.redirectReason`.
+    #[must_use]
+    pub const fn reason(&self) -> RedirectReason {
+        self.reason
+    }
+
+    /// When this migration was issued; the start of its Go-observed duration.
+    #[must_use]
+    pub const fn issued_at(&self) -> Instant {
+        self.issued_at
     }
 
     /// Whether `other` is the same exact migration operation.
@@ -271,6 +290,28 @@ pub enum Settlement {
     Ignored,
 }
 
+/// One settled migration, as Go observes it at `addMigrateMetrics`.
+///
+/// Go reads `from`, `to` and `reason` off the connection wrapper and the
+/// elapsed time from `connWrapper.lastRedirect`, all captured when the
+/// redirect was issued. This record carries the same frozen values so the
+/// natively served `migrate_total`, `migrate_duration_seconds` and
+/// `pending_migrate` series are label-identical to the retired Go ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationObservation {
+    /// Physical source backend address at issue time. Go labels these series
+    /// with `backend.addr`, the dial address, not the opaque routing id.
+    pub from: String,
+    /// Captured destination backend address at issue time.
+    pub to: String,
+    /// The frozen reason label.
+    pub reason: RedirectReason,
+    /// Whether the migration succeeded.
+    pub success: bool,
+    /// Issue-to-settlement elapsed time, Go's `time.Since(lastRedirect)`.
+    pub elapsed: Duration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LedgerError {
     ForeignSession,
@@ -312,6 +353,9 @@ pub(crate) struct Ledger {
     max_sessions: usize,
     sessions: BTreeMap<u64, Stage>,
     accounts: BTreeMap<u64, Account>,
+    /// Settled migrations awaiting publication. The ledger records; it never
+    /// touches a metric registry itself.
+    migrations: Vec<MigrationObservation>,
 }
 
 impl Ledger {
@@ -326,7 +370,13 @@ impl Ledger {
             max_sessions,
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            migrations: Vec::new(),
         }
+    }
+
+    /// Takes the migrations settled since the last drain.
+    pub(crate) fn drain_migrations(&mut self) -> Vec<MigrationObservation> {
+        std::mem::take(&mut self.migrations)
     }
 
     pub(crate) const fn set_max_sessions(&mut self, max_sessions: usize) {
@@ -535,6 +585,7 @@ impl Ledger {
         target: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
         now: Instant,
+        reason: RedirectReason,
     ) -> Result<Redirect, LedgerError> {
         let Stage::Active(active) = self.stage(session)? else {
             return Err(LedgerError::NotActive);
@@ -585,6 +636,7 @@ impl Ledger {
             from: active.assignment.clone(),
             to: assignment,
             issued_at: now,
+            reason,
         })
     }
 
@@ -652,6 +704,7 @@ impl Ledger {
             from: active.assignment.clone(),
             to: assignment,
             issued_at: now,
+            reason: RedirectReason::Test,
         })
     }
 
@@ -684,7 +737,7 @@ impl Ledger {
         &mut self,
         redirect: &Redirect,
         success: bool,
-        _now: Instant,
+        now: Instant,
     ) -> Settlement {
         let Ok(Stage::Active(active)) = self.stage(&redirect.session) else {
             return Settlement::Ignored;
@@ -727,6 +780,15 @@ impl Ledger {
             // Go's cooldown starts at issuance, not when the failure arrives.
             active.failed_at = Some(redirect.issued_at);
         }
+        self.migrations.push(MigrationObservation {
+            from: redirect.from.backend_address.clone(),
+            to: redirect.to.backend_address.clone(),
+            reason: redirect.reason,
+            success,
+            // Saturating: a settlement can never predate its own issuance, and
+            // a non-monotonic reading must not panic a routing settlement.
+            elapsed: now.saturating_duration_since(redirect.issued_at),
+        });
         Settlement::Applied
     }
 
@@ -914,8 +976,13 @@ mod tests {
         assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
         assert_eq!(ledger.evidence().active, 1);
 
-        let redirect =
-            must(ledger.prepare_redirect(&session, &target, assignment("b"), Instant::now()));
+        let redirect = must(ledger.prepare_redirect(
+            &session,
+            &target,
+            assignment("b"),
+            Instant::now(),
+            RedirectReason::Balance(Factor::Connection),
+        ));
         ledger.admit_redirect(redirect.clone(), true, Instant::now());
         let evidence = ledger.evidence();
         assert_eq!(
@@ -1005,7 +1072,13 @@ mod tests {
         );
         assert_eq!(
             ledger
-                .prepare_redirect(&second, &account, assignment("a"), Instant::now())
+                .prepare_redirect(
+                    &second,
+                    &account,
+                    assignment("a"),
+                    Instant::now(),
+                    RedirectReason::Balance(Factor::Connection)
+                )
                 .err(),
             Some(LedgerError::CoolingDown),
             "the ordinary path keeps its cooldown and same-account refusal"

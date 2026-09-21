@@ -94,6 +94,7 @@ impl Router {
                             source: Arc::clone(&source.account),
                             target: Arc::clone(&target.account),
                             target_id: Arc::clone(&pair.to),
+                            reason: crate::RedirectReason::Balance(pair.reason),
                         })
                         .collect();
                     Ok(Some(crate::PreparedBalance { pair, redirects }))

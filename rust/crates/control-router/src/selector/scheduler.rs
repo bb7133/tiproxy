@@ -455,6 +455,7 @@ impl Router {
                 source,
                 target: Arc::clone(&target.account),
                 target_id: Arc::clone(&target.source.backend_id),
+                reason: crate::RedirectReason::Test,
             };
             self.offer_redirect_locked(&mut state, &prepared, sender, now, &mut rejected)
         };

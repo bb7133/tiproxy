@@ -46,6 +46,22 @@ pub enum Factor {
     Connection,
 }
 impl Factor {
+    /// Go `Factor.Name()`: the exact string Go uses as the `reason` metric
+    /// label, so a natively served `migrate_total` / `pending_migrate` series
+    /// is label-identical to the retired Go one.
+    #[must_use]
+    pub const fn metric_name(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Status => "status",
+            Self::Health => "health",
+            Self::Memory => "memory",
+            Self::Cpu => "cpu",
+            Self::Location => "location",
+            Self::Connection => "conn",
+        }
+    }
+
     /// Number of bits used by the Go score segment.
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -54,6 +70,32 @@ impl Factor {
             Self::Health | Self::Memory => 2,
             Self::Cpu => 5,
             Self::Connection => 16,
+        }
+    }
+}
+
+/// Why a redirect was issued, frozen at acceptance.
+///
+/// Go stores this on the connection wrapper (`connWrapper.redirectReason`) at
+/// issue time and reads it back when the migration settles, because by then the
+/// scores that triggered it have moved on. The value is therefore captured
+/// here, never recomputed at settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectReason {
+    /// The first actionable factor in policy priority order.
+    Balance(Factor),
+    /// Go `Group.RedirectConnections`, which is test-only and labels every
+    /// migration `test` regardless of score.
+    Test,
+}
+
+impl RedirectReason {
+    /// The exact Go `reason` label value.
+    #[must_use]
+    pub const fn metric_name(self) -> &'static str {
+        match self {
+            Self::Balance(factor) => factor.metric_name(),
+            Self::Test => "test",
         }
     }
 }
