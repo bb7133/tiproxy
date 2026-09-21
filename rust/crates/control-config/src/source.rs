@@ -1109,6 +1109,23 @@ where
     })
 }
 
+impl EffectiveConfig {
+    /// Overlays a partial TOML document onto this configuration exactly as
+    /// Go's `ConfigManager.SetTOMLConfig` unmarshals onto a clone: only the
+    /// keys present in `data` change. The result is validated against
+    /// `current_dir` like a fresh load; the caller decides whether
+    /// restart-required differences are acceptable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a TOML decode/encode or validation error.
+    pub fn patched_with_toml(&self, data: &[u8], current_dir: &Path) -> Result<Self, StoreError> {
+        apply_toml_patch(self, data)?
+            .validated(current_dir)
+            .map_err(StoreError::from)
+    }
+}
+
 fn apply_toml_patch(base: &EffectiveConfig, data: &[u8]) -> Result<EffectiveConfig, StoreError> {
     let text = str::from_utf8(data).map_err(|_| StoreError::NonUtf8Toml)?;
     let mut base_value = toml::Value::try_from(base.clone()).map_err(StoreError::TomlEncode)?;

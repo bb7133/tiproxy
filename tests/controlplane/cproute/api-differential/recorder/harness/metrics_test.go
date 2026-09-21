@@ -50,7 +50,7 @@ func TestMetricWirePreservesSpecialValuesOrderAndTimes(t *testing.T) {
 	wire, copied, err := copyMetricResult(metricsreader.QueryResult{Value: source, UpdateTime: now})
 	require.NoError(t, err)
 	require.Equal(t, now.UnixNano(), *wire.UpdatedNanos)
-	require.Equal(t, []MetricSample{{123, "-0"}, {122, "NaN"}, {121, "+Inf"}, {120, "-Inf"}, {119, "0.12345678901234566"}}, wire.Series[0].Samples)
+	require.Equal(t, []MetricSample{{TimestampMillis: 123, Value: "-0"}, {TimestampMillis: 122, Value: "NaN"}, {TimestampMillis: 121, Value: "+Inf"}, {TimestampMillis: 120, Value: "-Inf"}, {TimestampMillis: 119, Value: "0.12345678901234566"}}, wire.Series[0].Samples)
 	encoded, err := json.Marshal(wire)
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), "Provenance")

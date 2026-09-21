@@ -1,0 +1,236 @@
+{
+  "levels": [
+    {
+      "text": "debug",
+      "accepted": true,
+      "emitted": {
+        "debug": true,
+        "error": true,
+        "info": true,
+        "warn": true
+      }
+    },
+    {
+      "text": "info",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": true,
+        "warn": true
+      }
+    },
+    {
+      "text": "",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": true,
+        "warn": true
+      }
+    },
+    {
+      "text": "warn",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": false,
+        "warn": true
+      }
+    },
+    {
+      "text": "warning",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": false,
+        "warn": true
+      }
+    },
+    {
+      "text": "error",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": false,
+        "warn": false
+      }
+    },
+    {
+      "text": "dpanic",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": false,
+        "info": false,
+        "warn": false
+      }
+    },
+    {
+      "text": "panic",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": false,
+        "info": false,
+        "warn": false
+      }
+    },
+    {
+      "text": "fatal",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": false,
+        "info": false,
+        "warn": false
+      }
+    },
+    {
+      "text": "INFO",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": true,
+        "warn": true
+      }
+    },
+    {
+      "text": "Warn",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": false,
+        "warn": true
+      }
+    },
+    {
+      "text": "ERROR",
+      "accepted": true,
+      "emitted": {
+        "debug": false,
+        "error": true,
+        "info": false,
+        "warn": false
+      }
+    },
+    {
+      "text": " info ",
+      "accepted": false,
+      "emitted": null
+    },
+    {
+      "text": "info\n",
+      "accepted": false,
+      "emitted": null
+    },
+    {
+      "text": "bogus",
+      "accepted": false,
+      "emitted": null
+    },
+    {
+      "text": "information",
+      "accepted": false,
+      "emitted": null
+    },
+    {
+      "text": "trace",
+      "accepted": false,
+      "emitted": null
+    },
+    {
+      "text": "critical",
+      "accepted": false,
+      "emitted": null
+    }
+  ],
+  "encoders": [
+    {
+      "text": "tidb",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": "tidb",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    },
+    {
+      "text": "json",
+      "simple": false,
+      "first_line": "{\"level\":\"INFO\",\"ts\":\"\u003cTS\u003e\",\"caller\":\"format-probe/main.go:N\",\"msg\":\"m\",\"marker\":\"marker-info\"}"
+    },
+    {
+      "text": "json",
+      "simple": true,
+      "first_line": "{\"marker\":\"marker-info\"}"
+    },
+    {
+      "text": "console",
+      "simple": false,
+      "first_line": "\u003cTS\u003e\tINFO\tformat-probe/main.go:N\tm\t{\"marker\": \"marker-info\"}"
+    },
+    {
+      "text": "console",
+      "simple": true,
+      "first_line": "{\"marker\": \"marker-info\"}"
+    },
+    {
+      "text": "JSON",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": "JSON",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    },
+    {
+      "text": "Console",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": "Console",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    },
+    {
+      "text": " json",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": " json",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    },
+    {
+      "text": "text",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": "text",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    },
+    {
+      "text": "",
+      "simple": false,
+      "first_line": "[\u003cTS\u003e] [INFO] [format-probe/main.go:N] [m]  [marker=marker-info]"
+    },
+    {
+      "text": "",
+      "simple": true,
+      "first_line": "[]  [marker=marker-info]"
+    }
+  ]
+}

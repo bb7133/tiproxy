@@ -18,6 +18,8 @@
 
 mod config_composition;
 mod health;
+mod metrics_http;
+mod native_meter;
 mod startup;
 mod tls_material;
 mod topology_composition;
@@ -25,6 +27,7 @@ mod topology_composition;
 use std::env;
 use std::fmt::Display;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -39,6 +42,7 @@ use control_config::{
 };
 use control_etcd::ElectionConfig;
 use control_external::{EtcdClientConfig, EtcdTlsConfig};
+use control_plane::logging::{self as process_logging, LogFileSettings};
 use control_plane::{
     ConfigSource, ControlModule, ControlModuleSet, ControlRuntime as InProcessControlRuntime,
     JsonStderrSink, LifecyclePhase, OwnershipRegistry, ShutdownReason,
@@ -53,14 +57,16 @@ use control_topology::{
     AdvertiseEndpointResolver, InterfaceAdvertiseResolver, MetricCollector, TopologyModule,
     TopologyModuleHandle,
 };
+use dataplane::GenerationStatusSnapshot;
 use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
-use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry, run_metering_sampler};
+use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsExporter, MetricsRecorder, ServerError, SystemMemoryProbe, spawn_metrics_exporter,
+    MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
+    install_session_log_writer, spawn_metrics_exporter,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -98,10 +104,13 @@ struct Options {
     tls_roots: Vec<PathBuf>,
     drain_grace: Option<Duration>,
     health_port: u16,
+    metrics_addr: Option<SocketAddr>,
+    admin_addr: Option<SocketAddr>,
+    log_file: Option<PathBuf>,
 }
 
 enum Command {
-    Run(Options),
+    Run(Box<Options>),
     Version,
     Help,
     IntegrationCapabilities,
@@ -114,7 +123,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -138,7 +147,7 @@ async fn main() -> ExitCode {
             println!("{INTEGRATION_CAPABILITIES}");
             ExitCode::SUCCESS
         }
-        Command::Run(options) => match run(options).await {
+        Command::Run(options) => match run(*options).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("tiproxy-rs stopped: {error}");
@@ -226,6 +235,9 @@ struct RunningProcess<R, E, S, H> {
     metrics_exporter: E,
     metering_sampler: S,
     health_task: Option<H>,
+    metrics_http_task: Option<JoinHandle<()>>,
+    log_reload_task: Option<JoinHandle<()>>,
+    admin_task: Option<AdminTask>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -250,6 +262,12 @@ struct StartupGuard<R, E, S, H> {
     metrics_exporter: Option<E>,
     metering_sampler: Option<S>,
     health_task: Option<H>,
+    /// Native `/metrics` responder; a concrete task because no test fakes it.
+    metrics_http_task: Option<JoinHandle<()>>,
+    /// Applies `log.log-file.*` reloads to the process log output.
+    log_reload_task: Option<JoinHandle<()>>,
+    /// Management-plane HTTP server (CP-ADMIN), stopped gracefully at exit.
+    admin_task: Option<AdminTask>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
 }
 
@@ -271,6 +289,9 @@ where
             metrics_exporter: None,
             metering_sampler: None,
             health_task: None,
+            metrics_http_task: None,
+            log_reload_task: None,
+            admin_task: None,
             routing_shadow: None,
         }
     }
@@ -306,6 +327,24 @@ where
         }
     }
 
+    fn set_metrics_http_task(&mut self, task: JoinHandle<()>) {
+        if self.metrics_http_task.replace(task).is_some() {
+            unreachable!("the metrics HTTP task was set twice");
+        }
+    }
+
+    fn set_admin_task(&mut self, task: AdminTask) {
+        if self.admin_task.replace(task).is_some() {
+            unreachable!("the admin task was set twice");
+        }
+    }
+
+    fn set_log_reload_task(&mut self, task: JoinHandle<()>) {
+        if self.log_reload_task.replace(task).is_some() {
+            unreachable!("the log reload task was set twice");
+        }
+    }
+
     /// Stops and joins every acquired resource in reverse order and returns the
     /// original error unchanged.
     async fn rollback(mut self, error: String) -> String {
@@ -327,6 +366,15 @@ where
         }
         if let Some(health_task) = self.health_task.take() {
             steps.push(("health_task", health_task.teardown()));
+        }
+        if let Some(task) = self.metrics_http_task.take() {
+            steps.push(("metrics_http_task", startup::Teardown::teardown(task)));
+        }
+        if let Some(task) = self.log_reload_task.take() {
+            steps.push(("log_reload_task", startup::Teardown::teardown(task)));
+        }
+        if let Some(task) = self.admin_task.take() {
+            steps.push(("admin_task", startup::Teardown::teardown(task)));
         }
         let _order = startup::run_teardowns_in_reverse(steps).await;
         // The owner and its modules were acquired first, so they retire last.
@@ -357,6 +405,9 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task,
+            log_reload_task,
+            admin_task,
             routing_shadow,
         } = self;
         let runtime = runtime.unwrap_or_else(|| unreachable!("commit before the runtime was set"));
@@ -371,6 +422,9 @@ where
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task,
+            log_reload_task,
+            admin_task,
             routing_shadow,
         }
     }
@@ -411,6 +465,30 @@ async fn run(options: Options) -> Result<(), String> {
         .unwrap_or(u64::MAX);
     let process_id = format!("tiproxy-rs-{}", std::process::id());
     let config_owner = load_config_owner(&options, &process_id)?;
+    // Process log output (B0): honour `log.log-file.*` before the first
+    // lifecycle event, and route the dataplane's session logs through the
+    // same writer so a rotating file receives every line.
+    let initial_log_file = log_file_settings(
+        options.log_file.as_deref(),
+        config_owner.handle.source().current().as_ref(),
+    );
+    {
+        // Line contract (slice 4a): the Go header of the configured encoder
+        // on every line, and the configured level filter. `log.encoder` and
+        // `log.simple` are restart-required; `log.level` follows the config
+        // reload below. Like Go's `BuildLogger`, a level zap rejects fails
+        // startup.
+        let effective = config_owner.handle.source().current();
+        let level = process_logging::Level::parse(effective.effective().log_level())
+            .map_err(|error| format!("build logger: {error}"))?;
+        process_logging::set_format(
+            process_logging::Encoder::from_config(effective.effective().log_encoder()),
+            effective.effective().log_simple(),
+        );
+        process_logging::set_level(level);
+    }
+    process_logging::configure(initial_log_file.as_ref())?;
+    install_session_log_writer(session_log_line);
     let routing_shadow_socket = options.routing_shadow_socket.clone().or_else(|| {
         config_owner
             .handle
@@ -441,7 +519,8 @@ async fn run(options: Options) -> Result<(), String> {
     );
     let in_process_config = in_process.handle().config().current();
     let capabilities = vec![
-        ControlCapability::MeteringAbsoluteSnapshots as u64,
+        ControlCapability::RustApiOwner as u64,
+        ControlCapability::RustMeterOwner as u64,
         ControlCapability::RustConfigNamespace as u64,
         ControlCapability::RustRouteOwner as u64,
     ];
@@ -457,11 +536,11 @@ async fn run(options: Options) -> Result<(), String> {
     };
     let mut wal_name = options.control_socket.as_os_str().to_os_string();
     wal_name.push(".metering.wal");
-    let ledger = MeteringLedger::open_persistent(PathBuf::from(wal_name))
-        .map_err(|error| format!("open metering WAL: {error}"))?;
-    let metering = MeteringSourceRegistry::new(ledger.process_generation())
-        .map_err(|error| format!("create metering registry: {error}"))?;
-    let dispatch_handler = ControlCommandHandler::with_metering_route_owner(ledger);
+    let wal_path = PathBuf::from(wal_name);
+    let dispatch_handler = ControlCommandHandler::native_meter_owner();
+    // Go `NewDrainIssuer` fails the bridge when the incarnation nonce cannot
+    // be read; the Rust owner refuses to start the same way.
+    dispatch_handler.local_drain_issuer_ready()?;
     let mut client =
         ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
     client.required_capabilities = capabilities;
@@ -473,9 +552,10 @@ async fn run(options: Options) -> Result<(), String> {
     let shared_client = Arc::new(ControlClient::new(client).map_err(|error| error.to_string())?);
     let (drain_tx, drain_rx) = watch::channel(None::<Duration>);
     let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
-    let (metering_shutdown_tx, metering_shutdown_rx) = watch::channel(false);
+    let (metering_shutdown_tx, _) = watch::channel(false);
     let loop_config = session_loop_config(in_process_config.drain_grace());
     let (metrics, observations) = MetricsRecorder::channel(DEFAULT_OBSERVATION_CAPACITY);
+    let metrics_registry = Arc::new(MetricsRegistry::new());
     let runtime_handle = in_process.handle();
     let modules = ControlModuleSet::new(&runtime_handle);
     // Arm the startup guard before the first module is spawned. From here every
@@ -514,6 +594,28 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("bootstrap default namespace: {error}"))
             .await);
     }
+    let meter_config = config_owner.handle.source().current();
+    let meter_paths = Path::new(meter_config.effective().workdir()).join("run");
+    let _meter_lock = match native_meter::lock_state(&meter_paths) {
+        Ok(lock) => lock,
+        Err(error) => return Err(guard.rollback(error).await),
+    };
+    let _wal_lock = match native_meter::lock_wal(&wal_path) {
+        Ok(lock) => lock,
+        Err(error) => return Err(guard.rollback(error).await),
+    };
+    let ledger = match MeteringLedger::open_persistent(wal_path) {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(guard.rollback(format!("open metering WAL: {error}")).await),
+    };
+    let metering = match MeteringSourceRegistry::new(ledger.process_generation()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            return Err(guard
+                .rollback(format!("create metering registry: {error}"))
+                .await);
+        }
+    };
     // CP-TOPO self-registration and discovery publication come online before any
     // SQL admission: register this instance's SQL topology and publish the
     // initial discovery generation, then wait for both to be installed. "Ready"
@@ -625,11 +727,15 @@ async fn run(options: Options) -> Result<(), String> {
     // path remains available only to compatibility tests.
     let route_config_source: Arc<dyn ConfigNamespaceSource> =
         Arc::new(config_owner.handle.source().clone());
+    // CP-ADMIN reads the owner history bytes through the same collector.
+    let backend_metrics = metric_overlay.backend_metrics_reader();
     let (route_plane, mut route_plane_handle) = RoutePlane::new(
         Arc::clone(&route_config_source),
         topology_handle.clone(),
         Some(metric_overlay),
     );
+    // CP-ADMIN's debug redirect sweeps every current router.
+    let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {
         return Err(guard
             .rollback(format!("start route-plane module: {error}"))
@@ -686,6 +792,7 @@ async fn run(options: Options) -> Result<(), String> {
             .rollback(format!("start config serving adapter: {error}"))
             .await);
     }
+    let (consumer, meter_ready) = native_meter::ReadyConsumer::new(consumer);
     let runtime = spawn_control_runtime_with_client_and_handler(
         Arc::clone(&shared_client),
         Duration::from_millis(100),
@@ -698,35 +805,21 @@ async fn run(options: Options) -> Result<(), String> {
     // guard; from then on the guard owns it (and tears it down on any later
     // failure).
     let install_handle = runtime.handle();
-    let metering_dispatch = runtime.handle();
+    let admin_dispatch = runtime.handle();
     let runtime_stats = runtime.stats();
     guard.set_runtime(runtime);
     if !installer.install(install_handle) {
+        meter_ready.send_replace(Some(false));
         return Err(guard
             .rollback("install control dispatch handle exactly once".to_owned())
             .await);
     }
-    guard.set_metrics_exporter(spawn_metrics_exporter(
-        Arc::clone(&shared_client),
-        serving.clone(),
-        runtime_stats,
-        &metrics,
-        observations,
-        Duration::from_secs(1),
-    ));
-    guard.set_metering_sampler(MeteringSampler {
-        task: tokio::spawn(async move {
-            run_metering_sampler(
-                metering,
-                metering_dispatch,
-                metering_shutdown_rx,
-                Duration::from_secs(1),
-            )
-            .await
-        }),
-        shutdown: metering_shutdown_tx.clone(),
-    });
-
+    // Operator-facing listeners (health, metrics, management plane) bind
+    // before the control peer is awaited: a bad address fails fast and rolls
+    // back, and the health probe stays reachable while native metering
+    // recovers (it answers not-ready until the SQL gate opens).
+    let meter_slot: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>> =
+        Arc::new(std::sync::OnceLock::new());
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
@@ -736,17 +829,146 @@ async fn run(options: Options) -> Result<(), String> {
         route_plane_handle,
         route_config_source,
         topology_handle,
+        Arc::clone(&runtime_stats),
+        Arc::clone(&meter_slot),
     )
     .await
     {
         Ok(Some(health_task)) => guard.set_health_task(health_task),
         Ok(None) => {}
-        Err(error) => return Err(guard.rollback(error).await),
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
     }
+    // Native Prometheus exposition (B0): bound before ready so a bad address
+    // fails fast; the task is owned by the guard and aborted at exit.
+    match spawn_metrics_http(options.metrics_addr, Arc::clone(&metrics_registry)).await {
+        Ok(Some(task)) => guard.set_metrics_http_task(task),
+        Ok(None) => {}
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
+    }
+    guard.set_log_reload_task(tokio::spawn(run_log_reload(
+        options.log_file.clone(),
+        config_owner.handle.source().subscribe(),
+        initial_log_file,
+    )));
+    // Management plane (CP-ADMIN): bound before ready so a bad address fails
+    // fast; its readiness gate opens together with the process, like Go's
+    // `ready` toggle at the end of `NewServer`. Under `RUST_API_OWNER` the
+    // Rust process is the only API server, so it binds the configured
+    // `api.addr` unless `--admin-addr` overrides it.
+    let admin_address = options.admin_addr.map_or_else(
+        || {
+            config_owner
+                .handle
+                .source()
+                .current()
+                .effective()
+                .api_addr()
+                .to_owned()
+        },
+        |address| address.to_string(),
+    );
+    let admin_app = match spawn_admin(
+        admin_address,
+        admin_hooks(
+            &in_process,
+            &config_owner.handle,
+            &serving,
+            &metrics_registry,
+            admin_dispatch,
+            options.log_file.clone(),
+            AdminPlaneSeams {
+                backend_metrics,
+                route_plane: redirect_plane,
+            },
+        ),
+        admin_tls_source(config_owner.handle.source().clone()),
+    )
+    .await
+    {
+        Ok(Some((app, task))) => {
+            guard.set_admin_task(task);
+            Some(app)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
+    };
+    if let Err(error) = wait_module_ready(
+        "native meter peer",
+        CONTROL_STARTUP_READY_TIMEOUT,
+        native_meter::wait_peer(shared_client.subscribe_state()),
+    )
+    .await
+    {
+        meter_ready.send_replace(Some(false));
+        return Err(guard.rollback(error).await);
+    }
+    // A legacy Go peer cannot reach this point: negotiation requires native
+    // ownership before either consumer or outbox is opened. SQL stays gated.
+    let native_meter = match control_meter::service::Service::open(
+        meter_config.effective().metering(),
+        meter_paths.join("rust-metering-consumer.json"),
+        meter_paths.join("metering-outbox.json"),
+        in_process.handle().module_context().owner().clone(),
+    )
+    .await
+    {
+        Ok(meter) => meter,
+        Err(error) => {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(format!("open native meter: {error}")).await);
+        }
+    };
+    let _ = meter_slot.set(Arc::clone(&native_meter));
+    let ledger =
+        match dataplane::metering::recover_native_metering(ledger, Arc::clone(&native_meter)).await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                meter_ready.send_replace(Some(false));
+                return Err(guard
+                    .rollback(format!("recover native meter WAL: {error}"))
+                    .await);
+            }
+        };
+    guard.set_metrics_exporter(spawn_metrics_exporter(
+        Arc::clone(&shared_client),
+        serving.clone(),
+        Arc::clone(&runtime_stats),
+        &metrics,
+        observations,
+        Duration::from_secs(1),
+        Arc::clone(&metrics_registry),
+    ));
+    let native_shutdown = metering_shutdown_tx.clone();
+    guard.set_metering_sampler(MeteringSampler {
+        task: tokio::spawn(native_meter::run(
+            metering,
+            ledger,
+            Arc::clone(&native_meter),
+            native_shutdown,
+            Duration::from_secs(1),
+        )),
+        shutdown: metering_shutdown_tx.clone(),
+    });
+
     if let Err(error) = in_process.mark_ready() {
+        meter_ready.send_replace(Some(false));
         return Err(guard
             .rollback(format!("mark in-process control runtime ready: {error}"))
             .await);
+    }
+    meter_ready.send_replace(Some(true));
+    if let Some(app) = &admin_app {
+        app.mark_ready();
     }
     // STARTUP-GUARD:COMMIT
     let RunningProcess {
@@ -759,6 +981,9 @@ async fn run(options: Options) -> Result<(), String> {
                 shutdown: _,
             },
         health_task,
+        metrics_http_task,
+        log_reload_task,
+        admin_task,
         routing_shadow,
     } = guard.commit();
 
@@ -771,6 +996,21 @@ async fn run(options: Options) -> Result<(), String> {
     let mut control_runtime = tokio::spawn(runtime.join());
     let mut metering_sampler = metering_sampler;
     let mut termination = Box::pin(wait_for_termination_signal());
+    // The management plane is supervised too: a listener failure must not
+    // silently leave the process without its operator surface (Go only logs
+    // that; the Rust owner fails closed and drains).
+    // The select borrows the join handle; the exit path hands it back to the
+    // one teardown helper, which never polls a handle that already finished.
+    let (mut admin_join, admin_shutdown) = match admin_task {
+        Some(AdminTask { task, shutdown }) => (Some(task), Some(shutdown)),
+        None => (None, None),
+    };
+    let mut admin_exit = Box::pin(async {
+        match admin_join.as_mut() {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    });
     let (control_result, sampler_result, serving_result, module_result) = tokio::select! {
         control = &mut control_runtime => {
             let control = match control {
@@ -848,6 +1088,30 @@ async fn run(options: Options) -> Result<(), String> {
             };
             (control, sampler, serving_result, Ok(()))
         }
+        admin = &mut admin_exit => {
+            let failure = match admin {
+                Ok(()) => "control admin server exited unexpectedly".to_owned(),
+                Err(_) => "control admin server panicked".to_owned(),
+            };
+            in_process.fail("control_admin", "runtime_failure");
+            let serving_result = stop_drain_and_join_sessions(
+                &in_process,
+                &serving,
+                &drain_tx,
+                &session_shutdown_tx,
+            ).await;
+            metering_shutdown_tx.send_replace(true);
+            shared_client.shutdown();
+            let sampler = match metering_sampler.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("metering sampler panicked".to_owned()),
+            };
+            let control = match control_runtime.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            };
+            (control, sampler, serving_result, Err(failure))
+        }
         module = modules.join_next() => {
             let failure = match module {
                 Some(exit) => match exit.result {
@@ -883,6 +1147,18 @@ async fn run(options: Options) -> Result<(), String> {
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
+    }
+    if let Some(task) = metrics_http_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = log_reload_task {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(admin_exit);
+    if let (Some(task), Some(shutdown)) = (admin_join.take(), admin_shutdown) {
+        startup::Teardown::teardown(AdminTask { task, shutdown }).await;
     }
     metrics_exporter.shutdown();
     metrics_exporter.join().await;
@@ -984,6 +1260,8 @@ async fn spawn_health(
     routes: control_router::RoutePlaneHandle,
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
+    dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
+    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -999,6 +1277,8 @@ async fn spawn_health(
     Ok(Some(tokio::spawn(health::serve(
         listener,
         serving,
+        // Before the native meter opens the SQL gate is closed anyway.
+        Arc::new(move || meter.get().is_none_or(|meter| meter.healthy())),
         Arc::new(move || routes.route_input_evidence()),
         Arc::new(move || ledger_routes.route_ledger_evidence()),
         Arc::new(move || {
@@ -1015,6 +1295,11 @@ async fn spawn_health(
                 routing_generation: routing.as_ref().map_or(0, |source| source.generation),
                 routing_client_epoch: routing.as_ref().map_or(0, |source| source.client_epoch),
             }
+        }),
+        Arc::new(move || {
+            dispatch_stats
+                .drain_watermark
+                .load(std::sync::atomic::Ordering::Relaxed)
         }),
     ))))
 }
@@ -1204,6 +1489,425 @@ async fn wait_for_termination_signal() {
     }
 }
 
+/// Dataplane session lifecycle lines are `INFO` records of the process log.
+fn session_log_line(line: &str) {
+    process_logging::emit(process_logging::Level::Info, line);
+}
+
+/// Projects `log.log-file.*` from the committed config into the process log
+/// output settings; an empty file name keeps the standard stream.
+/// Combines the process's own `--log-file` path with the committed
+/// `log.log-file.*` rotation limits. While the Go control process still owns
+/// `log.log-file.filename`, the Rust process must never share that file (two
+/// rotating writers on one path), so the Rust file name comes only from the
+/// CLI; without it the process keeps its standard stream.
+fn log_file_settings(
+    log_file: Option<&Path>,
+    snapshot: &control_config::ConfigNamespaceSnapshot,
+) -> Option<LogFileSettings> {
+    let filename = log_file?;
+    let log = snapshot.effective().log_online();
+    Some(LogFileSettings {
+        filename: filename.to_path_buf(),
+        max_size_mb: log.log_file_max_size_mb(),
+        max_days: log.log_file_max_days(),
+        max_backups: log.log_file_max_backups(),
+    })
+}
+
+/// Applies every committed `log.log-file.*` rotation-limit change to the
+/// process log output. A file that cannot be reopened is reported on the
+/// current output and the previous output stays in place, exactly like the
+/// Go logger's rebuild.
+async fn run_log_reload(
+    log_file: Option<PathBuf>,
+    mut updates: watch::Receiver<Arc<control_config::ConfigNamespaceSnapshot>>,
+    mut current: Option<LogFileSettings>,
+) {
+    while updates.changed().await.is_ok() {
+        let snapshot = updates.borrow_and_update().clone();
+        // Go `updateLoggerCfg`: rebuild the file output first; only when that
+        // succeeded parse and apply `log.level`, and a level zap rejects
+        // leaves the running level untouched (the failure is logged).
+        let next = log_file_settings(log_file.as_deref(), snapshot.as_ref());
+        if next != current {
+            match process_logging::configure(next.as_ref()) {
+                Ok(()) => current = next,
+                Err(error) => {
+                    process_logging::emit(
+                        process_logging::Level::Error,
+                        &format!(
+                            "{{\"component\":\"tiproxy-rs\",\"event\":\"log_file_reload_rejected\",\"error\":\"{}\"}}",
+                            error.replace('\\', "\\\\").replace('"', "\\\"")
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
+        match process_logging::Level::parse(snapshot.effective().log_level()) {
+            Ok(level) => process_logging::set_level(level),
+            Err(error) => process_logging::emit(
+                process_logging::Level::Error,
+                &format!(
+                    "{{\"component\":\"tiproxy-rs\",\"event\":\"log_level_reload_rejected\",\"error\":\"{}\"}}",
+                    error.to_string().replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            ),
+        }
+    }
+}
+
+/// Binds the native `/metrics` listener when an address was configured.
+/// Management-plane server task plus its graceful stop signal.
+struct AdminTask {
+    task: JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl startup::Teardown for AdminTask {
+    /// The single stop/cleanup helper for the admin server, used by the
+    /// startup rollback and by the supervisor exit path. It tolerates a join
+    /// handle whose completion was already observed (the supervisor branch
+    /// that noticed the server exiting): a finished handle is never polled
+    /// again.
+    fn teardown(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let AdminTask { mut task, shutdown } = self;
+            // Stop accepting and let in-flight requests finish within the
+            // server's own grace period; abort only if it overruns that.
+            shutdown.send_replace(true);
+            if task.is_finished() {
+                return;
+            }
+            if tokio::time::timeout(ADMIN_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        })
+    }
+}
+
+/// Upper bound on the admin server's graceful stop at process exit.
+const ADMIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+async fn spawn_admin(
+    address: String,
+    hooks: control_admin::AdminHooks,
+    tls: control_admin::TlsConfigSource,
+) -> Result<Option<(Arc<control_admin::AdminApp>, AdminTask)>, String> {
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(|error| format!("bind admin endpoint {address}: {error}"))?;
+    let app = Arc::new(control_admin::AdminApp::new(
+        hooks,
+        control_admin::HealthState::new(),
+    ));
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(control_admin::serve(
+        listener,
+        control_admin::full_router(Arc::clone(&app)),
+        control_admin::plaintext_router(Arc::clone(&app)),
+        tls,
+        shutdown_rx,
+        control_admin::ServeOptions::default(),
+    ));
+    Ok(Some((app, AdminTask { task, shutdown })))
+}
+
+/// `control_admin::ConfigAdmin` over the config owner: namespaces persist
+/// below `/config` through the owner-fenced handle, a configuration `PUT` is
+/// the owner's `SetTOMLConfig` equivalent, and a commit waits until the SQL
+/// serving side has composed the current config generation.
+struct OwnerConfigAdmin {
+    handle: ConfigModuleHandle,
+    /// CP-CFG generations the SQL serving side actually installed (initial
+    /// bind, bridge apply, recomposition). Each value is read from the
+    /// validated view that was installed, so nothing composed, staged,
+    /// skipped, or rejected can confirm a generation.
+    applied_config: watch::Receiver<u64>,
+}
+
+/// Longest a namespace commit waits for the serving side to catch up.
+const ADMIN_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl control_admin::ConfigAdmin for OwnerConfigAdmin {
+    fn list_namespaces(&self) -> Vec<NamespaceConfig> {
+        self.handle.source().current().namespaces().to_vec()
+    }
+
+    fn get_namespace(&self, name: &str) -> Option<NamespaceConfig> {
+        self.handle
+            .source()
+            .current()
+            .namespaces()
+            .iter()
+            .find(|namespace| namespace.namespace == name)
+            .cloned()
+    }
+
+    fn set_namespace(
+        &self,
+        value: NamespaceConfig,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(self.handle.set_namespace(value))
+    }
+
+    fn delete_namespace(
+        &self,
+        name: String,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(async move {
+            // Go's B-tree delete of an absent key is a no-op.
+            if self.get_namespace(&name).is_none() {
+                return Ok(());
+            }
+            self.handle.delete_namespace(name).await
+        })
+    }
+
+    fn commit_namespaces(
+        &self,
+        names: Vec<String>,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_admin::CommitError>> {
+        Box::pin(async move {
+            let snapshot = self.handle.source().current();
+            if names
+                .iter()
+                .any(|name| !snapshot.namespaces().iter().any(|ns| ns.namespace == *name))
+            {
+                return Err(control_admin::CommitError::Missing);
+            }
+            // Namespaces become serving through the config watch; "commit"
+            // is complete once serving has applied this CP-CFG generation.
+            let target = snapshot.generation();
+            let mut applied = self.applied_config.clone();
+            let barrier = async {
+                loop {
+                    if *applied.borrow_and_update() >= target {
+                        return Ok(());
+                    }
+                    if applied.changed().await.is_err() {
+                        return Err(control_admin::CommitError::Reload);
+                    }
+                }
+            };
+            tokio::time::timeout(ADMIN_COMMIT_TIMEOUT, barrier)
+                .await
+                .unwrap_or(Err(control_admin::CommitError::Reload))
+        })
+    }
+
+    fn config_toml(&self) -> Option<String> {
+        self.handle
+            .source()
+            .current()
+            .effective()
+            .to_toml_string()
+            .ok()
+    }
+
+    fn config_json(&self) -> Option<String> {
+        self.handle
+            .source()
+            .current()
+            .effective()
+            .to_json_string()
+            .ok()
+    }
+
+    fn put_config_toml(
+        &self,
+        data: Vec<u8>,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_config::ConfigMutationError>> {
+        Box::pin(self.handle.apply_local_toml(data))
+    }
+}
+
+/// `control_admin::DrainAdmin` over the dispatch owner: the operator label
+/// is the local issuer's caller id; outcomes keep Go's error classes and
+/// the status projects the gate's progress/terminal.
+struct DispatchDrainAdmin {
+    dispatch: dataplane::control_dispatch::ControlDispatchHandle,
+}
+
+impl control_admin::DrainAdmin for DispatchDrainAdmin {
+    fn start(
+        &self,
+        request: control_admin::DrainRequest,
+    ) -> control_admin::AdminFuture<'_, Result<(), control_admin::DrainStartError>> {
+        Box::pin(async move {
+            let outcome = self
+                .dispatch
+                .local_drain(dataplane::LocalDrainRequest {
+                    caller_id: request.drain_id,
+                    listener_names: request.listener_names,
+                    backend_ids: request.backend_ids,
+                    graceful_wait: request.graceful_wait,
+                    force_timeout: request.force_timeout,
+                })
+                .await
+                .ok_or(control_admin::DrainStartError::NoSession)?;
+            match outcome {
+                dataplane::LocalDrainOutcome::Accepted { .. } => Ok(()),
+                dataplane::LocalDrainOutcome::SnapshotNotReady => {
+                    Err(control_admin::DrainStartError::SnapshotNotReady)
+                }
+                dataplane::LocalDrainOutcome::DrainInProgress { .. } => {
+                    Err(control_admin::DrainStartError::InProgress)
+                }
+                dataplane::LocalDrainOutcome::ForeignDrainActive { .. } => {
+                    Err(control_admin::DrainStartError::ForeignActive)
+                }
+                dataplane::LocalDrainOutcome::Rejected { code, detail } => {
+                    Err(control_admin::DrainStartError::Other(format!(
+                        "{}: {detail}",
+                        code.as_str_name()
+                    )))
+                }
+            }
+        })
+    }
+
+    fn status(
+        &self,
+        drain_id: String,
+    ) -> control_admin::AdminFuture<'_, Option<control_admin::DrainProgress>> {
+        Box::pin(async move {
+            let status = self.dispatch.local_drain_status(drain_id).await.flatten()?;
+            Some(control_admin::DrainProgress {
+                active_connections: status.result.active_connections,
+                gracefully_closed: status.result.gracefully_closed,
+                force_closed: status.result.force_closed,
+                complete: status.result.complete,
+                code: status.result.code().as_str_name().to_owned(),
+                detail: status.result.detail,
+            })
+        })
+    }
+}
+
+/// Process-state accessors behind the admin handlers. Every closure reads
+/// live state on each request; none retains a payload.
+/// The route/metric plane seams the management plane reads from.
+struct AdminPlaneSeams {
+    backend_metrics: control_topology::BackendMetricsReader,
+    route_plane: control_router::RoutePlaneHandle,
+}
+
+fn admin_hooks(
+    in_process: &Arc<InProcessControlRuntime>,
+    config: &ConfigModuleHandle,
+    serving: &DataplaneServingHandle,
+    registry: &Arc<MetricsRegistry>,
+    dispatch: dataplane::control_dispatch::ControlDispatchHandle,
+    log_file: Option<PathBuf>,
+    seams: AdminPlaneSeams,
+) -> control_admin::AdminHooks {
+    let AdminPlaneSeams {
+        backend_metrics,
+        route_plane,
+    } = seams;
+    let lifecycle = in_process.handle();
+    let health_config = config.clone();
+    let health_serving = serving.clone();
+    let status_serving = serving.clone();
+    let registry = Arc::clone(registry);
+    let config_admin: control_admin::SharedConfigAdmin = Arc::new(OwnerConfigAdmin {
+        handle: config.clone(),
+        applied_config: serving.applied_config_generation(),
+    });
+    control_admin::AdminHooks {
+        health_inputs: Arc::new(move || control_admin::HealthInputs {
+            // Go `PreClose` sets closing when the drain begins.
+            closing: !matches!(
+                lifecycle.lifecycle().phase,
+                LifecyclePhase::Starting | LifecyclePhase::Ready
+            ),
+            namespaces_ready: health_config.is_ready(),
+            applied_generation: health_serving.status().applied_generation,
+            config_checksum: health_config.source().current().config_checksum(),
+        }),
+        metrics_text: Arc::new(move || registry.render_prometheus_text()),
+        dataplane_status: Arc::new(move || dataplane_status(&status_serving.status())),
+        config: config_admin,
+        drain: Some(Arc::new(DispatchDrainAdmin { dispatch })),
+        log_file,
+        backend_metrics: Arc::new(move |cluster| {
+            backend_metrics(cluster).map_or_else(Vec::new, |bytes| bytes.to_vec())
+        }),
+        redirect: Arc::new(move || {
+            route_plane
+                .redirect_connections()
+                .map(|summary| {
+                    let line = format!(
+                        "{{\"component\":\"control-admin\",\"event\":\"redirect_connections\",\"active\":{},\"offered\":{},\"accepted\":{}}}",
+                        summary.active, summary.offered, summary.accepted
+                    );
+                    process_logging::emit(process_logging::Level::Info, &line);
+                })
+                .map_err(|error| format!("{error:?}"))
+        }),
+    }
+}
+
+/// Reads the server-HTTP TLS identity retained by the current accepted config
+/// generation, the same source the metric owner endpoint uses.
+fn admin_tls_source(
+    source: control_config::ConfigNamespaceStore,
+) -> control_admin::TlsConfigSource {
+    Arc::new(move || {
+        source
+            .current()
+            .prepared()
+            .downcast_ref::<topology_composition::PreparedProcessSet>()
+            .and_then(topology_composition::PreparedProcessSet::server_http_tls)
+    })
+}
+
+/// Projects the Rust-owned generation counters onto the Go
+/// `/api/dataplane/status` shape. There is no transport hop in-process, so
+/// desired and sent are both the latest composed generation.
+fn dataplane_status(status: &GenerationStatusSnapshot) -> control_admin::DataplaneStatus {
+    let composed = status.composition_generation.max(status.applied_generation);
+    let last_result_code = if status.rejected_generation > status.applied_generation {
+        "ERROR_CODE_INVALID_SNAPSHOT"
+    } else if status.applied_generation > 0 {
+        "ERROR_CODE_OK"
+    } else {
+        "ERROR_CODE_UNSPECIFIED"
+    };
+    control_admin::DataplaneStatus {
+        enabled: true,
+        desired_generation: composed,
+        sent_generation: composed,
+        applied_generation: status.applied_generation,
+        rejected_generation: status.rejected_generation,
+        last_result_code: last_result_code.to_owned(),
+        detail: String::new(),
+        last_good_age_ms: status
+            .last_good_age
+            .map_or(0, |age| i64::try_from(age.as_millis()).unwrap_or(i64::MAX)),
+    }
+}
+
+async fn spawn_metrics_http(
+    address: Option<SocketAddr>,
+    registry: Arc<MetricsRegistry>,
+) -> Result<Option<JoinHandle<()>>, String> {
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("bind metrics endpoint {address}: {error}"))?;
+    Ok(Some(tokio::spawn(metrics_http::serve(listener, registry))))
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let mut config_file = env::var_os(CONFIG_FILE_ENV).map(PathBuf::from);
@@ -1217,6 +1921,9 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         .unwrap_or_default();
     let mut drain_grace = None;
     let mut health_port: u16 = 0;
+    let mut metrics_addr: Option<SocketAddr> = None;
+    let mut admin_addr: Option<SocketAddr> = None;
+    let mut log_file: Option<PathBuf> = None;
     let mut routing_shadow_socket = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1262,6 +1969,32 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                     .parse()
                     .map_err(|_| format!("health port must be a u16, got {value:?}"))?;
             }
+            "--metrics-addr" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--metrics-addr requires host:port".to_owned())?;
+                metrics_addr =
+                    Some(value.parse().map_err(|_| {
+                        format!("metrics address must be host:port, got {value:?}")
+                    })?);
+            }
+            "--admin-addr" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--admin-addr requires host:port".to_owned())?;
+                admin_addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("admin address must be host:port, got {value:?}"))?,
+                );
+            }
+            "--log-file" => {
+                log_file = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--log-file requires a path".to_owned())?,
+                ));
+            }
             "--drain-grace-seconds" => {
                 let value = arguments
                     .next()
@@ -1294,7 +2027,10 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     if tls_roots.iter().any(|root| !root.is_absolute()) {
         return Err("TLS allowlist roots must be absolute".to_owned());
     }
-    Ok(Command::Run(Options {
+    if log_file.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err("log file path must be absolute".to_owned());
+    }
+    Ok(Command::Run(Box::new(Options {
         config_file: config_file
             .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
         control_socket,
@@ -1304,7 +2040,10 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         tls_roots,
         drain_grace,
         health_port,
-    }))
+        metrics_addr,
+        admin_addr,
+        log_file,
+    })))
 }
 
 fn parse_uid(value: &str) -> Result<u32, String> {
@@ -1323,7 +2062,7 @@ impl startup::Teardown for legacy_router_shadow::consumer::Task {
 
 fn usage() -> &'static str {
     "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
-     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--routing-shadow-socket <absolute-path>]\n\
+     [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--admin-addr <host:port>] [--log-file <absolute-path>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
 
@@ -1333,14 +2072,16 @@ fn version_output() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::path::PathBuf;
 
     use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
 
     use super::{
-        Command, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS, Options, StartupGuard,
-        config_persistence_client, join_modules_with_timeout, parse_options, persistence_options,
-        session_loop_config, version_output, wait_module_ready,
+        Command, GenerationStatusSnapshot, INTEGRATION_CAPABILITIES, MAX_DRAIN_GRACE_SECONDS,
+        Options, StartupGuard, config_persistence_client, dataplane_status,
+        join_modules_with_timeout, parse_options, persistence_options, session_loop_config,
+        version_output, wait_module_ready,
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
@@ -1357,6 +2098,25 @@ mod tests {
     use dataplane::metering::MeteringSamplerError;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
+
+    /// Reviewer regression (`CodexM5`, `813b3140`): the supervisor observes the
+    /// admin server's completion, then hands the same handle to the one
+    /// teardown helper; that helper must not poll a completed handle again.
+    #[tokio::test]
+    async fn review_completed_admin_join_must_not_be_polled_again_during_cleanup() {
+        let (shutdown, _stop) = watch::channel(false);
+        let mut admin = super::AdminTask {
+            task: tokio::spawn(async {}),
+            shutdown,
+        };
+        // This is the same ownership sequence as the admin_exit select branch:
+        // observe completion, then pass the retained AdminTask to final cleanup.
+        (&mut admin.task)
+            .await
+            .unwrap_or_else(|error| unreachable!("admin completed normally: {error}"));
+        let cleanup = tokio::spawn(admin.teardown()).await;
+        assert!(cleanup.is_ok(), "cleanup must not panic: {cleanup:?}");
+    }
 
     #[test]
     fn a_control_failure_is_not_masked_by_the_final_sampler_handoff() {
@@ -1711,6 +2471,9 @@ mod tests {
             metrics_exporter,
             metering_sampler,
             health_task,
+            metrics_http_task: _,
+            log_reload_task: _,
+            admin_task: _,
             routing_shadow,
         } = guard.commit();
         // Tearing the transferred handles down proves they were moved out of the
@@ -1892,10 +2655,15 @@ mod tests {
         );
         assert_eq!(
             region.matches("wait_module_ready(").count(),
-            3,
-            "config, topology, and route-plane readiness are all deadline-bounded"
+            4,
+            "config, topology, route-plane, and native meter peer readiness are deadline-bounded"
         );
-        for module in ["config owner", "topology module", "route-plane module"] {
+        for module in [
+            "config owner",
+            "topology module",
+            "route-plane module",
+            "native meter peer",
+        ] {
             assert!(
                 region.contains(&format!("\"{module}\"")),
                 "the readiness diagnostic names {module}"
@@ -1923,7 +2691,7 @@ mod tests {
             unreachable!("valid operational arguments")
         };
         assert_eq!(
-            options,
+            *options,
             Options {
                 routing_shadow_socket: None,
                 config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
@@ -1932,6 +2700,9 @@ mod tests {
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
                 drain_grace: None,
                 health_port: 0,
+                metrics_addr: None,
+                admin_addr: None,
+                log_file: None,
             }
         );
     }
@@ -1968,10 +2739,18 @@ mod tests {
         };
         assert_eq!(
             INTEGRATION_CAPABILITIES,
-            "in-process-control-runtime,control-bridge-v1,rust-route-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
+            "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd",
             "only what the binary truthfully provides: Rust route ownership plus the wired plain slice, TLS, PROXY v2, and compression"
         );
-        for wired in ["rust-route-owner", "tls", "proxy-v2", "zlib", "zstd"] {
+        for wired in [
+            "rust-route-owner",
+            "rust-meter-owner",
+            "rust-api-owner",
+            "tls",
+            "proxy-v2",
+            "zlib",
+            "zstd",
+        ] {
             assert!(
                 INTEGRATION_CAPABILITIES.contains(wired),
                 "{wired:?} is wired (WIRE-activation A1/B/C), so it must be advertised"
@@ -1989,6 +2768,9 @@ mod tests {
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
             drain_grace: Some(Duration::from_secs(45)),
             health_port: 8081,
+            metrics_addr: None,
+            admin_addr: None,
+            log_file: None,
         };
         let source = ConfigNamespaceStore::from_toml(
             b"enable-traffic-replay = false\n",
@@ -2123,6 +2905,7 @@ pd-addrs = "routing-pd:2379"
             unreachable!("valid operational arguments")
         };
         assert_eq!(options.health_port, 8081);
+        assert_eq!(options.metrics_addr, None);
         assert!(
             parse_options([
                 "--config".to_owned(),
@@ -2136,6 +2919,134 @@ pd-addrs = "routing-pd:2379"
         );
     }
 
+    #[test]
+    fn parses_admin_addr() {
+        let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--admin-addr".to_owned(),
+            "127.0.0.1:3082".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.admin_addr,
+            "127.0.0.1:3082".parse::<SocketAddr>().ok(),
+            "the admin address is a plain socket address"
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--admin-addr".to_owned(),
+                "3082".to_owned(),
+            ])
+            .is_err(),
+            "a bare port is not an address"
+        );
+    }
+
+    #[test]
+    fn dataplane_status_projection_follows_the_go_shape() {
+        let mut status = GenerationStatusSnapshot {
+            applied_generation: 3,
+            rejected_generation: 0,
+            composition_generation: 4,
+            last_good_age: Some(Duration::from_millis(1500)),
+            ..Default::default()
+        };
+        let projected = dataplane_status(&status);
+        assert_eq!(
+            projected.to_json(),
+            "{\"applied_generation\":3,\"desired_generation\":4,\"detail\":\"\",\"enabled\":true,\"last_good_age_ms\":1500,\"last_result_code\":\"ERROR_CODE_OK\",\"rejected_generation\":0,\"sent_generation\":4}"
+        );
+        status.rejected_generation = 5;
+        assert_eq!(
+            dataplane_status(&status).last_result_code,
+            "ERROR_CODE_INVALID_SNAPSHOT"
+        );
+        assert_eq!(
+            dataplane_status(&GenerationStatusSnapshot::default()).last_result_code,
+            "ERROR_CODE_UNSPECIFIED"
+        );
+    }
+
+    #[test]
+    fn parses_metrics_addr() {
+        let command = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--metrics-addr".to_owned(),
+            "0.0.0.0:3081".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.metrics_addr,
+            "0.0.0.0:3081".parse::<SocketAddr>().ok(),
+            "the metrics address is a plain socket address"
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--control-uid".to_owned(),
+                "42".to_owned(),
+                "--metrics-addr".to_owned(),
+                "3081".to_owned(),
+            ])
+            .is_err(),
+            "a bare port is not a socket address"
+        );
+    }
+
+    #[test]
+    fn parses_log_file_and_requires_an_absolute_path() {
+        let Ok(Command::Run(options)) = parse_options([
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+            "--control-socket".to_owned(),
+            "/tmp/control.sock".to_owned(),
+            "--control-uid".to_owned(),
+            "42".to_owned(),
+            "--log-file".to_owned(),
+            "/var/log/tiproxy-rs.log".to_owned(),
+        ]) else {
+            unreachable!("valid operational arguments")
+        };
+        assert_eq!(
+            options.log_file,
+            Some(PathBuf::from("/var/log/tiproxy-rs.log"))
+        );
+        assert!(
+            parse_options([
+                "--config".to_owned(),
+                "/etc/tiproxy/tiproxy.toml".to_owned(),
+                "--control-socket".to_owned(),
+                "/tmp/control.sock".to_owned(),
+                "--control-uid".to_owned(),
+                "42".to_owned(),
+                "--log-file".to_owned(),
+                "tiproxy-rs.log".to_owned(),
+            ])
+            .is_err(),
+            "a relative log file would depend on the working directory"
+        );
+    }
     #[test]
     fn rejects_over_bound_drain_grace() {
         let Err(error) = parse_options([

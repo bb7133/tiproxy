@@ -48,7 +48,7 @@ production path and becomes dead-path deletion in Phase 2.
 | New redirect id while one is pending | Protocol violation surfaced; Go never issues one (it serializes on terminal results). |
 | Duplicate `CloseCommand` (same id) | Replays the cached `CloseResult`. |
 | Different close id while closing | Reports the actual closing id's state; never schedules a second close. |
-| Duplicate `DrainCommand` (active id) | Returns current progress; never a second drain. Protocol `drain_id` is an **incarnation-unique wire operation id** (`<operator-label>@<128-bit boot nonce>`): one Go issuer incarnation binds each operator label to exactly one wire id/sequence, including across reconnects/epochs. A fresh Go restart re-requesting the same label is **a new operation by definition** (resuming would require persisting the label→wire mapping, which is deliberately not claimed); a previous incarnation's still-active drain surfaces through the `DRAIN_IN_PROGRESS` answer (`DrainIssuer::ForeignActiveDrain`) for the composition to wait on and retry. |
+| Duplicate `DrainCommand` (active id; legacy composition only — under `RUST_ROUTE_OWNER` both drain bodies are retired tombstones and operator drains are issued inside the Rust process, see `rust-control-admin.md`) | Returns current progress; never a second drain. Protocol `drain_id` is an **incarnation-unique wire operation id** (`<operator-label>@<128-bit boot nonce>`): one Go issuer incarnation binds each operator label to exactly one wire id/sequence, including across reconnects/epochs. A fresh Go restart re-requesting the same label is **a new operation by definition** (resuming would require persisting the label→wire mapping, which is deliberately not claimed); a previous incarnation's still-active drain surfaces through the `DRAIN_IN_PROGRESS` answer (`DrainIssuer::ForeignActiveDrain`) for the composition to wait on and retry. |
 | Different drain id while one is active | `DRAIN_IN_PROGRESS` (both sides reject — Go locally before sending, Rust at the gate). |
 | Re-issued completed drain id (idle) | Replays the final result. |
 | Duplicate/reordered `MeteringBatch` | Same-producer sequences `<= last` are idempotently skipped; only `last+1` applies, while a gap (`> last+1`) is fatal. The producer's single WAL-ordered sender therefore prevents both double-count and skips. |
@@ -93,7 +93,9 @@ issuer ignores by id (never a new failure, never a re-execution).
 Watermarks survive restarts through reconciliation
 (`ReconcileConnection.last_redirect_command_sequence`,
 `ReconcileRequest.last_drain_command_sequence`): a restarted issuer
-resumes from watermark + 1.
+resumes from watermark + 1. Since CP-ADMIN slice 3 the drain watermark is
+reported by Rust for diagnostics only; the local issuer keeps its lineage
+inside the process and Go restores nothing.
 
 All of this — the additive reconcile fields, nonzero sequences, and
 the rehydration/orphan lifecycle — is gated by the

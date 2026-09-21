@@ -101,11 +101,13 @@ The v1 capability registry is append-only:
 | 4 | `METERING_ABSOLUTE_SNAPSHOTS` | producer-qualified absolute metering snapshots and durable acknowledgement |
 | 5 | `RUST_CONFIG_NAMESPACE` | Rust-owned config/namespace fields; Go sends only protocol/static `ConfigSnapshot` facts and no namespaces |
 | 6 | `RUST_ROUTE_OWNER` | process-lifetime assertion that Rust owns topology, route selection, migration, and route lifecycle; Go sends no backends/namespaces and never becomes a fallback owner |
+| 7 | `RUST_METER_OWNER` | Rust owns durable metering end to end; `MeteringBatch`/`MeteringAck` are retired wire bodies (see `rust-control-meter.md`) |
+| 8 | `RUST_API_OWNER` | Rust owns the management API and the Prometheus exposition; Go starts no API server and `MetricsBatch` is a retired wire body (see `rust-control-admin.md`, slice 5c) |
 
 Capabilities 1–3 are retired from the bundled Rust-owner production handshake;
-their enum values and message tags remain append-only v1 tombstones. Capability
-6 is different from an optional per-envelope extension: bundled Rust mode
-requires it during every handshake. A missing capability 6 rejects the
+their enum values and message tags remain append-only v1 tombstones. Capabilities
+6, 7, and 8 are different from an optional per-envelope extension: bundled Rust
+mode requires them during every handshake. A missing capability 6 rejects the
 connection before it becomes an active session. After one compatible startup,
 a disconnect or rejected reconnect cannot demote the process to Go routing.
 
@@ -203,6 +205,13 @@ reconciliation, or metering. Counter/histogram deltas remain locally
 coalesced until a batch is accepted by the Rust transport, while metrics as a
 whole remain best effort once written. Metering continues to use its separate
 durable, acknowledged ledger and never shares this loss policy.
+
+**Retired under `RUST_API_OWNER` (capability 8, CP-ADMIN slice 5c):** the
+Rust process serves these series natively on its own `/metrics` and the
+management listener; `MetricsBatch` (tag 35) is an append-only tombstone that
+Go answers with `PROTOCOL_VIOLATION` ("retired metrics message under
+RUST_API_OWNER") and counts in `tiproxy_server_err{type="rust_legacy_metrics_violation"}`.
+The table below records the retired batch catalog.
 
 | Owner/source | Existing Prometheus series carried by `MetricsBatch` | Bounded labels |
 |---|---|---|
@@ -317,10 +326,15 @@ or key material.
 With capability 6, handshake policy, namespace resolution, route selection,
 reservation settlement, connection lifecycle, redirect, failover, and
 per-route force-close are in-process Rust operations. Production emits no
-`Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, or `Close*` body.
-Receiving any one of those retired bodies is a nonfatal protocol violation:
-increment the bounded `rust_legacy_route_violation` observation, produce no
-callback/result/effect, and leave the route-state hash unchanged.
+`Handshake*`, `Route*`, `ConnectionEvent`, `Redirect*`, or `Close*` body, and
+since CP-ADMIN slice 3 (operator drains issued inside the Rust process) no
+`DrainCommand` or `DrainResult` body either. Receiving any one of those
+retired bodies is a nonfatal protocol violation: increment the bounded
+`rust_legacy_route_violation` observation (its count therefore includes
+retired drain bodies), produce no callback/result/effect, and leave the
+route-state hash unchanged. `ReconcileRequest.last_drain_command_sequence`
+remains Rust's own gate watermark, reported for diagnostics; Go restores
+nothing from it.
 
 The protobuf oneof tags and message definitions remain exactly where they are.
 They are deprecated non-actionable tombstones until a protocol-v2 change can
@@ -400,8 +414,11 @@ requires `PER_CONNECTION_CLOSE`. Rust replies once with `CloseResult` and then
 emits the ordinary terminal `ConnectionEvent(CLOSED)`. A duplicate close ID
 replays the cached result; a different close ID for an already-closing session
 returns its current state without scheduling a second close. `force=true`
-maps `RedirectableConn.ForceClose`; listener/backend-wide graceful shutdown
-continues to use `DrainCommand` and must not be overloaded for one connection.
+maps `RedirectableConn.ForceClose`; listener/backend-wide graceful shutdown is
+a drain, never a per-connection close. Under `RUST_ROUTE_OWNER` the drain is
+issued inside the Rust process through its admin API (`docs/design/
+rust-control-admin.md`) and `DrainCommand`/`DrainResult` are retired v1
+tombstones; the wire semantics above describe the legacy composition.
 
 ## Error codes
 

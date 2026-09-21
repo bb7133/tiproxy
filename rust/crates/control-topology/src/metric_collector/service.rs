@@ -211,6 +211,15 @@ impl Response {
     }
 }
 
+/// The bytes the owner endpoint would answer for `cluster` right now: the
+/// same capture, liveness and ownership checks as a served response, taken
+/// once (the management plane writes the small body in one step). `None`
+/// when this process is not serving.
+pub(super) fn snapshot_bytes(shared: &Arc<Shared>, cluster: &str) -> Option<Arc<[u8]>> {
+    let response = Response::capture(shared, cluster)?;
+    response.with_current(|| Arc::clone(&response.bytes))
+}
+
 async fn handle(mut socket: MetricConnectionStream, shared: Arc<Shared>) -> io::Result<()> {
     let mut request = Vec::with_capacity(1024);
     while !request.ends_with(b"\r\n\r\n") {

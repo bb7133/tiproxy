@@ -1,0 +1,2262 @@
+[
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": false,
+    "max": 1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000000
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000000
+        ],
+        "error": false,
+        "tokens": 500
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": false,
+    "max": 2,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000001
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 497
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000002
+        ],
+        "error": true,
+        "tokens": 497
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000002,
+          1825000003
+        ],
+        "error": true,
+        "tokens": 492
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000003
+        ],
+        "error": false,
+        "tokens": 493
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000003
+        ],
+        "error": false,
+        "tokens": 494
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": false,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002
+        ],
+        "error": false,
+        "tokens": 497
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002,
+          625000003
+        ],
+        "error": false,
+        "tokens": 498
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000003
+        ],
+        "error": true,
+        "tokens": 498
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000003,
+          1825000004,
+          1825000005,
+          1825000006
+        ],
+        "error": true,
+        "tokens": 483
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000006
+        ],
+        "error": false,
+        "tokens": 484
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000006
+        ],
+        "error": false,
+        "tokens": 485
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": false,
+    "max": -1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002
+        ],
+        "error": false,
+        "tokens": 497
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002,
+          625000003
+        ],
+        "error": false,
+        "tokens": 498
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000003
+        ],
+        "error": true,
+        "tokens": 498
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000003,
+          1825000004,
+          1825000005,
+          1825000006,
+          1825000007,
+          1825000008,
+          1825000009,
+          1825000010,
+          1825000011,
+          1825000012,
+          1825000013,
+          1825000014,
+          1825000015,
+          1825000016,
+          1825000017,
+          1825000018,
+          1825000019,
+          1825000020,
+          1825000021,
+          1825000022,
+          1825000023,
+          1825000024,
+          1825000025,
+          1825000026,
+          1825000027,
+          1825000028,
+          1825000029,
+          1825000030,
+          1825000031,
+          1825000032,
+          1825000033,
+          1825000034,
+          1825000035,
+          1825000036,
+          1825000037,
+          1825000038,
+          1825000039,
+          1825000040,
+          1825000041,
+          1825000042,
+          1825000043,
+          1825000044,
+          1825000045,
+          1825000046,
+          1825000047,
+          1825000048,
+          1825000049,
+          1825000050,
+          1825000051,
+          1825000052,
+          1825000053,
+          1825000054,
+          1825000055,
+          1825000056,
+          1825000057,
+          1825000058,
+          1825000059,
+          1825000060,
+          1825000061,
+          1825000062,
+          1825000063,
+          1825000064,
+          1825000065,
+          1825000066,
+          1825000067,
+          1825000068,
+          1825000069,
+          1825000070,
+          1825000071,
+          1825000072,
+          1825000073,
+          1825000074,
+          1825000075,
+          1825000076,
+          1825000077,
+          1825000078,
+          1825000079,
+          1825000080,
+          1825000081,
+          1825000082,
+          1825000083,
+          1825000084,
+          1825000085,
+          1825000086,
+          1825000087,
+          1825000088,
+          1825000089,
+          1825000090,
+          1825000091,
+          1825000092,
+          1825000093,
+          1825000094,
+          1825000095,
+          1825000096,
+          1825000097,
+          1825000098,
+          1825000099,
+          1825000100,
+          1825000101,
+          1825000102
+        ],
+        "error": true,
+        "tokens": 3
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000102
+        ],
+        "error": false,
+        "tokens": 4
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000102
+        ],
+        "error": false,
+        "tokens": 5
+      }
+    ]
+  },
+  {
+    "name": "late-throttle",
+    "new": false,
+    "adaptive": false,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          "RequestTimeout",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 750,
+        "attempt_ns": [
+          750000000,
+          750000001,
+          750000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002
+        ],
+        "error": false,
+        "tokens": 497
+      },
+      {
+        "codes": [
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002,
+          750000003
+        ],
+        "error": false,
+        "tokens": 498
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000003
+        ],
+        "error": false,
+        "tokens": 499
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": true,
+    "max": 1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          931919643
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1294182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1994182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          2494182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          12494182468
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          13109720317
+        ],
+        "error": false,
+        "tokens": 500
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": true,
+    "max": 2,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1569674745
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2029852002,
+          2476340363
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          3176340363
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          3676340363,
+          3722147283
+        ],
+        "error": true,
+        "tokens": 490
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          13722147283
+        ],
+        "error": false,
+        "tokens": 490
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          14614979937
+        ],
+        "error": false,
+        "tokens": 490
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": true,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643,
+          1569674745
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2029852002
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2476340363,
+          2919211738
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          3619211738
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          4119211738,
+          4119211739,
+          4731440964,
+          6189155717
+        ],
+        "error": true,
+        "tokens": 480
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          16189155717
+        ],
+        "error": false,
+        "tokens": 480
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          17701251930
+        ],
+        "error": false,
+        "tokens": 480
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": false,
+    "adaptive": true,
+    "max": -1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643,
+          1569674745
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2029852002
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2476340363,
+          2919211738
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          3619211738
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          4119211738,
+          4119211739,
+          4731440964,
+          6189155717,
+          8189155717,
+          10189155717,
+          12189155717,
+          14189155717,
+          16189155717,
+          18189155717,
+          20189155717,
+          22189155717,
+          24189155717,
+          26189155717,
+          28189155717,
+          30189155717,
+          32189155717,
+          34189155717,
+          36189155717,
+          38189155717,
+          40189155717,
+          42189155717,
+          44189155717,
+          46189155717,
+          48189155717,
+          50189155717,
+          52189155717,
+          54189155717,
+          56189155717,
+          58189155717,
+          60189155717,
+          62189155717,
+          64189155717,
+          66189155717,
+          68189155717,
+          70189155717,
+          72189155717,
+          74189155717,
+          76189155717,
+          78189155717,
+          80189155717,
+          82189155717,
+          84189155717,
+          86189155717,
+          88189155717,
+          90189155717,
+          92189155717,
+          94189155717,
+          96189155717,
+          98189155717,
+          100189155717,
+          102189155717,
+          104189155717,
+          106189155717,
+          108189155717,
+          110189155717,
+          112189155717,
+          114189155717,
+          116189155717,
+          118189155717,
+          120189155717,
+          122189155717,
+          124189155717,
+          126189155717,
+          128189155717,
+          130189155717,
+          132189155717,
+          134189155717,
+          136189155717,
+          138189155717,
+          140189155717,
+          142189155717,
+          144189155717,
+          146189155717,
+          148189155717,
+          150189155717,
+          152189155717,
+          154189155717,
+          156189155717,
+          158189155717,
+          160189155717,
+          162189155717,
+          164189155717,
+          166189155717,
+          168189155717,
+          170189155717,
+          172189155717,
+          174189155717,
+          176189155717,
+          178189155717,
+          180189155717,
+          182189155717,
+          184189155717,
+          186189155717,
+          188189155717,
+          190189155717,
+          192189155717,
+          194189155717,
+          196189155717,
+          198189155717
+        ],
+        "error": true,
+        "tokens": 0
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          208189155717
+        ],
+        "error": false,
+        "tokens": 0
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          210189155717
+        ],
+        "error": false,
+        "tokens": 0
+      }
+    ]
+  },
+  {
+    "name": "late-throttle",
+    "new": false,
+    "adaptive": true,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          "RequestTimeout",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 750,
+        "attempt_ns": [
+          750000000,
+          750000001,
+          1642857144
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2268623051
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2879153978,
+          4072813259
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          4905033212
+        ],
+        "error": false,
+        "tokens": 495
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": false,
+    "max": 1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000000
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000000
+        ],
+        "error": false,
+        "tokens": 500
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": false,
+    "max": 2,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000001
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000002
+        ],
+        "error": true,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000002,
+          1825000003
+        ],
+        "error": true,
+        "tokens": 491
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000003
+        ],
+        "error": false,
+        "tokens": 492
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000003
+        ],
+        "error": false,
+        "tokens": 493
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": false,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002,
+          625000003
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000003
+        ],
+        "error": true,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000003,
+          1825000004,
+          1825000005,
+          1825000006
+        ],
+        "error": true,
+        "tokens": 481
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000006
+        ],
+        "error": false,
+        "tokens": 482
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000006
+        ],
+        "error": false,
+        "tokens": 483
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": false,
+    "max": -1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          625000001,
+          625000002
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          625000002,
+          625000003
+        ],
+        "error": false,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1325000003
+        ],
+        "error": true,
+        "tokens": 496
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          1825000003,
+          1825000004,
+          1825000005,
+          1825000006,
+          1825000007,
+          1825000008,
+          1825000009,
+          1825000010,
+          1825000011,
+          1825000012,
+          1825000013,
+          1825000014,
+          1825000015,
+          1825000016,
+          1825000017,
+          1825000018,
+          1825000019,
+          1825000020,
+          1825000021,
+          1825000022,
+          1825000023,
+          1825000024,
+          1825000025,
+          1825000026,
+          1825000027,
+          1825000028,
+          1825000029,
+          1825000030,
+          1825000031,
+          1825000032,
+          1825000033,
+          1825000034,
+          1825000035,
+          1825000036,
+          1825000037,
+          1825000038,
+          1825000039,
+          1825000040,
+          1825000041,
+          1825000042,
+          1825000043,
+          1825000044,
+          1825000045,
+          1825000046,
+          1825000047,
+          1825000048,
+          1825000049,
+          1825000050,
+          1825000051,
+          1825000052,
+          1825000053,
+          1825000054,
+          1825000055,
+          1825000056,
+          1825000057,
+          1825000058,
+          1825000059,
+          1825000060,
+          1825000061,
+          1825000062,
+          1825000063,
+          1825000064,
+          1825000065,
+          1825000066,
+          1825000067,
+          1825000068,
+          1825000069,
+          1825000070,
+          1825000071,
+          1825000072,
+          1825000073,
+          1825000074,
+          1825000075,
+          1825000076,
+          1825000077,
+          1825000078,
+          1825000079,
+          1825000080,
+          1825000081,
+          1825000082,
+          1825000083,
+          1825000084,
+          1825000085,
+          1825000086,
+          1825000087,
+          1825000088,
+          1825000089,
+          1825000090,
+          1825000091,
+          1825000092,
+          1825000093,
+          1825000094,
+          1825000095,
+          1825000096,
+          1825000097,
+          1825000098,
+          1825000099,
+          1825000100,
+          1825000101,
+          1825000102
+        ],
+        "error": true,
+        "tokens": 1
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          11825000102
+        ],
+        "error": false,
+        "tokens": 2
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          11825000102
+        ],
+        "error": false,
+        "tokens": 3
+      }
+    ]
+  },
+  {
+    "name": "late-throttle",
+    "new": true,
+    "adaptive": false,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          "RequestTimeout",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 750,
+        "attempt_ns": [
+          750000000,
+          750000001,
+          750000002
+        ],
+        "error": false,
+        "tokens": 486
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002
+        ],
+        "error": false,
+        "tokens": 487
+      },
+      {
+        "codes": [
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002,
+          750000003
+        ],
+        "error": false,
+        "tokens": 487
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000003
+        ],
+        "error": false,
+        "tokens": 488
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": true,
+    "max": 1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          931919643
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1294182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          1994182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          2494182468
+        ],
+        "error": true,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          12494182468
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          13109720317
+        ],
+        "error": false,
+        "tokens": 500
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": true,
+    "max": 2,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1378348215
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1725570437,
+          2072792659
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          2772792659
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          3272792659,
+          3272792660
+        ],
+        "error": true,
+        "tokens": 490
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          13272792660
+        ],
+        "error": false,
+        "tokens": 490
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          13920168165
+        ],
+        "error": false,
+        "tokens": 490
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": true,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643,
+          1378348215
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1824776786
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2171999009,
+          2484147210
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          3184147210
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          3684147210,
+          3684147211,
+          4240732189,
+          5019024677
+        ],
+        "error": true,
+        "tokens": 480
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          15019024677
+        ],
+        "error": false,
+        "tokens": 480
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          15837877910
+        ],
+        "error": false,
+        "tokens": 480
+      }
+    ]
+  },
+  {
+    "name": "persistent-sequence",
+    "new": true,
+    "adaptive": true,
+    "max": -1,
+    "operations": [
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          0
+        ],
+        "error": false,
+        "tokens": 500
+      },
+      {
+        "codes": [
+          "Throttling",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 625,
+        "attempt_ns": [
+          625000000,
+          931919643,
+          1378348215
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          1824776786
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "RequestTimeout",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2171999009,
+          2484147210
+        ],
+        "error": false,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Denied"
+        ],
+        "gap_ms": 700,
+        "attempt_ns": [
+          3184147210
+        ],
+        "error": true,
+        "tokens": 495
+      },
+      {
+        "codes": [
+          "Throttling"
+        ],
+        "gap_ms": 500,
+        "attempt_ns": [
+          3684147210,
+          3684147211,
+          4240732189,
+          5019024677,
+          5797317166,
+          6575609654,
+          7353902143,
+          8132194631,
+          8910487120,
+          9688779608,
+          10467072097,
+          11245364585,
+          12023657074,
+          12801949563,
+          13580242051,
+          14358534540,
+          15136827028,
+          15915119517,
+          16693412005,
+          17471704494,
+          18249996982,
+          19028289471,
+          19806581959,
+          20584874448,
+          21363166937,
+          22141459425,
+          22919751914,
+          23698044402,
+          24476336891,
+          25254629379,
+          26032921868,
+          26811214356,
+          27589506845,
+          28367799333,
+          29146091822,
+          29924384311,
+          30702676799,
+          31480969288,
+          32259261776,
+          33037554265,
+          33815846753,
+          34594139242,
+          35372431730,
+          36150724219,
+          36929016707,
+          37707309196,
+          38485601685,
+          39263894173,
+          40042186662,
+          40820479150,
+          41598771639,
+          42377064127,
+          43155356616,
+          43933649104,
+          44711941593,
+          45490234081,
+          46268526570,
+          47046819058,
+          47825111547,
+          48603404036,
+          49381696524,
+          50159989013,
+          50938281501,
+          51716573990,
+          52494866478,
+          53273158967,
+          54051451455,
+          54829743944,
+          55608036432,
+          56386328921,
+          57164621410,
+          57942913898,
+          58721206387,
+          59499498875,
+          60277791364,
+          61056083852,
+          61834376341,
+          62612668829,
+          63390961318,
+          64169253806,
+          64947546295,
+          65725838784,
+          66504131272,
+          67282423761,
+          68060716249,
+          68839008738,
+          69617301226,
+          70395593715,
+          71173886203,
+          71952178692,
+          72730471180,
+          73508763669,
+          74287056158,
+          75065348646,
+          75843641135,
+          76621933623,
+          77400226112,
+          78178518600,
+          78956811089,
+          79735103577
+        ],
+        "error": true,
+        "tokens": 0
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 10000,
+        "attempt_ns": [
+          89735103577
+        ],
+        "error": false,
+        "tokens": 0
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          90685055732
+        ],
+        "error": false,
+        "tokens": 0
+      }
+    ]
+  },
+  {
+    "name": "late-throttle",
+    "new": true,
+    "adaptive": true,
+    "max": 4,
+    "operations": [
+      {
+        "codes": [
+          "RequestTimeout",
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 750,
+        "attempt_ns": [
+          750000000,
+          750000001,
+          750000002
+        ],
+        "error": false,
+        "tokens": 486
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002
+        ],
+        "error": false,
+        "tokens": 486
+      },
+      {
+        "codes": [
+          "Throttling",
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          750000002,
+          1642857144
+        ],
+        "error": false,
+        "tokens": 486
+      },
+      {
+        "codes": [
+          ""
+        ],
+        "gap_ms": 0,
+        "attempt_ns": [
+          2535714287
+        ],
+        "error": false,
+        "tokens": 486
+      }
+    ]
+  }
+]

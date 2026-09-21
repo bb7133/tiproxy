@@ -58,7 +58,8 @@ use control_proto::control_transport::{
     ClientConfig, ConnectionState, ControlClient, SessionMeta, TransportError,
 };
 use control_proto::snapshot::{
-    SnapshotError, SnapshotLineage, SnapshotStore, UnixTime, ValidatedSnapshot,
+    CompositionGenerations, SnapshotError, SnapshotLineage, SnapshotStore, UnixTime,
+    ValidatedSnapshot,
 };
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{ControlEnvelope, Priority, StateSnapshot};
@@ -78,6 +79,10 @@ pub struct SnapshotComposition {
     /// Zero for the legacy one-source path; otherwise the Rust domain
     /// generation that replaced bridge-owned fields.
     pub generation: u64,
+    /// Zero for the legacy one-source path; otherwise the Rust-owned config
+    /// source generation this composition was composed from. It travels with
+    /// the composed view so only a successful serving apply can confirm it.
+    pub config_generation: u64,
 }
 
 /// Applies each newly validated snapshot to the serving side (for
@@ -99,6 +104,7 @@ pub trait SnapshotConsumer: Send + 'static {
         Ok(SnapshotComposition {
             snapshot: source.clone(),
             generation: 0,
+            config_generation: 0,
         })
     }
 
@@ -426,7 +432,10 @@ pub async fn process_state_snapshot<C: SnapshotConsumer>(
                     generation,
                     snapshot.clone(),
                     effective.snapshot,
-                    effective.generation,
+                    CompositionGenerations {
+                        composition: effective.generation,
+                        config: effective.config_generation,
+                    },
                     now,
                     lineage,
                 )

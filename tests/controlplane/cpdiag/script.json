@@ -1,0 +1,197 @@
+{
+  "files": [
+    {
+      "name": "tiproxy.log",
+      "lines": [
+        "[2019/08/26 06:22:14.011 -04:00] [INFO] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "This is also an invalid log contains partern ...",
+        "[2019/08/26 06:22:14.011 -04:00] [WARN] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:22:15.011 -04:00] [ERROR] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:22:16.011 -04:00] [DEBUG] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:22:17.011 -04:00] [TRACE] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:23:14.011 -04:00] [INFO] [printer.go:41] [\"partern test to TiDB.\"]",
+        "[2019/08/27 06:23:14.011 -04:00] [INFO] [printer.go:41] [\"partern test txn to TiDB.\"]"
+      ]
+    },
+    {
+      "name": "tiproxy-2019-08-26T06-19-00.000.log",
+      "lines": [
+        "[2019/08/26 06:19:13.011 -04:00] [INFO] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:19:14.011 -04:00] [WARN] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:19:15.011 -04:00] [ERROR] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:19:16.011 -04:00] [DEBUG] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:19:16.500 -04:00] [NOTICE] [printer.go:41] [\"unknown level passes every filter\"]",
+        "This is an invalid log blablabla][",
+        "[2019/08/26 06:19:17.011 -04:00] ] [INFO] invalid log\"]",
+        "[2019/08/26 06:19:17.011 -04:00] [TRACE] [printer.go:41] [\"Welcome to TiDB.\"]"
+      ]
+    },
+    {
+      "name": "tiproxy-2019-08-26T06-20-00.000.log",
+      "lines": [
+        "[2019/08/26 06:20:14.011 -04:00] [INFO] [printer.go:41] [\"Welcome to TiDB.\"]"
+      ]
+    },
+    {
+      "name": "tiproxy-2019-08-26T06-21-00.000.log.gz",
+      "gz": true,
+      "lines": [
+        "[2019/08/26 06:21:14.011 -04:00] [WARN] [printer.go:41] [\"Welcome to TiDB.\"]",
+        "[2019/08/26 06:21:15.011 -04:00] [INFO] [printer.go:41] [\"Welcome to TiDB.\"]"
+      ]
+    },
+    {
+      "name": "tiproxy-empty.log",
+      "lines": [
+        ""
+      ]
+    },
+    {
+      "name": "tiproxy-bulk.log",
+      "generate": {
+        "count": 2049,
+        "stamp_prefix": "2019/08/25 06:00:",
+        "level": "INFO"
+      }
+    },
+    {
+      "name": "other.log",
+      "lines": [
+        "[2019/08/26 06:22:14.011 -04:00] [INFO] [printer.go:41] [\"Welcome to TiDB.\"]"
+      ]
+    }
+  ],
+  "searches": [
+    {
+      "name": "all",
+      "start_time": 0,
+      "end_time": 0
+    },
+    {
+      "name": "window-inclusive",
+      "start_time": 1566814754011,
+      "end_time": 1566814756011
+    },
+    {
+      "name": "window-across-files",
+      "start_time": 1566814814011,
+      "end_time": 1566814935011
+    },
+    {
+      "name": "levels-warn-error",
+      "start_time": 0,
+      "end_time": 0,
+      "levels": [
+        "Warn",
+        "Error"
+      ]
+    },
+    {
+      "name": "levels-unknown-passes",
+      "start_time": 1566814753011,
+      "end_time": 1566814757011,
+      "levels": [
+        "Info"
+      ]
+    },
+    {
+      "name": "pattern-all-must-match",
+      "start_time": 0,
+      "end_time": 0,
+      "patterns": [
+        "partern",
+        "txn"
+      ]
+    },
+    {
+      "name": "pattern-anchored-and-class",
+      "start_time": 0,
+      "end_time": 0,
+      "patterns": [
+        "^\\[printer\\.go:41\\] \\[\"Welcome to TiDB\\.\"\\]$"
+      ]
+    },
+    {
+      "name": "pattern-invalid",
+      "start_time": 0,
+      "end_time": 0,
+      "patterns": [
+        "("
+      ]
+    },
+    {
+      "name": "empty-window",
+      "start_time": 1566815353011,
+      "end_time": 1566815537011
+    },
+    {
+      "name": "bulk-batches",
+      "start_time": 1566727200000,
+      "end_time": 1566730799999
+    },
+    {
+      "name": "bulk-exact-1024",
+      "start_time": 1566727200000,
+      "end_time": 1566727201023
+    },
+    {
+      "name": "cancel-after-first-packet",
+      "start_time": 0,
+      "end_time": 0,
+      "cancel_after_packets": 1
+    }
+  ],
+  "http1_probe_path": "/diagnosticspb.Diagnostics/server_info",
+  "server_info_types": {
+    "all": 0,
+    "hardware": 1,
+    "system": 2,
+    "load": 3,
+    "unknown": 7
+  },
+  "server_info_tls_types": [
+    "load"
+  ],
+  "server_info_volatile_sysctl": [
+    "^fs\\.dentry-state$",
+    "^fs\\.inode-nr$",
+    "^fs\\.inode-state$",
+    "^fs\\.file-nr$",
+    "^kernel\\.ns_last_pid$",
+    "^kernel\\.random\\.(uuid|entropy_avail)$",
+    "^kernel\\.pty\\.nr$",
+    "^net\\.netfilter\\.nf_conntrack_count$",
+    "^fs\\.quota\\.syncs$"
+  ],
+  "server_info_declared": {
+    "darwin": [
+      {
+        "kind": "missing",
+        "item": "cpu/usage",
+        "owner": "macos-mach-cpu-ticks"
+      },
+      {
+        "kind": "missing",
+        "item": "net/disk*",
+        "owner": "macos-iokit-disk-io"
+      },
+      {
+        "kind": "value",
+        "item": "cpu/cpu",
+        "key": "cpu-frequency",
+        "owner": "macos-m1cpu-frequency"
+      },
+      {
+        "kind": "value",
+        "item": "disk/*",
+        "key": "opts",
+        "owner": "macos-mount-multilabel"
+      },
+      {
+        "kind": "sysctl-values",
+        "owner": "macos-sysctl-live-counters"
+      }
+    ],
+    "linux": []
+  }
+}

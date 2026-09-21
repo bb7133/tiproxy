@@ -150,6 +150,17 @@ func newRustMetricsStore() *rustMetricsStore {
 
 var rustMetrics = newRustMetricsStore()
 
+// RustMetricNames lists every metric family the Rust dataplane may publish, in
+// no particular order. The native Rust exposition parity gate uses it to select
+// the families it compares against the Go promhttp output.
+func RustMetricNames() []string {
+	names := make([]string, 0, len(rustMetricSpecs))
+	for name := range rustMetricSpecs {
+		names = append(names, name)
+	}
+	return names
+}
+
 // ApplyRustMetricsBatch validates and merges one Rust bulk observation batch.
 // A duplicate sequence in the same control epoch and every stale control
 // epoch are ignored. On a newer epoch, a lower sequence is accepted as a

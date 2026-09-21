@@ -167,15 +167,23 @@ pub trait EventSink: Send + Sync + 'static {
     fn record(&self, event: &RuntimeEvent);
 }
 
-/// JSON-lines stderr sink used by the production binary.
+/// JSON-lines sink used by the production binary. Lines go through the
+/// process log output ([`crate::logging::emit`]): stderr by default, or the
+/// configured rotating log file. An event carrying an error class is an
+/// `ERROR` line; every other lifecycle event is `INFO`.
 #[derive(Debug, Default)]
 pub struct JsonStderrSink;
 
 impl EventSink for JsonStderrSink {
     fn record(&self, event: &RuntimeEvent) {
-        eprintln!(
-            "{}",
-            json!({
+        let level = if event.error_class.is_some() {
+            crate::logging::Level::Error
+        } else {
+            crate::logging::Level::Info
+        };
+        crate::logging::emit(
+            level,
+            &json!({
                 "component": "control-plane",
                 "event": event.kind.as_str(),
                 "phase": event.snapshot.phase.as_str(),
@@ -187,6 +195,7 @@ impl EventSink for JsonStderrSink {
                 "module": event.module,
                 "error_class": event.error_class,
             })
+            .to_string(),
         );
     }
 }

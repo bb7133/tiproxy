@@ -1,0 +1,162 @@
+[
+  {
+    "env": {},
+    "name": "imds-system",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "metadata": "true"
+        },
+        "method": "GET",
+        "url": "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "AZURE_TOKEN_CREDENTIALS": "prod"
+    },
+    "name": "imds-chain",
+    "requests": [
+      {
+        "body": "",
+        "headers": {},
+        "method": "GET",
+        "url": "http://169.254.169.254/metadata/identity/oauth2/token"
+      },
+      {
+        "body": "",
+        "headers": {
+          "metadata": "true"
+        },
+        "method": "GET",
+        "url": "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "AZURE_CLIENT_ID": "client"
+    },
+    "name": "imds-user",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "metadata": "true"
+        },
+        "method": "GET",
+        "url": "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01\u0026client_id=client\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "AZURE_CLIENT_ID": "client",
+      "IDENTITY_ENDPOINT": "http://identity.test/token?keep=1",
+      "IDENTITY_HEADER": "fake-identity-secret"
+    },
+    "name": "app-service",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "x-identity-header": "fake-identity-secret"
+        },
+        "method": "GET",
+        "url": "http://identity.test/token?api-version=2019-08-01\u0026client_id=client\u0026keep=1\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "DEFAULT_IDENTITY_CLIENT_ID": "default-client",
+      "MSI_ENDPOINT": "http://identity.test/token?keep=1",
+      "MSI_SECRET": "fake-msi-secret"
+    },
+    "name": "azure-ml-default",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "secret": "fake-msi-secret"
+        },
+        "method": "GET",
+        "url": "http://identity.test/token?api-version=2017-09-01\u0026clientid=default-client\u0026keep=1\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "AZURE_CLIENT_ID": "client",
+      "DEFAULT_IDENTITY_CLIENT_ID": "default-client",
+      "MSI_ENDPOINT": "http://identity.test/token?keep=1",
+      "MSI_SECRET": "fake-msi-secret"
+    },
+    "name": "azure-ml-user",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "secret": "fake-msi-secret"
+        },
+        "method": "GET",
+        "url": "http://identity.test/token?api-version=2017-09-01\u0026clientid=client\u0026keep=1\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "MSI_ENDPOINT": "http://identity.test/token?keep=1"
+    },
+    "name": "cloud-shell",
+    "requests": [
+      {
+        "body": "resource=https%3A%2F%2Fstorage.azure.com",
+        "headers": {
+          "content-type": "application/x-www-form-urlencoded",
+          "metadata": "true"
+        },
+        "method": "POST",
+        "url": "http://identity.test/token?keep=1"
+      }
+    ]
+  },
+  {
+    "env": {
+      "IDENTITY_ENDPOINT": "https://identity.test/token?keep=1",
+      "IDENTITY_HEADER": "fake-identity-secret",
+      "IDENTITY_SERVER_THUMBPRINT": "fake-thumbprint"
+    },
+    "name": "service-fabric",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "application/json",
+          "secret": "fake-identity-secret"
+        },
+        "method": "GET",
+        "url": "https://identity.test/token?api-version=2019-07-01-preview\u0026keep=1\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  },
+  {
+    "env": {
+      "IDENTITY_ENDPOINT": "http://identity.test/token?keep=1",
+      "IMDS_ENDPOINT": "configured"
+    },
+    "name": "azure-arc",
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "metadata": "true"
+        },
+        "method": "GET",
+        "url": "http://identity.test/token?api-version=2020-06-01\u0026keep=1\u0026resource=https%3A%2F%2Fstorage.azure.com"
+      }
+    ]
+  }
+]

@@ -332,6 +332,10 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         let mut next_probe = (!self.config.backend_check_interval.is_zero())
             .then(|| Instant::now() + self.config.backend_check_interval);
 
+        // The wire engine has at most one unacknowledged command. Its payload
+        // stays in the engine; retain only the classified event while a
+        // redirect owns the command boundary (Go's processLock).
+        let mut queued_command = None;
         loop {
             if self.fsm.state() == SessionState::Closed {
                 return LoopEnd::FsmClosed;
@@ -371,7 +375,20 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     self.apply(event, &mut armed_deadline, None).await;
                 }
                 LoopAction::Event(event) => {
-                    self.apply(event, &mut armed_deadline, None).await;
+                    if self.fsm.state() == SessionState::RedirectPending
+                        && matches!(
+                            event,
+                            SessionEvent::ClientCommand | SessionEvent::ClientCommandQuit
+                        )
+                        && queued_command.is_none()
+                    {
+                        // A response can reach the client before the engine
+                        // consumes the following StartRedirectHandshake effect.
+                        // Rejecting this next command would lose its ACK forever.
+                        queued_command = Some(event);
+                    } else {
+                        self.apply(event, &mut armed_deadline, None).await;
+                    }
                 }
                 LoopAction::Control(command) => {
                     let drain_deadline = match command {
@@ -381,6 +398,14 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     self.apply(command.session_event(), &mut armed_deadline, drain_deadline)
                         .await;
                 }
+            }
+            if self.fsm.state() == SessionState::Ready
+                && let Some(event) = queued_command.take()
+            {
+                // apply() enqueues all terminal redirect effects first, so the
+                // backend swap (or failure retaining the old backend) precedes
+                // this command's forwarding ACK. Closing instead drops the slot.
+                self.apply(event, &mut armed_deadline, None).await;
             }
         }
     }

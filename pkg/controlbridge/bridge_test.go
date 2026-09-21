@@ -5,11 +5,9 @@ package controlbridge
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,7 +58,6 @@ func TestBridgeOwnsListenerAndCadenceLifecycle(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, bridge.Adapter())
-	require.NotNil(t, bridge.Issuer())
 	require.NotNil(t, bridge.Consumer())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,138 +197,6 @@ func bridgeFakeRustPeer(t *testing.T, socketPath string) (*net.UnixConn, uint64)
 		Body:            &controlpb.ControlEnvelope_HelloAck{HelloAck: echo},
 	}, ack.GetMaxFrameBytes()))
 	return peer, ack.GetControlEpoch()
-}
-
-// The operator drain lifecycle end to end over a real control socket:
-// issuance rewrites the wire id with the incarnation lineage and one
-// absolute deadline budget; progress and the terminal flow back into
-// DrainStatus; a duplicate issuance is idempotent (same wire id and
-// sequence); a still-active foreign drain rejects until resolved; and
-// completion frees the single-flight slot for the next drain id.
-func TestBridgeOperatorDrainLifecycle(t *testing.T) {
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
-	handler := &recordingHandler{rt: rt}
-	config := bridgeTransportConfig(t)
-	bridge, err := NewBridge(BridgeConfig{
-		Transport:             config,
-		Handshake:             handler,
-		OrphanResolveInterval: time.Hour,
-		SnapshotSyncInterval:  10 * time.Millisecond,
-	})
-	require.NoError(t, err)
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		_ = bridge.Close()
-		<-done
-	})
-
-	// No session yet: the drain has no carrier.
-	require.ErrorIs(t,
-		bridge.StartDrain(t.Context(), DrainRequest{DrainID: "d-early"}),
-		ErrNoDataplaneSession)
-
-	peer, epoch := bridgeFakeRustPeer(t, config.SocketPath)
-
-	// A foreign (previous-incarnation) drain blocks issuance until its
-	// terminal resolves it.
-	require.NoError(t, bridge.Issuer().HandleDrainResult(&controlpb.DrainResult{
-		DrainId:           "old@feedface",
-		ActiveConnections: 1,
-		Code:              controlpb.ErrorCode_ERROR_CODE_DRAIN_IN_PROGRESS,
-	}))
-	// The server installs the active session asynchronously after the
-	// wire handshake; the foreign rejection doubles as the readiness
-	// probe.
-	require.Eventually(t, func() bool {
-		err = bridge.StartDrain(t.Context(), DrainRequest{
-			DrainID:      "d-op",
-			GracefulWait: 50 * time.Millisecond,
-			ForceTimeout: 100 * time.Millisecond,
-		})
-		return errors.Is(err, ErrForeignDrainActive)
-	}, 2*time.Second, 10*time.Millisecond)
-	require.NoError(t, bridge.Issuer().HandleDrainResult(&controlpb.DrainResult{
-		DrainId:  "old@feedface",
-		Complete: true,
-	}))
-
-	// Issuance: the wire command carries the incarnation-scoped id,
-	// sequence 1, and absolute deadlines.
-	require.NoError(t, bridge.StartDrain(t.Context(), DrainRequest{
-		DrainID:      "d-op",
-		Scope:        DrainScope{ListenerNames: []string{"sql-0"}},
-		GracefulWait: 50 * time.Millisecond,
-		ForceTimeout: 100 * time.Millisecond,
-	}))
-	first := readPeerResponse(t, peer, func(envelope *controlpb.ControlEnvelope) bool {
-		return envelope.GetDrainCommand() != nil
-	}).GetDrainCommand()
-	require.True(t, strings.HasPrefix(first.GetDrainId(), "d-op@"), first.GetDrainId())
-	require.EqualValues(t, 1, first.GetCommandSequence())
-	require.Positive(t, first.GetGracefulDeadlineUnixMillis())
-	require.Greater(t, first.GetForceDeadlineUnixMillis(), first.GetGracefulDeadlineUnixMillis())
-	require.Equal(t, []string{"sql-0"}, first.GetListenerNames())
-
-	// Idempotent re-issue: the same operator id re-sends the SAME wire
-	// binding (id and sequence unchanged).
-	require.NoError(t, bridge.StartDrain(t.Context(), DrainRequest{DrainID: "d-op"}))
-	second := readPeerResponse(t, peer, func(envelope *controlpb.ControlEnvelope) bool {
-		return envelope.GetDrainCommand() != nil
-	}).GetDrainCommand()
-	require.Equal(t, first.GetDrainId(), second.GetDrainId())
-	require.Equal(t, first.GetCommandSequence(), second.GetCommandSequence())
-
-	// A different id while active: single-flight rejection.
-	require.ErrorIs(t,
-		bridge.StartDrain(t.Context(), DrainRequest{DrainID: "d-other"}),
-		ErrDrainInProgress)
-
-	// Progress flows into DrainStatus by the operator's id.
-	writePeerEnvelope(t, peer, epoch, &controlpb.ControlEnvelope{
-		RequestId: 42,
-		Body: &controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{
-			DrainId:           first.GetDrainId(),
-			ActiveConnections: 2,
-			GracefullyClosed:  1,
-			Code:              controlpb.ErrorCode_ERROR_CODE_OK,
-		}},
-	})
-	require.Eventually(t, func() bool {
-		result, _ := bridge.DrainStatus("d-op")
-		return result.GetGracefullyClosed() == 1
-	}, 2*time.Second, 10*time.Millisecond)
-
-	// The terminal completes the drain and frees the slot: a new drain
-	// id may start.
-	writePeerEnvelope(t, peer, epoch, &controlpb.ControlEnvelope{
-		RequestId: 43,
-		Body: &controlpb.ControlEnvelope_DrainResult{DrainResult: &controlpb.DrainResult{
-			DrainId:           first.GetDrainId(),
-			ActiveConnections: 2,
-			GracefullyClosed:  1,
-			ForceClosed:       1,
-			Complete:          true,
-			Code:              controlpb.ErrorCode_ERROR_CODE_OK,
-		}},
-	})
-	require.Eventually(t, func() bool {
-		result, completed := bridge.DrainStatus("d-op")
-		return completed && result.GetComplete()
-	}, 2*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool {
-		return bridge.StartDrain(t.Context(), DrainRequest{
-			DrainID:      "d-next",
-			GracefulWait: 10 * time.Millisecond,
-			ForceTimeout: 10 * time.Millisecond,
-		}) == nil
-	}, 2*time.Second, 20*time.Millisecond)
-	next := readPeerResponse(t, peer, func(envelope *controlpb.ControlEnvelope) bool {
-		return envelope.GetDrainCommand() != nil && strings.HasPrefix(envelope.GetDrainCommand().GetDrainId(), "d-next@")
-	}).GetDrainCommand()
-	require.EqualValues(t, 2, next.GetCommandSequence(), "the issuer-wide sequence advanced")
 }
 
 // Every boot precedes its peer: the snapshot cadence must tick with a

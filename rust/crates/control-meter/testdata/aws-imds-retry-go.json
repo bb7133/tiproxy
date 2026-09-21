@@ -1,0 +1,1338 @@
+[
+  {
+    "after": "",
+    "name": "token-503-recovers",
+    "new": false,
+    "token_statuses": [
+      503,
+      200
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-503-falls-back",
+    "new": false,
+    "token_statuses": [
+      503
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1,
+      2
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-503-no-v1",
+    "new": false,
+    "token_statuses": [
+      503
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": true,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      1,
+      2
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-400-terminal",
+    "new": false,
+    "token_statuses": [
+      400
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-429-not-retried",
+    "new": false,
+    "token_statuses": [
+      429
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-403-fallback",
+    "new": false,
+    "token_statuses": [
+      403
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-503-recovers",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-503-exhausted",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      503
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      1,
+      2
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-429-terminal",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      429
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-401-refreshes-token",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-401-exhausted",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      401
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      1,
+      2
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-3",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "v1-401-reenables-token",
+    "new": false,
+    "token_statuses": [
+      403,
+      200
+    ],
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-403-terminal",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      403
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "invalid-token-ttl-no-retry",
+    "new": false,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "MISSING",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "invalid-token-ttl-no-v1",
+    "new": false,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "MISSING",
+    "v1_disabled": true,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "zero-token-ttl-refreshed-on-retry",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "0",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "five-second-deadline",
+    "new": false,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": true,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "token-retry-after",
+    "new": false,
+    "token_statuses": [
+      503,
+      200
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "metadata-retry-after",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "metadata-401-no-retry-after",
+    "new": false,
+    "token_statuses": null,
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-503-recovers",
+    "new": true,
+    "token_statuses": [
+      503,
+      200
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-503-falls-back",
+    "new": true,
+    "token_statuses": [
+      503
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0,
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-503-no-v1",
+    "new": true,
+    "token_statuses": [
+      503
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": true,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      0,
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-400-terminal",
+    "new": true,
+    "token_statuses": [
+      400
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-429-not-retried",
+    "new": true,
+    "token_statuses": [
+      429
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "token-403-fallback",
+    "new": true,
+    "token_statuses": [
+      403
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-503-recovers",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-503-exhausted",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      503
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      0,
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-429-terminal",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      429
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-401-refreshes-token",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-401-exhausted",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      401
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": [
+      0,
+      1
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-3",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "v1-401-reenables-token",
+    "new": true,
+    "token_statuses": [
+      403,
+      200
+    ],
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "metadata-403-terminal",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      403
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "invalid-token-ttl-no-retry",
+    "new": true,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "MISSING",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "invalid-token-ttl-no-v1",
+    "new": true,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "MISSING",
+    "v1_disabled": true,
+    "hang": false,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "zero-token-ttl-refreshed-on-retry",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "0",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "",
+    "name": "five-second-deadline",
+    "new": true,
+    "token_statuses": null,
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": true,
+    "error": true,
+    "second_error": false,
+    "backoffs": null,
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "token-retry-after",
+    "new": true,
+    "token_statuses": [
+      503,
+      200
+    ],
+    "statuses": null,
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "metadata-retry-after",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      503,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      }
+    ]
+  },
+  {
+    "after": "2000",
+    "name": "metadata-401-no-retry-after",
+    "new": true,
+    "token_statuses": null,
+    "statuses": [
+      401,
+      200
+    ],
+    "ttl": "300",
+    "v1_disabled": false,
+    "hang": false,
+    "error": false,
+    "second_error": false,
+    "backoffs": [
+      0
+    ],
+    "requests": [
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-1",
+        "ttl": ""
+      },
+      {
+        "method": "PUT",
+        "token": "",
+        "ttl": "300"
+      },
+      {
+        "method": "GET",
+        "token": "token-2",
+        "ttl": ""
+      }
+    ]
+  }
+]

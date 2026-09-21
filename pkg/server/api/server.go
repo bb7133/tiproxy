@@ -71,7 +71,10 @@ type DataplaneStatusReader interface {
 	Status() controlbridge.SnapshotStatus
 }
 
-// DataplaneDrainer exposes the operator drain entry (DPL-04).
+// DataplaneDrainer exposes the operator drain entry (DPL-04). Since CP-ADMIN
+// slice 3 no production composition implements it (operator drains are
+// issued through the Rust admin API); the handlers and this interface remain
+// as the HTTP contract and the Go oracle of the CP-ADMIN differential harness.
 type DataplaneDrainer interface {
 	StartDrain(ctx context.Context, request controlbridge.DrainRequest) error
 	DrainStatus(drainID string) (*controlpb.DrainResult, bool)

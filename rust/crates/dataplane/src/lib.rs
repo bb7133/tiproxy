@@ -49,9 +49,11 @@ pub use control_commands::{
 };
 pub use control_dispatch::{CommandKind, CommandToken, SessionDirective};
 pub use control_dispatch::{ControlCommandHandler, OutboundControl};
+pub use control_dispatch::{LocalDrainOutcome, LocalDrainRequest, LocalDrainStatus};
 pub use observability::{
-    DEFAULT_OBSERVATION_CAPACITY, MetricsExporter, MetricsRecorder, Observation, QuitSource,
-    SessionLogContext, spawn_metrics_exporter,
+    DEFAULT_OBSERVATION_CAPACITY, METRIC_SPECS, MetricKind, MetricSpec, MetricsExporter,
+    MetricsRecorder, MetricsRegistry, Observation, QuitSource, SessionLogContext, format_go_float,
+    install_session_log_writer, spawn_metrics_exporter,
 };
 pub use registry::{
     ConnectionId, ConnectionMetadata, ConnectionRegistry, ConnectionRegistrySnapshot, RegistryError,

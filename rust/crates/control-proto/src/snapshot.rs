@@ -230,11 +230,23 @@ impl ClientCertVerifier for CommonNameClientVerifier {
     }
 }
 
+/// Independent process-local generations attached to a composed serving
+/// view. Both are zero on the legacy one-source path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompositionGenerations {
+    /// Composer counter that produced the view.
+    pub composition: u64,
+    /// Rust-owned config source generation the composition was composed
+    /// from. It travels with the view so only the serving apply that
+    /// installs the view can publish it.
+    pub config: u64,
+}
+
 /// One complete, immutable generation ready for new sessions.
 #[derive(Debug)]
 pub struct ValidatedSnapshot {
     generation: u64,
-    composition_generation: u64,
+    generations: CompositionGenerations,
     source_raw: StateSnapshot,
     raw: StateSnapshot,
     /// Server TLS config captured by new frontend sessions.
@@ -256,7 +268,16 @@ impl ValidatedSnapshot {
     /// serving view. Zero identifies the legacy one-source path.
     #[must_use]
     pub const fn composition_generation(&self) -> u64 {
-        self.composition_generation
+        self.generations.composition
+    }
+
+    /// Returns the Rust-owned config source generation this serving view was
+    /// composed from. Zero identifies the legacy one-source path. Carried
+    /// with the validated view so a successful serving apply can publish the
+    /// config lineage it actually installed.
+    #[must_use]
+    pub const fn config_generation(&self) -> u64 {
+        self.generations.config
     }
 
     /// Returns the complete validated protobuf snapshot.
@@ -545,14 +566,15 @@ impl SnapshotStore {
             generation,
             source_snapshot,
             effective_snapshot,
-            0,
+            CompositionGenerations::default(),
             now,
             lineage,
         )
     }
 
     /// Stages one source/effective pair and records its independent
-    /// process-local composition generation.
+    /// process-local composition generation together with the Rust-owned
+    /// config source generation the composition used.
     ///
     /// # Errors
     ///
@@ -562,7 +584,7 @@ impl SnapshotStore {
         generation: u64,
         source_snapshot: StateSnapshot,
         effective_snapshot: StateSnapshot,
-        composition_generation: u64,
+        generations: CompositionGenerations,
         now: UnixTime,
         lineage: SnapshotLineage,
     ) -> Result<Staged, SnapshotError> {
@@ -616,7 +638,7 @@ impl SnapshotStore {
         }
         let candidate = Arc::new(self.validate(
             generation,
-            composition_generation,
+            generations,
             source_snapshot,
             effective_snapshot,
             now,
@@ -640,11 +662,12 @@ impl SnapshotStore {
         snapshot: StateSnapshot,
         now: UnixTime,
     ) -> Result<Arc<ValidatedSnapshot>, SnapshotError> {
-        self.validate_composed(generation, 0, snapshot, now)
+        self.validate_composed(generation, CompositionGenerations::default(), snapshot, now)
     }
 
     /// Validates a serving-only recomposition with its independent
-    /// process-local generation, without changing store state.
+    /// process-local generation and the Rust-owned config source generation
+    /// it was composed from, without changing store state.
     ///
     /// # Errors
     ///
@@ -652,7 +675,7 @@ impl SnapshotStore {
     pub fn validate_composed(
         &self,
         generation: u64,
-        composition_generation: u64,
+        generations: CompositionGenerations,
         snapshot: StateSnapshot,
         now: UnixTime,
     ) -> Result<Arc<ValidatedSnapshot>, SnapshotError> {
@@ -663,7 +686,7 @@ impl SnapshotStore {
         }
         Ok(Arc::new(self.validate(
             generation,
-            composition_generation,
+            generations,
             snapshot.clone(),
             snapshot,
             now,
@@ -770,7 +793,7 @@ impl SnapshotStore {
     fn validate(
         &self,
         generation: u64,
-        composition_generation: u64,
+        generations: CompositionGenerations,
         source_raw: StateSnapshot,
         snapshot: StateSnapshot,
         now: UnixTime,
@@ -796,7 +819,7 @@ impl SnapshotStore {
         }
         Ok(ValidatedSnapshot {
             generation,
-            composition_generation,
+            generations,
             source_raw,
             raw: snapshot,
             frontend_server_config,

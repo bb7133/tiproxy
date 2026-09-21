@@ -68,9 +68,9 @@ pub use merge::{
     ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
 };
 pub use metric_collector::{
-    MetricAcceptFuture, MetricCacheLineage, MetricCollector, MetricCollectorError,
-    MetricConnection, MetricConnectionAcceptor, MetricConnectionStream, MetricOverlayHandle,
-    MetricSnapshot, PlainMetricConnectionAcceptor,
+    BackendMetricsReader, MetricAcceptFuture, MetricCacheLineage, MetricCollector,
+    MetricCollectorError, MetricConnection, MetricConnectionAcceptor, MetricConnectionStream,
+    MetricOverlayHandle, MetricSnapshot, PlainMetricConnectionAcceptor,
 };
 pub use metric_source::{
     MetricCapture, MetricConfigError, MetricReadError, MetricRuntimePolicy, MetricSourceHandle,

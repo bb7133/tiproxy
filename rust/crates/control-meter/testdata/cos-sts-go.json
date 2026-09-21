@@ -1,0 +1,1 @@
+{"authorization":"TC3-HMAC-SHA256 Credential=fake-id/2023-11-14/sts/tc3_request, SignedHeaders=content-type;host, Signature=ac5bf6f8b3e251e5620ff15980e8ef4e2de6feac0b1faadbbbe21cbc9e42afcc","body":"{\"DurationSeconds\":7200,\"RoleArn\":\"qcs::cam::uin/123:roleName/test\",\"RoleSessionName\":\"metering-writer\"}","timestamp":"1700000000","token":"fake-token"}

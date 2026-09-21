@@ -28,7 +28,7 @@ use control_plane::{
     ConfigSource, ControlConfig, ControlModule, ControlRuntime as InProcessControlRuntime,
     LifecyclePhase, LogLevel, MetricsPolicy, ModuleContext, ModuleError, ModuleFuture, TlsPolicy,
 };
-use control_proto::snapshot::{SnapshotError, SnapshotStore, UnixTime};
+use control_proto::snapshot::{CompositionGenerations, SnapshotError, SnapshotStore, UnixTime};
 use control_proto::v1::{
     BackendSnapshot, ConfigSnapshot, KeepalivePolicy, Listener, NamespaceSnapshot,
     ProxyProtocolMode, StateSnapshot, TlsPolicy as WireTlsPolicy,
@@ -48,7 +48,7 @@ pub struct RustConfigComposer {
 
 impl RustConfigComposer {
     #[must_use]
-    pub const fn new(source: ConfigNamespaceStore, drain_grace_override: Option<Duration>) -> Self {
+    pub fn new(source: ConfigNamespaceStore, drain_grace_override: Option<Duration>) -> Self {
         Self {
             source,
             topology: None,
@@ -82,11 +82,16 @@ impl RustConfigComposer {
         &self,
         bridge: &StateSnapshot,
     ) -> Result<SnapshotComposition, SnapshotError> {
+        let owned = self.source.current();
+        let composition_generation = self.generation.load(Ordering::Acquire);
+        // The CP-CFG generation travels inside the composition: the
+        // namespace-commit barrier only learns it from the serving apply
+        // that installed this exact view, never from the act of composing.
         compose_snapshot(
-            &self.source.current(),
+            &owned,
             bridge,
             self.topology.as_ref(),
-            self.generation.load(Ordering::Acquire),
+            composition_generation,
             self.drain_grace_override,
         )
     }
@@ -293,7 +298,15 @@ impl CandidateValidator for ServingCandidateValidator {
         };
         let now = unix_time_now();
         self.snapshots
-            .validate_composed(1, 1, candidate, unix_time_now())
+            .validate_composed(
+                1,
+                CompositionGenerations {
+                    composition: 1,
+                    config: 1,
+                },
+                candidate,
+                unix_time_now(),
+            )
             .map_err(|_| "serving_validation")?;
         let server_http_policy = wire_tls(&effective.server_http_tls().material_policy());
         let server_http_tls = self
@@ -410,6 +423,7 @@ fn compose_snapshot(
             namespaces: wire_namespaces(owned.namespaces()),
         },
         generation: composition_generation,
+        config_generation: owned.generation(),
     })
 }
 
@@ -629,6 +643,67 @@ mod tests {
         assert!(composition.snapshot.namespaces.is_empty());
         composer.advance_generation()?;
         assert_eq!(composer.compose_current(&bridge)?.generation, 2);
+        Ok(())
+    }
+
+    /// Every composition carries the CP-CFG generation it was composed from
+    /// as a value of its own: the initial bind composition carries
+    /// generation 1, a topology-only wake advances the composer counter but
+    /// keeps the config lineage, and a bridge re-compose at an unchanged
+    /// composition counter after a newer configuration carries that newer
+    /// generation without touching any earlier composition's value (there
+    /// is no composer-side history to overwrite; only the serving apply
+    /// that installs a view publishes its generation).
+    #[test]
+    fn compositions_carry_the_config_generation_they_were_composed_from()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir();
+        let owned =
+            ConfigNamespaceStore::from_toml(b"[proxy]\naddr = \"127.0.0.1:7001\"\n", None, &dir)?;
+        let composer = RustConfigComposer::new(owned.clone(), None);
+        let bridge = StateSnapshot {
+            config: Some(ConfigSnapshot {
+                advertised_capability: 123,
+                server_version: "TiProxy-test".to_owned(),
+                ..ConfigSnapshot::default()
+            }),
+            ..StateSnapshot::default()
+        };
+        let initial = composer.compose_current(&bridge)?;
+        assert_eq!((initial.generation, initial.config_generation), (1, 1));
+        composer.advance_generation()?;
+        let topology_wake = composer.compose_current(&bridge)?;
+        assert_eq!(
+            (topology_wake.generation, topology_wake.config_generation),
+            (2, 1),
+            "topology-only wake keeps the config lineage"
+        );
+        owned.apply_toml(
+            b"[proxy]\naddr = \"127.0.0.1:7001\"\nmax-connections = 5\n",
+            None,
+            2,
+            &dir,
+        )?;
+        assert_eq!(owned.current().generation(), 2);
+        let bridge_recompose = composer.compose_current(&bridge)?;
+        assert_eq!(
+            (
+                bridge_recompose.generation,
+                bridge_recompose.config_generation
+            ),
+            (2, 2),
+            "a bridge re-compose before the adapter wake carries the new config"
+        );
+        assert_eq!(
+            topology_wake.config_generation, 1,
+            "the earlier composition still reports the generation it used"
+        );
+        composer.advance_generation()?;
+        let adapter_wake = composer.compose_current(&bridge)?;
+        assert_eq!(
+            (adapter_wake.generation, adapter_wake.config_generation),
+            (3, 2)
+        );
         Ok(())
     }
 

@@ -1,0 +1,892 @@
+[
+  {
+    "name": "empty-put-ignoresCRC",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "unicode-payload",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "success",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "empty404",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 404,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "malformed404",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 404,
+        "body": "\u003cbad",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "NoSuchKey403",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 403,
+        "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "401terminal",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 401,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "408terminal",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 408,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "429terminal",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 429,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "503retry",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 503,
+        "body": "",
+        "crc": "",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "501retry",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 501,
+        "body": "",
+        "crc": "",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "599exhaustion",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 599,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "transport-retry",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 0,
+        "body": "",
+        "crc": "",
+        "transport": true
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "BadRequest400terminal",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 400,
+        "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "missingCRC",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "wrongCRC",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "malformedCRC",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "invalid",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "crc-error-not-retried",
+    "method": "HEAD",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "0",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": true,
+    "error": false
+  },
+  {
+    "name": "empty-put-ignoresCRC",
+    "method": "PUT",
+    "payload": "",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "unicode-payload",
+    "method": "PUT",
+    "payload": "汉字\u0000payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "18350002009662028172",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "汉字\u0000payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "success",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "4003499538920775563",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "empty404",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 404,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "malformed404",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 404,
+        "body": "\u003cbad",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "NoSuchKey403",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 403,
+        "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "401terminal",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 401,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "408terminal",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 408,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "429terminal",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 429,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "503retry",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 503,
+        "body": "",
+        "crc": "",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "4003499538920775563",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "501retry",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 501,
+        "body": "",
+        "crc": "",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "4003499538920775563",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "599exhaustion",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 599,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "payload",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "transport-retry",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 0,
+        "body": "",
+        "crc": "",
+        "transport": true
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "4003499538920775563",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      },
+      {
+        "retry": true,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": false
+  },
+  {
+    "name": "BadRequest400terminal",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 400,
+        "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "missingCRC",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "wrongCRC",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "malformedCRC",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "invalid",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  },
+  {
+    "name": "crc-error-not-retried",
+    "method": "PUT",
+    "payload": "payload",
+    "responses": [
+      {
+        "status": 200,
+        "body": "",
+        "crc": "1",
+        "transport": false
+      },
+      {
+        "status": 200,
+        "body": "",
+        "crc": "4003499538920775563",
+        "transport": false
+      }
+    ],
+    "attempts": [
+      {
+        "retry": false,
+        "body": "payload",
+        "signed": true
+      }
+    ],
+    "exists": false,
+    "error": true
+  }
+]

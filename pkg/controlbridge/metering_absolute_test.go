@@ -282,7 +282,7 @@ func TestCompositeExplicitMeteringAck(t *testing.T) {
 	consumer, err := OpenMeteringConsumer(filepath.Join(t.TempDir(), "consumer.json"), nil)
 	require.NoError(t, err)
 	adapter := newTestAdapter(t, &recordingHandler{})
-	composite, err := NewCompositeControlHandler(adapter, mustDrainIssuer(t), consumer)
+	composite, err := NewCompositeControlHandler(adapter, consumer)
 	require.NoError(t, err)
 	sender := &recordingSender{}
 	batch := absoluteBatch(1, absoluteSnapshot(1, 1, 1, 8, 2))
@@ -303,7 +303,7 @@ func TestCompositeMeteringFailureSendsFatalInsteadOfDisconnectOnly(t *testing.T)
 	require.NoError(t, err)
 	sink.fail = true
 	adapter := newTestAdapter(t, &recordingHandler{})
-	composite, err := NewCompositeControlHandler(adapter, mustDrainIssuer(t), consumer)
+	composite, err := NewCompositeControlHandler(adapter, consumer)
 	require.NoError(t, err)
 	sender := &recordingSender{}
 
@@ -331,7 +331,7 @@ func TestCompositeMeteringAckAllocatorFailureAlsoSendsFatal(t *testing.T) {
 	consumer, err := OpenMeteringConsumer(filepath.Join(t.TempDir(), "consumer.json"), nil)
 	require.NoError(t, err)
 	adapter := newTestAdapter(t, &recordingHandler{})
-	composite, err := NewCompositeControlHandler(adapter, mustDrainIssuer(t), consumer)
+	composite, err := NewCompositeControlHandler(adapter, consumer)
 	require.NoError(t, err)
 	sender := &recordingSender{nextID: ^uint64(0)}
 

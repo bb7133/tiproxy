@@ -746,10 +746,37 @@ impl EffectiveConfig {
         &self.log.online.level
     }
 
+    /// Returns the `log.encoder` spelling (restart-required; Go selects
+    /// `json`/`console` case-sensitively and treats anything else as `tidb`).
+    #[must_use]
+    pub fn log_encoder(&self) -> &str {
+        &self.log.encoder
+    }
+
+    /// Returns `log.simple` (restart-required): the Go encoders drop the
+    /// time, level, caller and message keys.
+    #[must_use]
+    pub const fn log_simple(&self) -> bool {
+        self.log.simple
+    }
+
+    /// Returns restart-pinned metering settings without copying credentials.
+    #[must_use]
+    pub const fn metering(&self) -> &MeteringConfig {
+        &self.metering
+    }
+
     /// Returns the canonical effective work directory.
     #[must_use]
     pub fn workdir(&self) -> &str {
         &self.workdir
+    }
+
+    /// Returns the management API listen address (`api.addr`). Under
+    /// `RUST_API_OWNER` the Rust process binds it itself.
+    #[must_use]
+    pub fn api_addr(&self) -> &str {
+        &self.api.addr
     }
 
     /// Returns whether traffic replay is enabled.
@@ -876,6 +903,33 @@ impl EffectiveConfig {
         }
         normalized.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(normalized)
+    }
+
+    /// Renders the configuration as a TOML document for
+    /// `GET /api/admin/config/`: the same document shape `SetTOMLConfig`
+    /// accepts. Bytes follow this crate's encoder, not gin's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder error for an unrepresentable value.
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
+    }
+
+    /// Renders the configuration as JSON for `GET /api/admin/config/?format=json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder error for an unrepresentable value.
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// CRC32-IEEE over the Go-encoded TOML, the value Go's `ConfigManager`
+    /// reports as the config checksum. CP-ADMIN serves it from `/api/debug/health`.
+    #[must_use]
+    pub fn go_checksum(&self) -> u32 {
+        crc32fast::hash(self.encode_go_toml().as_bytes())
     }
 
     /// Encodes the exact byte representation used by Go's `BurntSushi` TOML
@@ -1736,6 +1790,38 @@ impl Default for LogFileConfig {
     }
 }
 
+impl LogOnlineConfig {
+    /// Configured log level string (`debug`, `info`, `warn`, `error`, `fatal`).
+    #[must_use]
+    pub fn level(&self) -> &str {
+        &self.level
+    }
+
+    /// Log file name; empty means the process writes to its standard stream.
+    #[must_use]
+    pub fn log_file_name(&self) -> &str {
+        &self.log_file.filename
+    }
+
+    /// `log-file.max-size` in megabytes (non-negative; zero means the default).
+    #[must_use]
+    pub fn log_file_max_size_mb(&self) -> u64 {
+        u64::try_from(self.log_file.max_size).unwrap_or(0)
+    }
+
+    /// `log-file.max-days` (non-negative; zero disables age pruning).
+    #[must_use]
+    pub fn log_file_max_days(&self) -> u64 {
+        u64::try_from(self.log_file.max_days).unwrap_or(0)
+    }
+
+    /// `log-file.max-backups` (non-negative; zero keeps every backup).
+    #[must_use]
+    pub fn log_file_max_backups(&self) -> u64 {
+        u64::try_from(self.log_file.max_backups).unwrap_or(0)
+    }
+}
+
 impl LogFileConfig {
     fn is_zero(&self) -> bool {
         self.filename.is_empty()
@@ -1841,21 +1927,33 @@ impl HaConfig {
     }
 }
 
+/// Restart-pinned metering storage configuration; debug output excludes credentials.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct MeteringConfig {
+pub struct MeteringConfig {
     #[serde(rename = "type")]
-    provider_type: String,
-    region: String,
-    bucket: String,
-    prefix: String,
-    endpoint: String,
-    aws: Option<AwsMeteringConfig>,
-    oss: Option<CloudMeteringConfig>,
-    cos: Option<CloudMeteringConfig>,
-    azure: Option<AzureMeteringConfig>,
-    localfs: Option<LocalFsMeteringConfig>,
-    shared_pool_id: String,
+    /// Provider spelling accepted by the Go SDK.
+    pub provider_type: String,
+    /// Cloud region.
+    pub region: String,
+    /// Bucket or Azure container name.
+    pub bucket: String,
+    /// Object key prefix.
+    pub prefix: String,
+    /// Optional provider service endpoint.
+    pub endpoint: String,
+    /// AWS settings.
+    pub aws: Option<AwsMeteringConfig>,
+    /// Alibaba OSS settings.
+    pub oss: Option<CloudMeteringConfig>,
+    /// Tencent COS settings.
+    pub cos: Option<CloudMeteringConfig>,
+    /// Azure settings.
+    pub azure: Option<AzureMeteringConfig>,
+    /// Local filesystem settings.
+    pub localfs: Option<LocalFsMeteringConfig>,
+    /// Shared metering pool identity.
+    pub shared_pool_id: String,
 }
 
 impl fmt::Debug for MeteringConfig {
@@ -1866,7 +1964,7 @@ impl fmt::Debug for MeteringConfig {
             .field("region", &self.region)
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
-            .field("endpoint", &self.endpoint)
+            .field("has_endpoint", &!self.endpoint.is_empty())
             .field("has_aws", &self.aws.is_some())
             .field("has_oss", &self.oss.is_some())
             .field("has_cos", &self.cos.is_some())
@@ -1893,39 +1991,58 @@ impl MeteringConfig {
     }
 }
 
+/// AWS storage credentials and addressing policy. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct AwsMeteringConfig {
-    assume_role_arn: String,
-    s3_force_path_style: bool,
-    access_key: String,
-    secret_access_key: String,
-    session_token: String,
+pub struct AwsMeteringConfig {
+    /// Optional role to assume using the base credentials.
+    pub assume_role_arn: String,
+    /// Address the bucket in the path rather than the hostname.
+    pub s3_force_path_style: bool,
+    /// Static access key identifier.
+    pub access_key: String,
+    /// Static secret access key; sensitive.
+    pub secret_access_key: String,
+    /// Optional temporary credential token; sensitive.
+    pub session_token: String,
 }
 
+/// OSS/COS credential inputs. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct CloudMeteringConfig {
-    assume_role_arn: String,
-    access_key: String,
-    secret_access_key: String,
-    session_token: String,
+pub struct CloudMeteringConfig {
+    /// Optional role to assume using the base credentials.
+    pub assume_role_arn: String,
+    /// Static access key identifier.
+    pub access_key: String,
+    /// Static secret access key; sensitive.
+    pub secret_access_key: String,
+    /// Optional temporary credential token; sensitive.
+    pub session_token: String,
 }
 
+/// Azure storage credential inputs. Never log credential fields.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct AzureMeteringConfig {
-    account_name: String,
-    account_key: String,
-    sas_token: String,
+pub struct AzureMeteringConfig {
+    /// Azure storage account name.
+    pub account_name: String,
+    /// Azure shared account key; sensitive.
+    pub account_key: String,
+    /// Azure SAS query token; sensitive.
+    pub sas_token: String,
 }
 
+/// Local filesystem storage options.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct LocalFsMeteringConfig {
-    base_path: String,
-    create_dirs: bool,
-    permissions: String,
+pub struct LocalFsMeteringConfig {
+    /// Local storage base directory.
+    pub base_path: String,
+    /// Create missing directories.
+    pub create_dirs: bool,
+    /// Octal directory and file permission spelling.
+    pub permissions: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

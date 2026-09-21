@@ -10,6 +10,7 @@ single-process Rust migration.
 - `internal/contract/`: strict validation, normalization, and first-divergence
   comparison.
 - `differential/`: CLI and synthetic comparator self-test fixtures.
+- `cpmeter/`: production Go/native Rust durable metering and state handoff evidence.
 - `cp001/`: paired CP-001 observations from the production Go config manager
   and the Rust process-local control runtime.
 - `cp003/`: production Go versus Rust etcd lease/election parity, including
@@ -23,6 +24,7 @@ Run the gates:
 make controlplane-contracts
 make controlplane-differential-self-test
 make controlplane-cp001-evidence
+make controlplane-cpmeter-evidence
 make controlplane-cp003-evidence
 make controlplane-cproute-evidence
 go test ./tests/controlplane/...

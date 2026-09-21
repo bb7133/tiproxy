@@ -106,6 +106,18 @@ jobs:
         run: make controlplane-cproute-evidence
       - name: Run CP-METRICS query and history evidence
         run: make controlplane-cpmetrics-evidence
+      - name: Check the native metrics exposition against the Go oracle
+        run: make dataplane-metrics-parity
+      - name: Check log rotation retention against the Go lumberjack writer
+        run: make controlplane-cplog-evidence
+      - name: Check the admin API and config checksum against the Go server
+        run: make controlplane-cpadmin-evidence
+      - name: Check the diagnostics gRPC service against the Go server
+        run: make controlplane-cpdiag-evidence
+      - name: Check tiproxyctl against the Go and Rust management planes
+        run: make controlplane-cpctl-evidence
+      - name: Run CP-METER durable ingestion and state handoff evidence
+        run: make controlplane-cpmeter-evidence
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests

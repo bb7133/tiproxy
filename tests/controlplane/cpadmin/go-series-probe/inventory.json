@@ -1,0 +1,271 @@
+[
+  {
+    "name": "tiproxy_backend_b_status",
+    "help": "Gauge of backend status.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_backend_backend_metric",
+    "help": "The backend metric.",
+    "labels": [
+      "backend",
+      "metric"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_backend_dial_backend_fail",
+    "help": "Counter of failing to dial backends.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_backend_get_backend",
+    "help": "Counter of getting backend.",
+    "labels": [
+      "res"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_backend_get_backend_duration_seconds",
+    "help": "Bucketed histogram of time (s) for getting an available backend.",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_backend_health_check_seconds",
+    "help": "Time (s) of each health check cycle.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_backend_keepalive_update_total",
+    "help": "Counter of health-driven backend keepalive policy updates.",
+    "labels": [
+      "backend",
+      "health",
+      "result"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_backend_ping_duration_seconds",
+    "help": "Time (s) of pinging the SQL port of each backend.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_balance_b_conn",
+    "help": "Number of backend connections.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_balance_b_score",
+    "help": "Gauge of backend scores.",
+    "labels": [
+      "backend",
+      "factor"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_balance_migrate_duration_seconds",
+    "help": "Bucketed histogram of migrating time (s) of sessions.",
+    "labels": [
+      "from",
+      "to",
+      "migrate_res"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_balance_migrate_total",
+    "help": "Number and result of session migration.",
+    "labels": [
+      "from",
+      "to",
+      "reason",
+      "migrate_res"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_balance_pending_migrate",
+    "help": "Number of pending session migration.",
+    "labels": [
+      "from",
+      "to",
+      "reason"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_monitor_keep_alive_total",
+    "help": "Counter of proxy keep alive.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_monitor_time_jump_back_total",
+    "help": "Counter of system time jumps backward.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_replay_pending_cmds",
+    "help": "Counter of pending commands.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_replay_wait_time",
+    "help": "Wait time of replaying commands.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_server_connections",
+    "help": "Number of connections.",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_server_create_connection_total",
+    "help": "Number of create connections.",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_server_disconnection_total",
+    "help": "Number of disconnections.",
+    "labels": [
+      "type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_server_err",
+    "help": "Counter of server error.",
+    "labels": [
+      "type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_server_event",
+    "help": "Counter of TiProxy event.",
+    "labels": [
+      "type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_server_maxprocs",
+    "help": "The value of GOMAXPROCS.",
+    "labels": null,
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_server_owner",
+    "help": "The TiProxy owner of each job type.",
+    "labels": [
+      "type"
+    ],
+    "rust_fed": false
+  },
+  {
+    "name": "tiproxy_server_reject_connection_total",
+    "help": "Number of rejected connections.",
+    "labels": [
+      "type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_session_conn_lifetime_seconds",
+    "help": "Bucketed histogram of connection lifetime (s).",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_session_handshake_duration_seconds",
+    "help": "Bucketed histogram of processing time (s) of handshakes.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_session_query_duration_seconds",
+    "help": "Bucketed histogram of processing time (s) of handled queries.",
+    "labels": [
+      "backend",
+      "cmd_type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_session_query_time_since_conn_creation_seconds",
+    "help": "Bucketed histogram of query start time (s) since connection creation.",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_session_query_total",
+    "help": "Counter of queries.",
+    "labels": [
+      "backend",
+      "cmd_type"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_traffic_cross_location_bytes",
+    "help": "Counter of bytes between TiProxy and cross-location backends.",
+    "labels": null,
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_traffic_inbound_bytes",
+    "help": "Counter of bytes from backends.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_traffic_inbound_packets",
+    "help": "Counter of packets from backends.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_traffic_outbound_bytes",
+    "help": "Counter of bytes to backends.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  },
+  {
+    "name": "tiproxy_traffic_outbound_packets",
+    "help": "Counter of packets to backends.",
+    "labels": [
+      "backend"
+    ],
+    "rust_fed": true
+  }
+]

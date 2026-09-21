@@ -35,7 +35,9 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::model::{EffectiveConfig, LogOnlineConfig, NamespaceConfig, ProxyOnlineConfig};
+use crate::model::{
+    ConfigError, EffectiveConfig, LogOnlineConfig, NamespaceConfig, ProxyOnlineConfig,
+};
 use crate::source::{
     CONFIG_PREFIX, CandidateValidator, ConfigNamespaceSource, ConfigNamespaceStore, LOG_CONFIG_KEY,
     NAMESPACE_CONFIG_PREFIX, PROXY_CONFIG_KEY, PreparedArtifact, StoreError,
@@ -132,6 +134,9 @@ pub enum ConfigMutationError {
     /// The module has stopped accepting mutations.
     #[error("configuration module is stopped")]
     Stopped,
+    /// The document changes a restart-required field; nothing was applied.
+    #[error("configuration mutation requires a restart")]
+    RestartRequired,
 }
 
 enum Mutation {
@@ -139,6 +144,8 @@ enum Mutation {
     Log(LogOnlineConfig),
     Namespace(NamespaceConfig),
     DeleteNamespace(String),
+    /// A partial TOML document applied to this process's file base.
+    LocalToml(Vec<u8>),
 }
 
 struct MutationRequest {
@@ -187,6 +194,38 @@ impl ConfigModuleHandle {
                 .map_err(|_| ConfigMutationError::Stopped)?;
         }
         Ok(())
+    }
+
+    /// Whether the initial persistent `/config` view has been incorporated
+    /// (always true for a file-only owner). Non-blocking counterpart of
+    /// [`Self::wait_ready`] for readiness probes.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Applies a partial TOML document to this process's file base exactly as
+    /// Go's `ConfigManager.SetTOMLConfig` does for `PUT /api/admin/config/`:
+    /// omitted fields keep their values, explicitly supplied zero values
+    /// overwrite, the complete candidate is validated, and a change to a
+    /// restart-required field rejects the whole document. The persistent
+    /// etcd overlay still applies on top. This is instance-scoped like the Go
+    /// API and works without persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigMutationError::RestartRequired`], `Invalid`, or
+    /// `Stopped`.
+    pub async fn apply_local_toml(&self, data: Vec<u8>) -> Result<(), ConfigMutationError> {
+        let (result, response) = oneshot::channel();
+        self.mutations
+            .send(MutationRequest {
+                mutation: Mutation::LocalToml(data),
+                result,
+            })
+            .await
+            .map_err(|_| ConfigMutationError::Stopped)?;
+        response.await.unwrap_or(Err(ConfigMutationError::Stopped))
     }
 
     /// Persists the dynamic proxy subset under /config/proxy.
@@ -442,6 +481,11 @@ impl ConfigModule {
                     let Some(request) = request else {
                         continue;
                     };
+                    if let Mutation::LocalToml(data) = &request.mutation {
+                        let result = self.apply_local_toml(data);
+                        let _ = request.result.send(result);
+                        continue;
+                    }
                     let result = match election.as_mut() {
                         Some(session) => persist_mutation(
                             session,
@@ -500,6 +544,30 @@ impl ConfigModule {
         self.file_revision = file_revision;
         self.external_material = external_material_fingerprint(&self.source);
         published.is_some()
+    }
+
+    /// `SetTOMLConfig` through the owner: the same merge, validation and
+    /// fail-closed restart boundary as a local file reload, with a new file
+    /// revision so a later file change re-applies on top of the accepted
+    /// document.
+    fn apply_local_toml(&mut self, data: &[u8]) -> Result<(), ConfigMutationError> {
+        let file_revision = self.file_revision.saturating_add(1);
+        match self.source.apply_toml(
+            data,
+            self.options.advertise_addr.as_deref(),
+            file_revision,
+            &self.options.current_dir,
+        ) {
+            Ok(_) => {
+                self.file_revision = file_revision;
+                self.external_material = external_material_fingerprint(&self.source);
+                Ok(())
+            }
+            Err(StoreError::Config(ConfigError::RestartRequired { .. })) => {
+                Err(ConfigMutationError::RestartRequired)
+            }
+            Err(_) => Err(ConfigMutationError::Invalid),
+        }
     }
 
     fn reload_external_material(&mut self) -> bool {
@@ -568,7 +636,7 @@ impl ConfigModule {
         }
         let decoded = decode_persistent_entries(entries).map_err(|error| {
             if let Some(log) = persistent_candidate_rejection_log(revision, &error) {
-                eprintln!("{log}");
+                control_plane::logging::emit(control_plane::logging::Level::Warn, &log);
             }
             module_error("persistent_candidate_decode_rejected")
         })?;
@@ -947,6 +1015,8 @@ async fn persist_mutation(
                 .apply_committed_namespace_mutation(value, result.revision(), current_dir)
                 .map_err(|_| ConfigMutationError::Invalid)
         }
+        // Handled by the owner loop before any persistence; never reaches here.
+        Mutation::LocalToml(_) => Err(ConfigMutationError::Invalid),
         Mutation::DeleteNamespace(name) => {
             if name.is_empty() || name.as_bytes().contains(&0) {
                 return Err(ConfigMutationError::Invalid);

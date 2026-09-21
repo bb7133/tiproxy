@@ -390,8 +390,11 @@ def validate_row_specific(
             text = require_text(run / name, '"event":"connection_closed"')
             connection_ids = []
             for line in text.splitlines():
+                # Rust log lines carry the Go `[ts] [LEVEL] ` header (or the
+                # zap object shape) in front of / around the JSON body.
+                body = line[line.find("{"):] if "{" in line else ""
                 try:
-                    event = json.loads(line)
+                    event = json.loads(body)
                 except json.JSONDecodeError:
                     continue
                 if event.get("event") == "connection_closed":

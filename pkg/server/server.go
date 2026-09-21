@@ -183,7 +183,8 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 		srv.replay = mgrrp.NewJobManager(lg.Named("replay"), srv.configManager.GetConfig(), srv.certManager, idMgr, hsHandler, false)
 	}
 
-	{
+	// Rust owns metering state and exports when its dataplane is selected.
+	if !cfg.RustDataplane.Enabled {
 		srv.meter, err = meter.NewMeter(cfg, lg.Named("meter"))
 		if err != nil {
 			return
@@ -219,9 +220,15 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 	}
 	if srv.controlBridge != nil {
 		mgrs.DataplaneStatus = srv.controlBridge
-		mgrs.DataplaneDrainer = srv.controlBridge
+		// DataplaneDrainer stays nil: operator drains are issued through the
+		// Rust admin API (CP-ADMIN slice 3), so `/api/dataplane/drain` answers
+		// 404 {"enabled": false} here.
 	}
-	if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
+	// CP-ADMIN slice 5c: with the Rust dataplane the management API (`api.addr`)
+	// is served by the Rust process; this process starts no API server.
+	if cfg.RustDataplane.Enabled {
+		lg.Info("management API is owned by the Rust dataplane; no Go API server", zap.String("addr", cfg.API.Addr))
+	} else if srv.apiServer, err = api.NewServer(cfg.API, lg.Named("api"), mgrs, handler, ready); err != nil {
 		return
 	}
 

@@ -35,6 +35,27 @@ pub use ledger::{
 };
 pub use namespace::{ResolvedNamespace, RouteCandidateValidator, UserNamespaceResolver};
 pub use plane::{RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle};
+
+/// Outcome of one management redirect sweep (Go `RedirectConnections`):
+/// counts only, no authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedirectAllSummary {
+    /// Active sessions at the sweep.
+    pub active: u64,
+    /// Sessions offered a self-redirect (active minus those already pending).
+    pub offered: u64,
+    /// Offers the migration queue accepted.
+    pub accepted: u64,
+}
+
+impl RedirectAllSummary {
+    /// Sums another router's sweep into this one.
+    pub fn add(&mut self, other: Self) {
+        self.active += other.active;
+        self.offered += other.offered;
+        self.accepted += other.accepted;
+    }
+}
 pub use retry::Selector;
 pub use selector::Router;
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};

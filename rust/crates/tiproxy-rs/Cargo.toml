@@ -12,10 +12,12 @@ build = "build.rs"
 default = []
 
 [dependencies]
+control-admin.workspace = true
 control-config.workspace = true
 control-etcd.workspace = true
 control-external.workspace = true
 control-plane.workspace = true
+control-meter.workspace = true
 control-proto.workspace = true
 control-router.workspace = true
 control-topology.workspace = true

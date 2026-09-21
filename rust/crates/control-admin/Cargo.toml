@@ -1,0 +1,40 @@
+[package]
+name = "control-admin"
+description = "Rust management-plane HTTP server for TiProxy (CP-ADMIN)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+control-config.workspace = true
+control-external.workspace = true
+control-plane.workspace = true
+flate2.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+regex.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "param", "pipe", "process", "system"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tonic.workspace = true
+tower.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+rustls-pki-types.workspace = true
+tonic-prost.workspace = true
+
+[lints]
+workspace = true

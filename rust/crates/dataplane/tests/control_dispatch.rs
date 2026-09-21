@@ -30,15 +30,15 @@ use std::time::Duration;
 use control_proto::control_transport::{ConnectionState, Handler, SessionMeta, TransportError};
 use control_proto::v1::control_envelope::Body;
 use control_proto::v1::{
-    CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand, ErrorCode,
-    ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot, ProtocolError,
-    ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
+    CloseCommand, ConnectionIdentity, ControlCapability, ControlEnvelope, DrainCommand,
+    DrainResult, ErrorCode, ErrorSource, MeteringAck, MeteringDelta, MeteringSourceSnapshot,
+    ProtocolError, ReconcileConnection, ReconcileSnapshot, RedirectCommand, RouteAssignment,
 };
 use dataplane::MeteringLedger;
 use dataplane::control_dispatch::{
     CommandKind, CommandToken, ControlCommandHandler, DispatchFatal, DispatchNotice,
-    DispatchSender, InboundForwarder, ResponseKind, SessionDirective, TaggedEnvelope,
-    run_control_dispatch,
+    DispatchSender, InboundForwarder, LocalDrainOutcome, LocalDrainRequest, ResponseKind,
+    SessionDirective, TaggedEnvelope, run_control_dispatch,
 };
 use dataplane::session::SessionControl;
 use tokio::sync::{Notify, mpsc, watch};
@@ -215,11 +215,14 @@ async fn close_dispatch_end_to_end() {
     assert!(handler.close_completed(1, "c-1").is_none());
 }
 
-/// Drain dispatch: matched sessions get graceful closes at admission,
-/// per-id accounting flows through `session_closed`, the force deadline
-/// closes the remainder via `tick`, and the **completion transition
-/// itself** produces the terminal `DrainResult` proactively with the
-/// initiating request id — no command replay required.
+/// Drain dispatch (legacy composition; under `RUST_ROUTE_OWNER` the wire
+/// bodies are retired tombstones and operator drains are local, see
+/// `route_owner_rejects_retired_drain_bodies_without_effect`): matched
+/// sessions get graceful closes at admission, per-id accounting flows
+/// through `session_closed`, the force deadline closes the remainder via
+/// `tick`, and the **completion transition itself** produces the terminal
+/// `DrainResult` proactively with the initiating request id — no command
+/// replay required.
 #[tokio::test(start_paused = true)]
 async fn drain_dispatch_runs_graceful_then_force() {
     let mut handler = ControlCommandHandler::new();
@@ -4432,4 +4435,687 @@ async fn state_arm_reconcile_does_not_inherit_a_generation() {
         "B's reconcile does not inherit A's applied generation"
     );
     harness.task.abort();
+}
+
+fn local_request(
+    caller: &str,
+    listeners: &[&str],
+    wait_ms: u64,
+    force_ms: u64,
+) -> LocalDrainRequest {
+    LocalDrainRequest {
+        caller_id: caller.to_owned(),
+        listener_names: listeners.iter().map(|name| (*name).to_owned()).collect(),
+        backend_ids: Vec::new(),
+        graceful_wait: Duration::from_millis(wait_ms),
+        force_timeout: Duration::from_millis(force_ms),
+    }
+}
+
+/// CP-ADMIN slice 3: a locally issued drain runs the same graceful → force
+/// lifecycle as a bridge drain, reports progress and the terminal through
+/// the local status query, and a replay of the same label is idempotent.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)]
+async fn local_drain_runs_graceful_then_force_and_replays_idempotently() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let mut b = register(&mut handler, 2, "sql-a", "tidb-a");
+    let mut other = register(&mut handler, 3, "sql-b", "tidb-a");
+    let now = Instant::now();
+    let now_ms: u64 = 1_000_000;
+
+    let (outcome, outbound) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        now,
+        now_ms,
+    );
+    assert!(
+        outbound.is_empty(),
+        "graceful start sends nothing to the wire"
+    );
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = outcome
+    else {
+        unreachable!("first local drain is accepted: {outcome:?}")
+    };
+    assert!(wire_id.starts_with("op-1@"), "{wire_id}");
+    assert_eq!(
+        command_sequence, 1,
+        "first sequence above the empty watermark"
+    );
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert!(other.control.try_recv().is_err(), "out of scope untouched");
+    let status = handler
+        .local_drain_status("op-1")
+        .unwrap_or_else(|| unreachable!());
+    assert!(!status.complete);
+    assert_eq!(status.result.active_connections, 2);
+    assert_eq!(status.result.drain_id, wire_id);
+    assert!(handler.local_drain_status("nobody").is_none());
+
+    // Replaying the same label re-uses the binding and closes nothing twice.
+    let mut c = register(&mut handler, 4, "sql-a", "tidb-a");
+    let (replay, _) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        now,
+        now_ms,
+    );
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id: wire_id.clone(),
+            command_sequence: 1
+        }
+    );
+    assert!(a.control.try_recv().is_err(), "no second GracefulClose");
+    assert!(
+        c.control.try_recv().is_err(),
+        "a later session is not selected by the replay"
+    );
+
+    // A different label while this drain runs is a local conflict.
+    let (conflict, _) =
+        handler.start_local_drain(&local_request("op-2", &[], 1_000, 1_000), now, now_ms);
+    assert_eq!(
+        conflict,
+        LocalDrainOutcome::DrainInProgress {
+            active: wire_id.clone()
+        }
+    );
+    assert!(
+        handler.local_drain_status("op-2").is_none(),
+        "a conflict binds nothing"
+    );
+
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let force_by = now + Duration::from_secs(20);
+    let _ = handler.tick(force_by + Duration::from_millis(1));
+    assert_eq!(
+        b.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::CloseImmediate)
+    );
+    let closed = handler.session_closed(
+        2,
+        true,
+        ErrorSource::Proxy,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    assert_eq!(
+        closed.len(),
+        1,
+        "a local drain has no wire requester: only the CLOSED event goes out"
+    );
+    let status = handler
+        .local_drain_status("op-1")
+        .unwrap_or_else(|| unreachable!());
+    assert!(status.complete);
+    assert_eq!(status.result.gracefully_closed, 1);
+    assert_eq!(status.result.force_closed, 1);
+
+    // After completion the label still replays its terminal, and a new
+    // label may start (sequence 2 above the shared watermark).
+    let (replay, _) = handler.start_local_drain(
+        &local_request("op-1", &["sql-a"], 10_000, 10_000),
+        force_by,
+        now_ms + 20_002,
+    );
+    assert!(matches!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            command_sequence: 1,
+            ..
+        }
+    ));
+    assert!(
+        handler
+            .local_drain_status("op-1")
+            .is_some_and(|s| s.complete)
+    );
+    let (next, _) = handler.start_local_drain(
+        &local_request("op-2", &["no-such-listener"], 0, 0),
+        force_by,
+        now_ms + 20_003,
+    );
+    assert!(
+        matches!(
+            next,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 2,
+                ..
+            }
+        ),
+        "{next:?}"
+    );
+    assert!(
+        handler
+            .local_drain_status("op-2")
+            .is_some_and(|s| s.complete && s.result.active_connections == 0)
+    );
+}
+
+/// Without an applied generation the drain is refused before any effect
+/// (Go `ErrSnapshotNotReady`).
+#[tokio::test(start_paused = true)]
+async fn local_drain_requires_an_applied_generation() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let (outcome, _) =
+        handler.start_local_drain(&local_request("op-1", &[], 0, 0), Instant::now(), 1_000_000);
+    assert_eq!(outcome, LocalDrainOutcome::SnapshotNotReady);
+    assert!(session.control.try_recv().is_err());
+    assert!(handler.local_drain_status("op-1").is_none());
+}
+
+/// Bridge and local drains share one sequence lineage through the gate
+/// watermark: a local drain takes the next sequence after a bridge drain,
+/// a bridge command at or below that watermark is obsolete, and a bridge
+/// drain still running is a foreign conflict for the local issuer.
+#[tokio::test(start_paused = true)]
+async fn local_and_bridge_drains_share_the_gate_lineage() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let now_ms: u64 = 1_000_000;
+
+    // Bridge drain sequence 1 on sql-a is active.
+    let bridge = DrainCommand {
+        drain_id: "go@inc-1".to_owned(),
+        listener_names: vec!["sql-a".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 1,
+    };
+    let _ = handler.handle_envelope(&envelope(30, 7, Body::DrainCommand(bridge)), now, now_ms);
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    let (foreign, _) = handler.start_local_drain(&local_request("op-1", &[], 0, 0), now, now_ms);
+    assert_eq!(
+        foreign,
+        LocalDrainOutcome::ForeignDrainActive {
+            active: "go@inc-1".to_owned()
+        }
+    );
+
+    // The bridge drain completes; the local issuer takes sequence 2.
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let (local, _) = handler.start_local_drain(
+        &local_request("op-1", &["no-such-listener"], 0, 0),
+        now,
+        now_ms + 1,
+    );
+    assert!(
+        matches!(
+            local,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 2,
+                ..
+            }
+        ),
+        "{local:?}"
+    );
+
+    // A bridge command at the consumed sequence is obsolete; the next one
+    // above the watermark is admitted.
+    let stale = DrainCommand {
+        drain_id: "go@inc-1-b".to_owned(),
+        listener_names: vec!["none".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 2,
+    };
+    let out = handler.handle_envelope(&envelope(31, 7, Body::DrainCommand(stale)), now, now_ms + 2);
+    let Some(Body::DrainResult(answer)) = &out[0].body else {
+        unreachable!("obsolete answers a result")
+    };
+    assert_eq!(answer.code(), ErrorCode::DuplicateRequest);
+    let fresh = DrainCommand {
+        drain_id: "go@inc-1-c".to_owned(),
+        listener_names: vec!["none".to_owned()],
+        backend_ids: Vec::new(),
+        graceful_deadline_unix_millis: now_ms + 10_000,
+        force_deadline_unix_millis: now_ms + 20_000,
+        command_sequence: 3,
+    };
+    let out = handler.handle_envelope(&envelope(32, 7, Body::DrainCommand(fresh)), now, now_ms + 3);
+    let Some(Body::DrainResult(answer)) = &out[0].body else {
+        unreachable!("fresh sequence is admitted")
+    };
+    assert_eq!(answer.code(), ErrorCode::Ok);
+}
+
+/// A restarted process (new handler, new incarnation) issues the same
+/// operator label under a new wire id, so a label is never confused with a
+/// previous incarnation's tombstone.
+#[tokio::test(start_paused = true)]
+async fn restarted_issuer_uses_a_new_wire_id_for_the_same_label() {
+    let mut first = ControlCommandHandler::new();
+    first.on_session_negotiated(true);
+    first.set_applied_generation(7, None);
+    let (one, _) = first.start_local_drain(
+        &local_request("op-1", &["none"], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    let mut second = ControlCommandHandler::new();
+    second.on_session_negotiated(true);
+    second.set_applied_generation(7, None);
+    let (two, _) = second.start_local_drain(
+        &local_request("op-1", &["none"], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    let (
+        LocalDrainOutcome::Accepted { wire_id: a, .. },
+        LocalDrainOutcome::Accepted { wire_id: b, .. },
+    ) = (one, two)
+    else {
+        unreachable!("both accepted")
+    };
+    assert_ne!(a, b);
+    assert!(a.starts_with("op-1@") && b.starts_with("op-1@"));
+}
+
+/// Go `NewDrainIssuer` refuses to start when the incarnation nonce cannot
+/// be read, because a weaker nonce could alias two incarnations' wire ids.
+/// The Rust issuer keeps that fail-closed: with a failing entropy source the
+/// readiness check reports the failure for the owner to refuse startup, and
+/// even a handler kept alive refuses every local drain without binding a
+/// label or touching the gate, while status queries see nothing.
+#[tokio::test(start_paused = true)]
+async fn review_local_drain_issuer_refuses_without_boot_entropy() {
+    let mut handler = ControlCommandHandler::new()
+        .with_local_drain_entropy(|_| Err(std::io::Error::other("entropy source unavailable")));
+    let Err(reason) = handler.local_drain_issuer_ready() else {
+        unreachable!("a failed entropy read must not produce an issuer")
+    };
+    assert_eq!(
+        reason,
+        "drain issuer incarnation nonce: entropy source unavailable"
+    );
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let (outcome, outbound) =
+        handler.start_local_drain(&local_request("op-1", &[], 0, 0), Instant::now(), 1_000_000);
+    assert_eq!(
+        outcome,
+        LocalDrainOutcome::Rejected {
+            code: ErrorCode::Internal,
+            detail: "local drain issuer unavailable: boot entropy failed",
+        }
+    );
+    assert!(outbound.is_empty());
+    assert!(session.control.try_recv().is_err());
+    assert!(handler.local_drain_status("op-1").is_none());
+
+    let healthy = ControlCommandHandler::new().with_local_drain_entropy(|nonce| {
+        nonce.fill(0xab);
+        Ok(())
+    });
+    assert_eq!(healthy.local_drain_issuer_ready(), Ok(()));
+    assert_eq!(
+        ControlCommandHandler::new().local_drain_issuer_ready(),
+        Ok(())
+    );
+}
+
+/// The dispatch task answers local drain notices in order with every
+/// other notice, so the HTTP layer sees a consistent view.
+#[tokio::test(start_paused = true)]
+async fn dispatch_task_serves_local_drain_notices() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let harness = spawn_loop(handler);
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    assert!(
+        harness
+            .notice_tx
+            .send(DispatchNotice::LocalDrain {
+                request: local_request("op-9", &["none"], 0, 0),
+                reply,
+            })
+            .await
+            .is_ok()
+    );
+    let outcome = outcome
+        .await
+        .unwrap_or_else(|_| unreachable!("dispatch alive"));
+    assert!(
+        matches!(
+            outcome,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 1,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    for (label, known) in [("op-9", true), ("unknown", false)] {
+        let (reply, status) = tokio::sync::oneshot::channel();
+        assert!(
+            harness
+                .notice_tx
+                .send(DispatchNotice::LocalDrainStatus {
+                    caller_id: label.to_owned(),
+                    reply,
+                })
+                .await
+                .is_ok()
+        );
+        let status = status
+            .await
+            .unwrap_or_else(|_| unreachable!("dispatch alive"));
+        assert_eq!(status.is_some(), known, "{label}");
+        if let Some(status) = status {
+            assert!(status.complete && status.result.active_connections == 0);
+        }
+    }
+    harness.task.abort();
+}
+
+/// Review reproduction: Go `DrainIssuer` keeps `operation.latest/completed`
+/// for the incarnation's lifetime and a terminal is never overwritten by a
+/// replay. The local issuer must not depend on the gate's bounded
+/// tombstone ring: after `MAX_COMPLETED_DRAINS` later drains complete, the
+/// first label's status still answers its original terminal, and a repeated
+/// POST returns the original binding without relabeling the terminal as a
+/// synthetic `DUPLICATE_REQUEST`. Immediate completion (empty drain) path.
+#[tokio::test(start_paused = true)]
+async fn review_local_terminal_survives_gate_tombstone_eviction() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7, None);
+    let now = Instant::now();
+    let (first, _) = handler.start_local_drain(&local_request("first", &[], 0, 0), now, 1_000_000);
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = first
+    else {
+        unreachable!("first is accepted: {first:?}")
+    };
+    let original = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!());
+    assert!(original.complete);
+    assert_eq!(original.result.code(), ErrorCode::Ok);
+    for n in 0..dataplane::control_commands::MAX_COMPLETED_DRAINS {
+        let (outcome, _) = handler.start_local_drain(
+            &local_request(&format!("next-{n}"), &[], 0, 0),
+            now,
+            1_000_000,
+        );
+        assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    }
+    let retained = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!("gate eviction must not turn GET into 404"));
+    assert_eq!(retained, original);
+    let (replay, outbound) =
+        handler.start_local_drain(&local_request("first", &[], 0, 0), now, 1_000_000);
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id,
+            command_sequence,
+        }
+    );
+    assert!(outbound.is_empty());
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!()),
+        original,
+        "a replay never relabels the terminal"
+    );
+}
+
+/// Same retention through the `session_closed` completion path: the
+/// terminal produced when the last matched session closes is kept by the
+/// issuer, survives tombstone eviction, and is not overwritten by a replay.
+#[tokio::test(start_paused = true)]
+async fn review_local_terminal_from_session_close_survives_eviction() {
+    let mut handler = ControlCommandHandler::new();
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut a = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let (first, _) = handler.start_local_drain(
+        &local_request("first", &["sql-a"], 10_000, 10_000),
+        now,
+        1_000_000,
+    );
+    let LocalDrainOutcome::Accepted {
+        wire_id,
+        command_sequence,
+    } = first
+    else {
+        unreachable!("first is accepted: {first:?}")
+    };
+    assert_eq!(
+        a.control.try_recv().map(|d| d.control),
+        Ok(SessionControl::GracefulClose)
+    );
+    assert!(
+        !handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!())
+            .complete
+    );
+    let _ = handler.session_closed(
+        1,
+        false,
+        ErrorSource::ClientNetwork,
+        dataplane::route_control::TrafficTotals::default(),
+    );
+    let original = handler
+        .local_drain_status("first")
+        .unwrap_or_else(|| unreachable!());
+    assert!(original.complete);
+    assert_eq!(original.result.gracefully_closed, 1);
+    assert_eq!(original.result.active_connections, 1);
+    for n in 0..dataplane::control_commands::MAX_COMPLETED_DRAINS {
+        let (outcome, _) = handler.start_local_drain(
+            &local_request(&format!("next-{n}"), &[], 0, 0),
+            now,
+            1_000_001,
+        );
+        assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    }
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!("gate eviction must not turn GET into 404")),
+        original
+    );
+    let (replay, _) = handler.start_local_drain(
+        &local_request("first", &["sql-a"], 10_000, 10_000),
+        now,
+        1_000_002,
+    );
+    assert_eq!(
+        replay,
+        LocalDrainOutcome::Accepted {
+            wire_id,
+            command_sequence,
+        }
+    );
+    assert_eq!(
+        handler
+            .local_drain_status("first")
+            .unwrap_or_else(|| unreachable!()),
+        original,
+        "a replay never relabels the terminal"
+    );
+}
+
+/// Review reproduction: a 0/0 local drain whose matched session already lost
+/// its control receiver completes inline, inside the admission's own force
+/// phase, before the caller record exists. The terminal must still be
+/// classified as local (no `DrainResult` on the wire; the CLOSED lifecycle
+/// event is still owed) and must reach the label's retained status.
+#[tokio::test(start_paused = true)]
+async fn review_local_immediate_drain_of_gone_session_emits_no_wire_terminal() {
+    let mut handler = ControlCommandHandler::new();
+    handler.set_applied_generation(7, None);
+    let session = register(&mut handler, 1, "sql-a", "tidb-a");
+    drop(session);
+    let (outcome, outbound) = handler.start_local_drain(
+        &local_request("local-gone", &[], 0, 0),
+        Instant::now(),
+        1_000_000,
+    );
+    assert!(matches!(outcome, LocalDrainOutcome::Accepted { .. }));
+    assert!(
+        !outbound
+            .iter()
+            .any(|e| matches!(e.body, Some(Body::DrainResult(_)))),
+        "a local operation has no bridge issuer; even an inline terminal stays local"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|e| matches!(e.body, Some(Body::ConnectionEvent(_)))),
+        "the CLOSED lifecycle event is still owed to the wire"
+    );
+    assert!(
+        handler
+            .local_drain_status("local-gone")
+            .is_some_and(|s| s.complete && s.result.force_closed == 1)
+    );
+}
+
+/// CP-ADMIN slice 3b: operator drains are issued inside the Rust process,
+/// so under `RUST_ROUTE_OWNER` both drain bodies are retired tombstones.
+/// Each is answered with a nonfatal `PROTOCOL_VIOLATION`, counted on the one
+/// legacy-violation counter, and has no effect: no session directive, no
+/// gate watermark movement, and the local issuer still takes sequence 1.
+#[tokio::test(start_paused = true)]
+async fn route_owner_rejects_retired_drain_bodies_without_effect() {
+    let mut handler = ControlCommandHandler::with_metering_route_owner(MeteringLedger::new());
+    handler.on_session_negotiated(true);
+    handler.set_applied_generation(7, None);
+    let mut session = register(&mut handler, 1, "sql-a", "tidb-a");
+    let now = Instant::now();
+    let before = handler.legacy_route_violations();
+    let bodies = vec![
+        Body::DrainCommand(DrainCommand {
+            drain_id: "go@retired".to_owned(),
+            listener_names: vec!["sql-a".to_owned()],
+            backend_ids: Vec::new(),
+            graceful_deadline_unix_millis: 1_010_000,
+            force_deadline_unix_millis: 1_020_000,
+            command_sequence: 1,
+        }),
+        Body::DrainResult(DrainResult {
+            drain_id: "go@retired".to_owned(),
+            active_connections: 0,
+            gracefully_closed: 0,
+            force_closed: 0,
+            complete: true,
+            code: ErrorCode::Ok.into(),
+            detail: String::new(),
+        }),
+    ];
+    for (index, body) in bodies.into_iter().enumerate() {
+        let request_id = 60 + index as u64;
+        let out = handler.handle_envelope(&envelope(request_id, 7, body), now, 1_000_000);
+        assert_eq!(out.len(), 1, "one inline answer per retired body");
+        assert_eq!(out[0].request_id, request_id);
+        assert_eq!(error_code(&out[0]), Some(ErrorCode::ProtocolViolation));
+        assert!(session.control.try_recv().is_err(), "no retired body acts");
+    }
+    assert_eq!(handler.legacy_route_violations(), before + 2);
+    let (local, _) = handler.start_local_drain(
+        &local_request("op-1", &["no-such-listener"], 0, 0),
+        now,
+        1_000_001,
+    );
+    assert!(
+        matches!(
+            local,
+            LocalDrainOutcome::Accepted {
+                command_sequence: 1,
+                ..
+            }
+        ),
+        "a retired drain command never consumed a sequence: {local:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_meter_owner_rejects_bridge_intake_and_ignores_retired_acks() {
+    let mut handler = ControlCommandHandler::native_meter_owner();
+    assert!(matches!(
+        handler.record_metering(MeteringDelta::default()),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(
+        handler.record_metering_snapshots(Vec::new()),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(
+        handler.acknowledge_metering("producer", 99),
+        Err(dataplane::MeteringError::NativeOwner)
+    ));
+    assert!(matches!(handler.seal_metering(), Ok(None)));
+    let harness = spawn_loop(handler);
+    connect_go_fixture(&harness, 1);
+    for body in [
+        Body::MeteringAck(MeteringAck {
+            producer_id: "native-producer".into(),
+            sequence: 99,
+        }),
+        Body::MeteringBatch(control_proto::v1::MeteringBatch::default()),
+    ] {
+        assert!(
+            harness
+                .inbound_tx
+                .send(tagged_on(envelope(901, 0, body), 1, 1))
+                .await
+                .is_ok()
+        );
+    }
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        while harness.stats.unrouted.load(Ordering::Relaxed) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(observed.is_ok(), "both retired wire bodies were consumed");
+    assert!(harness.sender.sent().iter().all(|frame| !matches!(
+        frame.body,
+        Some(Body::MeteringBatch(_) | Body::MeteringAck(_))
+    )));
+    harness.task.abort();
+    let _ = harness.task.await;
 }

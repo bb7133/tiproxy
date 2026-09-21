@@ -60,10 +60,11 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_proto::control_transport::{
     ConnectionState, ControlClient, Handler, SessionMeta, TransportError,
@@ -98,8 +99,15 @@ pub struct DispatchStats {
     pub send_failures: AtomicU64,
     /// Fail-closed metering rejections (record and seal).
     pub metering_failures: AtomicU64,
-    /// Retired route-family bodies rejected under `RUST_ROUTE_OWNER`.
+    /// Retired v1 tombstone bodies rejected under `RUST_ROUTE_OWNER`: the
+    /// route family retired at cutover and, since CP-ADMIN slice 3, both
+    /// drain bodies (`drain_command`/`drain_result`). One counter, one
+    /// meaning: "a peer sent a body this owner no longer acts on".
     pub legacy_route_violations: AtomicU64,
+    /// Highest drain command sequence the gate has consumed (bridge or
+    /// local issuer alike): the value the next reconcile reports as
+    /// `last_drain_command_sequence`, exposed for readiness diagnostics.
+    pub drain_watermark: AtomicU64,
 }
 
 /// Longest accepted distance between "now" and a wire drain deadline:
@@ -254,6 +262,137 @@ enum ForwardOutcome {
     Gone,
 }
 
+/// Operator drain issued locally by CP-ADMIN, before any wire encoding.
+/// The budget is relative: the dispatcher mints absolute deadlines from its
+/// own clock exactly as the Go bridge did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalDrainRequest {
+    /// Operator-chosen label; the wire id is `<caller_id>@<incarnation>`.
+    pub caller_id: String,
+    /// Listener scope; empty matches every listener.
+    pub listener_names: Vec<String>,
+    /// Backend scope; empty matches every backend.
+    pub backend_ids: Vec<String>,
+    /// Safe-point close window.
+    pub graceful_wait: Duration,
+    /// Force-close window after the graceful deadline.
+    pub force_timeout: Duration,
+}
+
+/// Outcome of a local drain issuance, mirroring the Go bridge's error
+/// classes so the HTTP layer keeps its status mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalDrainOutcome {
+    /// Issued now, or the same operator label re-issued idempotently.
+    Accepted {
+        /// Incarnation-qualified wire id bound to the label.
+        wire_id: String,
+        /// Sequence bound to the label for this incarnation.
+        command_sequence: u64,
+    },
+    /// No applied configuration generation exists yet (Go
+    /// `ErrSnapshotNotReady`).
+    SnapshotNotReady,
+    /// A different local drain is still running (Go `ErrDrainInProgress`).
+    DrainInProgress {
+        /// Wire id of the running drain.
+        active: String,
+    },
+    /// A drain from another issuer (the bridge, or a previous incarnation)
+    /// is still running (Go `ErrForeignDrainActive`).
+    ForeignDrainActive {
+        /// Wire id of the running drain.
+        active: String,
+    },
+    /// The gate refused the command; the class is a protocol error.
+    Rejected {
+        /// Error class.
+        code: ErrorCode,
+        /// Bounded detail.
+        detail: &'static str,
+    },
+}
+
+/// Latest observed progress or terminal for one local drain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalDrainStatus {
+    /// Progress/terminal counters; `drain_id` is the wire id.
+    pub result: DrainResult,
+    /// Whether `result` is the terminal.
+    pub complete: bool,
+}
+
+/// Verdict of the shared drain admission core, before the caller decides
+/// between wire envelopes and a local outcome.
+enum DrainVerdict {
+    Malformed,
+    Stale,
+    SequenceMismatch,
+    Result(DrainResult),
+}
+
+/// Local counterpart of the Go `DrainIssuer`: one boot nonce qualifies
+/// every wire id, each operator label is bound once to a wire id and a
+/// sequence taken from the gate's own watermark, and the binding survives
+/// completion so a replay answers the retained terminal.
+struct LocalDrainIssuer {
+    incarnation: String,
+    callers: HashMap<String, LocalDrainRecord>,
+}
+
+struct LocalDrainRecord {
+    wire_id: String,
+    command_sequence: u64,
+    /// Latest observed result for this label (Go `operation.latest`): the
+    /// gate's admission answer, progress from a re-issuance, or the
+    /// terminal. Retained for the incarnation's lifetime, so a status query
+    /// never depends on the gate's bounded tombstone ring.
+    latest: Option<DrainResult>,
+    /// Whether `latest` is the terminal (Go `operation.completed`). A
+    /// terminal is absolute: nothing observed later overwrites it.
+    completed: bool,
+}
+
+impl LocalDrainRecord {
+    fn observe(&mut self, result: DrainResult) {
+        if self.completed {
+            return;
+        }
+        self.completed = result.complete;
+        self.latest = Some(result);
+    }
+}
+
+impl LocalDrainIssuer {
+    /// Mirrors Go `NewDrainIssuer`: the incarnation nonce is the safety
+    /// anchor for drain wire ids, so a failed entropy read refuses the
+    /// issuer instead of degrading to a guessable or collision-prone nonce
+    /// that could alias two incarnations.
+    fn new() -> Result<Self, String> {
+        Self::from_entropy(|nonce| {
+            getrandom::getrandom(nonce).map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    }
+
+    fn from_entropy(fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>) -> Result<Self, String> {
+        let mut nonce = [0_u8; 16];
+        fill(&mut nonce).map_err(|error| format!("drain issuer incarnation nonce: {error}"))?;
+        let incarnation = nonce
+            .iter()
+            .fold(String::with_capacity(32), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            });
+        Ok(Self {
+            incarnation,
+            callers: HashMap::new(),
+        })
+    }
+}
+
+/// Bounded refusal detail when the local drain issuer never came up.
+const LOCAL_DRAIN_ISSUER_UNAVAILABLE: &str = "local drain issuer unavailable: boot entropy failed";
+
 /// The long-lived production owner of the command gate, metering
 /// ledger, session channels, and initiating-request-id records.
 /// Single-owner: lives on the dispatch task, no lock. Survives control
@@ -262,9 +401,19 @@ enum ForwardOutcome {
 /// lost result needs cross-epoch replay.
 pub struct ControlCommandHandler {
     gate: CommandGate,
+    /// Locally issued drains (CP-ADMIN), sharing the gate lineage. `Err`
+    /// retains the boot entropy failure: every local drain is refused and
+    /// the production owner refuses to start (Go `NewDrainIssuer`).
+    local_drains: Result<LocalDrainIssuer, String>,
+    /// Wire id of the local drain currently inside admission. The admission's
+    /// own force phase can close a gone session and finish the drain inline,
+    /// before the caller record exists; this marks that terminal as local so
+    /// it is never pushed to the wire as a bridge result.
+    admitting_local: Option<String>,
     /// The production cutover composition. This is process-fixed: bridge
     /// reconnects cannot demote routing back to Go.
     route_owner: bool,
+    native_meter_owner: bool,
     /// The active control session's atomic `(epoch, capability mask)`
     /// snapshot — `None` whenever the last observed transport state is
     /// not `Connected` (watch coalescing can collapse
@@ -331,6 +480,7 @@ impl ControlCommandHandler {
         Self {
             gate: CommandGate::new(),
             route_owner: false,
+            native_meter_owner: false,
             active_session: None,
             active_lineage: None,
             reconcile_capable: true,
@@ -342,7 +492,32 @@ impl ControlCommandHandler {
             initiating_close: HashMap::new(),
             initiating_drain: HashMap::new(),
             stats: Arc::new(DispatchStats::default()),
+            local_drains: LocalDrainIssuer::new(),
+            admitting_local: None,
         }
+    }
+
+    /// Whether the local drain issuer came up. Go `NewDrainIssuer` fails
+    /// the bridge when its incarnation nonce cannot be read; the production
+    /// owner checks this before serving and refuses to start on `Err`, so a
+    /// process never runs with a guessable or aliasing drain lineage.
+    ///
+    /// # Errors
+    ///
+    /// The bounded boot entropy failure.
+    pub fn local_drain_issuer_ready(&self) -> Result<(), String> {
+        self.local_drains.as_ref().map(|_| ()).map_err(Clone::clone)
+    }
+
+    /// Rebuilds the local drain issuer from the given entropy source
+    /// (tests inject a failing source to verify the fail-closed path).
+    #[must_use]
+    pub fn with_local_drain_entropy(
+        mut self,
+        fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+    ) -> Self {
+        self.local_drains = LocalDrainIssuer::from_entropy(fill);
+        self
     }
 
     /// Creates the production post-cutover handler. The owner decision is
@@ -352,6 +527,15 @@ impl ControlCommandHandler {
         let mut handler = Self::with_metering(metering);
         handler.route_owner = true;
         handler.reconcile_capable = false;
+        handler
+    }
+
+    /// Production composition with metering entirely in the native process.
+    /// The bridge holds no persistent ledger and cannot acknowledge its WAL.
+    #[must_use]
+    pub fn native_meter_owner() -> Self {
+        let mut handler = Self::with_metering_route_owner(MeteringLedger::new());
+        handler.native_meter_owner = true;
         handler
     }
 
@@ -462,6 +646,9 @@ impl ControlCommandHandler {
     /// single dispatch task and enqueues the entire replay before it can
     /// process a later seal notice, so new batches cannot overtake the replay.
     fn begin_metering_delivery(&mut self) -> Vec<control_proto::v1::MeteringBatch> {
+        if self.native_meter_owner {
+            return Vec::new();
+        }
         let Some((serial, _, _)) = self.active_session else {
             return Vec::new();
         };
@@ -661,6 +848,9 @@ impl ControlCommandHandler {
         &mut self,
         delta: control_proto::v1::MeteringDelta,
     ) -> Result<(), MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.record(delta);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -679,6 +869,9 @@ impl ControlCommandHandler {
         &mut self,
         snapshots: Vec<MeteringSourceSnapshot>,
     ) -> Result<Option<control_proto::v1::MeteringBatch>, MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.record_snapshots(snapshots);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -697,6 +890,9 @@ impl ControlCommandHandler {
         producer_id: &str,
         sequence: u64,
     ) -> Result<bool, MeteringError> {
+        if self.native_meter_owner {
+            return Err(MeteringError::NativeOwner);
+        }
         let result = self.metering.acknowledge(producer_id, sequence);
         if result.is_err() {
             self.stats.metering_failures.fetch_add(1, Ordering::Relaxed);
@@ -782,11 +978,27 @@ impl ControlCommandHandler {
                 .initiating_drain
                 .remove(&terminal.drain_id)
                 .unwrap_or(NEEDS_ALLOCATION);
-            outbound.push(result_envelope(
-                OutboundControl::DrainResult(terminal),
-                0,
-                initiating,
-            ));
+            // A locally issued drain has no wire requester: its terminal
+            // is retained by the issuer's record for the local status query.
+            // A terminal produced inline by the local admission itself is
+            // local before its record exists; the admission answer then
+            // carries that terminal into the record.
+            let local = self.admitting_local.as_deref() == Some(terminal.drain_id.as_str())
+                || self.local_drains.as_mut().is_ok_and(|issuer| {
+                    issuer
+                        .callers
+                        .values_mut()
+                        .find(|record| record.wire_id == terminal.drain_id)
+                        .map(|record| record.observe(terminal.clone()))
+                        .is_some()
+                });
+            if !local {
+                outbound.push(result_envelope(
+                    OutboundControl::DrainResult(terminal),
+                    0,
+                    initiating,
+                ));
+            }
         }
         outbound
     }
@@ -1188,6 +1400,55 @@ impl ControlCommandHandler {
         now: Instant,
         now_unix_millis: u64,
     ) -> Vec<ControlEnvelope> {
+        let (verdict, mut outbound) =
+            self.admit_drain_core(command, generation, Some(request_id), now, now_unix_millis);
+        outbound.push(match verdict {
+            DrainVerdict::Malformed => result_envelope(
+                OutboundControl::ProtocolError {
+                    code: ErrorCode::ProtocolViolation,
+                    request_id,
+                    detail: "drain deadlines are malformed",
+                },
+                generation,
+                request_id,
+            ),
+            DrainVerdict::Stale => result_envelope(
+                OutboundControl::ProtocolError {
+                    code: ErrorCode::StaleGeneration,
+                    request_id,
+                    detail: "drain provenance predates the applied snapshot",
+                },
+                generation,
+                request_id,
+            ),
+            DrainVerdict::SequenceMismatch => result_envelope(
+                OutboundControl::ProtocolError {
+                    code: ErrorCode::ProtocolViolation,
+                    request_id,
+                    detail: "drain id/sequence violates the one-issuance binding",
+                },
+                generation,
+                request_id,
+            ),
+            DrainVerdict::Result(result) => {
+                result_envelope(OutboundControl::DrainResult(result), generation, request_id)
+            }
+        });
+        outbound
+    }
+
+    /// Shared drain admission for the bridge and the local issuer: deadline
+    /// validation, scope matching, gate admission, session directives. The
+    /// initiating request id is recorded only for a bridge command so the
+    /// proactive terminal answers it; a local drain has no wire requester.
+    fn admit_drain_core(
+        &mut self,
+        command: &DrainCommand,
+        generation: u64,
+        initiating: Option<u64>,
+        now: Instant,
+        now_unix_millis: u64,
+    ) -> (DrainVerdict, Vec<ControlEnvelope>) {
         // Validate the wire's absolute deadlines before converting: a
         // force deadline before the graceful one, or a deadline
         // unreasonably far ahead, is a malformed command — checked
@@ -1203,15 +1464,7 @@ impl ControlCommandHandler {
             || (command.force_deadline_unix_millis != 0
                 && command.force_deadline_unix_millis < command.graceful_deadline_unix_millis)
         {
-            return vec![result_envelope(
-                OutboundControl::ProtocolError {
-                    code: ErrorCode::ProtocolViolation,
-                    request_id,
-                    detail: "drain deadlines are malformed",
-                },
-                generation,
-                request_id,
-            )];
+            return (DrainVerdict::Malformed, Vec::new());
         }
         let graceful_deadline = now + Duration::from_millis(graceful_ahead);
         let force_deadline = now + Duration::from_millis(force_ahead);
@@ -1240,15 +1493,18 @@ impl ControlCommandHandler {
             matched.clone(),
         ) {
             DrainAdmission::Start => {
-                self.initiating_drain
-                    .insert(command.drain_id.clone(), request_id);
+                self.stats
+                    .drain_watermark
+                    .store(self.gate.drain_watermark(), Ordering::Relaxed);
+                if let Some(request_id) = initiating {
+                    self.initiating_drain
+                        .insert(command.drain_id.clone(), request_id);
+                }
                 self.force_notified.clear();
                 let mut outbound = Vec::new();
                 if command.force_deadline_unix_millis != 0
                     && now_unix_millis >= command.force_deadline_unix_millis
                 {
-                    // Already past the force deadline: never ask a
-                    // graceful close first.
                     outbound.extend(self.force_close_remaining());
                 } else {
                     for id in &matched {
@@ -1256,26 +1512,26 @@ impl ControlCommandHandler {
                             .forward(*id, SessionDirective::bare(SessionControl::GracefulClose));
                     }
                 }
-                // A zero-match admission completes on arrival: its very
-                // first answer is already the terminal result.
                 let answer = self
                     .gate
                     .drain_progress()
-                    .or_else(|| self.gate.completed_drain_result(&command.drain_id));
-                outbound.extend(answer.map(|result| {
-                    result_envelope(OutboundControl::DrainResult(result), generation, request_id)
-                }));
-                outbound
+                    .or_else(|| self.gate.completed_drain_result(&command.drain_id))
+                    .unwrap_or_else(|| DrainResult {
+                        drain_id: command.drain_id.clone(),
+                        active_connections: 0,
+                        gracefully_closed: 0,
+                        force_closed: 0,
+                        complete: true,
+                        code: ErrorCode::Ok.into(),
+                        detail: String::new(),
+                    });
+                (DrainVerdict::Result(answer), outbound)
             }
             DrainAdmission::Progress(result)
             | DrainAdmission::Replay(result)
-            | DrainAdmission::Conflict(result) => vec![result_envelope(
-                OutboundControl::DrainResult(result),
-                generation,
-                request_id,
-            )],
-            DrainAdmission::Obsolete { .. } => vec![result_envelope(
-                OutboundControl::DrainResult(DrainResult {
+            | DrainAdmission::Conflict(result) => (DrainVerdict::Result(result), Vec::new()),
+            DrainAdmission::Obsolete { .. } => (
+                DrainVerdict::Result(DrainResult {
                     drain_id: command.drain_id.clone(),
                     active_connections: 0,
                     gracefully_closed: 0,
@@ -1284,35 +1540,172 @@ impl ControlCommandHandler {
                     code: ErrorCode::DuplicateRequest.into(),
                     detail: String::new(),
                 }),
-                generation,
-                request_id,
-            )],
-            DrainAdmission::StaleGeneration { .. } => vec![result_envelope(
-                OutboundControl::ProtocolError {
-                    code: ErrorCode::StaleGeneration,
-                    request_id,
-                    detail: "drain provenance predates the applied snapshot",
-                },
-                generation,
-                request_id,
-            )],
-            DrainAdmission::SequenceMismatch { .. } => vec![result_envelope(
-                OutboundControl::ProtocolError {
-                    code: ErrorCode::ProtocolViolation,
-                    request_id,
-                    detail: "drain id/sequence violates the one-issuance binding",
-                },
-                generation,
-                request_id,
-            )],
+                Vec::new(),
+            ),
+            DrainAdmission::StaleGeneration { .. } => (DrainVerdict::Stale, Vec::new()),
+            DrainAdmission::SequenceMismatch { .. } => (DrainVerdict::SequenceMismatch, Vec::new()),
         }
     }
 
-    /// Sends `CloseImmediate` to every remaining matched session under
-    /// the active drain, marking delivery **only on a successful
-    /// send**: `Full` leaves the session unmarked for the next tick,
-    /// `Gone` converges the dead session through the close path (which
-    /// also produces the terminal result on the completion transition).
+    /// Resolves the wire id and sequence bound to an operator label, or the
+    /// outcome that ends the issuance before any effect: the issuer never
+    /// came up, the label already completed (Go replays a completed label
+    /// without re-arming it and ignores whatever answers; the gate's answer
+    /// for a finished id is its tombstone or, once evicted, a synthetic
+    /// `DUPLICATE_REQUEST`, and neither may touch the retained terminal), or
+    /// the sequence space is exhausted.
+    fn local_drain_binding(&self, caller_id: &str) -> Result<(String, u64), LocalDrainOutcome> {
+        let issuer = self
+            .local_drains
+            .as_ref()
+            .map_err(|_| LocalDrainOutcome::Rejected {
+                code: ErrorCode::Internal,
+                detail: LOCAL_DRAIN_ISSUER_UNAVAILABLE,
+            })?;
+        if let Some(record) = issuer.callers.get(caller_id) {
+            if record.completed {
+                return Err(LocalDrainOutcome::Accepted {
+                    wire_id: record.wire_id.clone(),
+                    command_sequence: record.command_sequence,
+                });
+            }
+            return Ok((record.wire_id.clone(), record.command_sequence));
+        }
+        let sequence =
+            self.gate
+                .drain_watermark()
+                .checked_add(1)
+                .ok_or(LocalDrainOutcome::Rejected {
+                    code: ErrorCode::ProtocolViolation,
+                    detail: "drain sequence space exhausted",
+                })?;
+        Ok((format!("{caller_id}@{}", issuer.incarnation), sequence))
+    }
+
+    /// Issues (or idempotently re-issues) one operator drain from inside the
+    /// process. Mirrors `Bridge.StartDrain` + `DrainIssuer.StartDrain`: the
+    /// label binds once to `<label>@<incarnation>` and to the next sequence
+    /// above the gate watermark; a completed label replays its terminal; a
+    /// different label while a drain runs is a conflict; without an applied
+    /// generation the drain is refused before any effect. Any envelopes the
+    /// admission produces (force-phase closes) are returned for the wire.
+    pub fn start_local_drain(
+        &mut self,
+        request: &LocalDrainRequest,
+        now: Instant,
+        now_unix_millis: u64,
+    ) -> (LocalDrainOutcome, Vec<ControlEnvelope>) {
+        let generation = self.gate.applied_generation();
+        if generation == 0 {
+            return (LocalDrainOutcome::SnapshotNotReady, Vec::new());
+        }
+        let (wire_id, command_sequence) = match self.local_drain_binding(&request.caller_id) {
+            Ok(binding) => binding,
+            Err(outcome) => return (outcome, Vec::new()),
+        };
+        let graceful = now_unix_millis
+            .saturating_add(u64::try_from(request.graceful_wait.as_millis()).unwrap_or(u64::MAX));
+        let force = graceful
+            .saturating_add(u64::try_from(request.force_timeout.as_millis()).unwrap_or(u64::MAX));
+        let command = DrainCommand {
+            drain_id: wire_id.clone(),
+            listener_names: request.listener_names.clone(),
+            backend_ids: request.backend_ids.clone(),
+            graceful_deadline_unix_millis: graceful,
+            force_deadline_unix_millis: force,
+            command_sequence,
+        };
+        self.admitting_local = Some(wire_id.clone());
+        let (verdict, outbound) =
+            self.admit_drain_core(&command, generation, None, now, now_unix_millis);
+        self.admitting_local = None;
+        let outcome = match verdict {
+            DrainVerdict::Malformed => LocalDrainOutcome::Rejected {
+                code: ErrorCode::ProtocolViolation,
+                detail: "drain deadlines are malformed",
+            },
+            DrainVerdict::Stale => LocalDrainOutcome::Rejected {
+                code: ErrorCode::StaleGeneration,
+                detail: "drain provenance predates the applied snapshot",
+            },
+            DrainVerdict::SequenceMismatch => LocalDrainOutcome::Rejected {
+                code: ErrorCode::ProtocolViolation,
+                detail: "drain id/sequence violates the one-issuance binding",
+            },
+            DrainVerdict::Result(result) if result.code() == ErrorCode::DrainInProgress => {
+                let active = result.drain_id;
+                if self.local_drains.as_ref().is_ok_and(|issuer| {
+                    issuer
+                        .callers
+                        .values()
+                        .any(|record| record.wire_id == active)
+                }) {
+                    LocalDrainOutcome::DrainInProgress { active }
+                } else {
+                    LocalDrainOutcome::ForeignDrainActive { active }
+                }
+            }
+            DrainVerdict::Result(result) => match &mut self.local_drains {
+                Ok(issuer) => {
+                    let record = issuer.callers.entry(request.caller_id.clone()).or_insert(
+                        LocalDrainRecord {
+                            wire_id,
+                            command_sequence,
+                            latest: None,
+                            completed: false,
+                        },
+                    );
+                    record.observe(result);
+                    LocalDrainOutcome::Accepted {
+                        wire_id: record.wire_id.clone(),
+                        command_sequence: record.command_sequence,
+                    }
+                }
+                // Unreachable after the admission guard above; stays
+                // fail-closed rather than fabricating a record.
+                Err(_) => LocalDrainOutcome::Rejected {
+                    code: ErrorCode::Internal,
+                    detail: LOCAL_DRAIN_ISSUER_UNAVAILABLE,
+                },
+            },
+        };
+        (outcome, outbound)
+    }
+
+    /// Latest progress or terminal for a local drain label: the retained
+    /// terminal once the drain completed, otherwise the gate's live
+    /// progress, then its tombstone ring, then the last retained answer.
+    #[must_use]
+    pub fn local_drain_status(&self, caller_id: &str) -> Option<LocalDrainStatus> {
+        let record = self.local_drains.as_ref().ok()?.callers.get(caller_id)?;
+        if record.completed {
+            return record.latest.clone().map(|result| LocalDrainStatus {
+                complete: true,
+                result,
+            });
+        }
+        if let Some(progress) = self
+            .gate
+            .drain_progress()
+            .filter(|result| result.drain_id == record.wire_id)
+        {
+            return Some(LocalDrainStatus {
+                complete: progress.complete,
+                result: progress,
+            });
+        }
+        if let Some(done) = self.gate.completed_drain_result(&record.wire_id) {
+            return Some(LocalDrainStatus {
+                complete: true,
+                result: done,
+            });
+        }
+        record.latest.clone().map(|result| LocalDrainStatus {
+            complete: result.complete,
+            result,
+        })
+    }
+
     fn force_close_remaining(&mut self) -> Vec<ControlEnvelope> {
         let mut outbound = Vec::new();
         for id in self.gate.drain_remaining() {
@@ -1481,6 +1874,9 @@ impl ControlCommandHandler {
     pub fn seal_metering(
         &mut self,
     ) -> Result<Option<control_proto::v1::MeteringBatch>, MeteringError> {
+        if self.native_meter_owner {
+            return Ok(None);
+        }
         self.metering.seal()
     }
 
@@ -1556,11 +1952,17 @@ fn result_envelope(outbound: OutboundControl, generation: u64, request_id: u64) 
     }
 }
 
+/// The v1 tombstones the route owner rejects without effect: the route
+/// family, and both drain bodies now that operator drains are issued inside
+/// this process (CP-ADMIN slice 3). The legacy composition keeps acting on
+/// them so the pre-cutover contract stays testable.
 const fn is_retired_route_body(body: Option<&Body>) -> bool {
     matches!(
         body,
         Some(
-            Body::HandshakeResponse(_)
+            Body::DrainCommand(_)
+                | Body::DrainResult(_)
+                | Body::HandshakeResponse(_)
                 | Body::HandshakeDecision(_)
                 | Body::HandshakeResult(_)
                 | Body::RouteRequest(_)
@@ -1748,6 +2150,20 @@ pub enum DispatchNotice {
         /// The close id.
         close_id: String,
     },
+    /// CP-ADMIN issues an operator drain from inside the process.
+    LocalDrain {
+        /// The request.
+        request: LocalDrainRequest,
+        /// The outcome once the dispatcher has applied it.
+        reply: tokio::sync::oneshot::Sender<LocalDrainOutcome>,
+    },
+    /// CP-ADMIN asks for a local drain's latest progress/terminal.
+    LocalDrainStatus {
+        /// Operator label.
+        caller_id: String,
+        /// `None` when the label was never issued in this incarnation.
+        reply: tokio::sync::oneshot::Sender<Option<LocalDrainStatus>>,
+    },
 }
 
 /// Cloneable session-facing handle to the dispatch task. The typed
@@ -1824,6 +2240,32 @@ impl ControlDispatchHandle {
     #[must_use]
     pub fn stats(&self) -> Arc<DispatchStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Issues an operator drain from inside the process (CP-ADMIN).
+    /// `None` when the dispatch task is gone.
+    pub async fn local_drain(&self, request: LocalDrainRequest) -> Option<LocalDrainOutcome> {
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::LocalDrain { request, reply })
+            .await
+        {
+            return None;
+        }
+        outcome.await.ok()
+    }
+
+    /// Latest progress/terminal of a locally issued drain. The outer `None`
+    /// means the dispatch task is gone; the inner `None` an unknown label.
+    pub async fn local_drain_status(&self, caller_id: String) -> Option<Option<LocalDrainStatus>> {
+        let (reply, status) = tokio::sync::oneshot::channel();
+        if !self
+            .notify(DispatchNotice::LocalDrainStatus { caller_id, reply })
+            .await
+        {
+            return None;
+        }
+        status.await.ok()
     }
 
     /// Hands the applied config snapshot generation to the dispatcher,
@@ -2293,8 +2735,8 @@ pub type UnixMillisFn = fn() -> u64;
 /// Production wall clock for [`run_control_dispatch`].
 #[must_use]
 pub fn system_unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
@@ -3035,6 +3477,21 @@ async fn apply_notice<S: DispatchSender>(
                 dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
             }
         }
+        DispatchNotice::LocalDrain { request, reply } => {
+            let now_unix_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let (outcome, outbound) =
+                handler.start_local_drain(&request, Instant::now(), now_unix_millis);
+            for envelope in outbound {
+                dispatch_send(sender, handler, envelope, SendScope::Durable).await?;
+            }
+            let _ = reply.send(outcome);
+        }
+        DispatchNotice::LocalDrainStatus { caller_id, reply } => {
+            let _ = reply.send(handler.local_drain_status(&caller_id));
+        }
     }
     Ok(())
 }
@@ -3084,6 +3541,15 @@ async fn process_inbound<S: DispatchSender>(
             .send(tagged)
             .await
             .map_err(|_| DispatchFatal::SnapshotOwnerGone);
+    }
+    if handler.native_meter_owner
+        && matches!(
+            tagged.envelope.body,
+            Some(Body::MeteringAck(_) | Body::MeteringBatch(_))
+        )
+    {
+        handler.count_unrouted();
+        return Ok(());
     }
     if let Some(Body::MeteringAck(ack)) = &tagged.envelope.body {
         // ACKs are session-bound and capability-gated: a delayed ACK from a

@@ -242,6 +242,24 @@ if [[ $mode == rust && ($variant == plain || ${DATAPLANE_T4_QUALIFICATION:-0} ==
 	fi
 fi
 "$script_dir/render-configs.sh" "$run_dir" "$variant" "$port_offset" >"$run_dir/render.log"
+if [[ ${DATAPLANE_NATIVE_METER:-0} == 1 ]]; then
+    if [[ $mode != rust || $variant != plain ]]; then
+        echo "native metering focused probe requires Rust plain" >&2
+        exit 2
+    fi
+    cat >>"$run_dir/tiproxy.toml" <<NATIVEMETERCONFIG
+
+[metering]
+type = "localfs"
+bucket = "native-process-probe"
+shared-pool-id = "native-process-probe"
+[metering.localfs]
+base-path = "$run_dir/meter-objects"
+create-dirs = true
+permissions = "0755"
+NATIVEMETERCONFIG
+fi
+
 # The focused T3 oracle needs all three live backends in one route group: A0
 # and A1 share ks-old while B carries ks-new. This lets the final phase fail
 # both same-keyspace backends without tripping the all-failed safeguard; the
@@ -308,7 +326,7 @@ if [[ $mode == rust ]]; then
 	fi
 	PORTS="$PORTS $RUST_HEALTH_PORT"
 	if [[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ||
-		($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1)) ]]; then
+		($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1 || ${DATAPLANE_NATIVE_METER:-0} == 1)) ]]; then
 		PORTS="$PORTS $T3_DROP_ADMIN_PORT"
 	fi
 fi
@@ -412,7 +430,7 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 		if [[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 ||
-			($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1)) ]]; then
+			($variant == plain && (${DATAPLANE_T3_FOCUSED:-0} == 1 || ${DATAPLANE_T4_FOCUSED:-0} == 1 || ${DATAPLANE_NATIVE_METER:-0} == 1)) ]]; then
 		# The focused route-owner probes interpose a byte-transparent bridge
 		# process from startup. They later remove only this owned process,
 		# creating a real bridge disconnect while Go's API and both TiDB
@@ -921,6 +939,30 @@ PYT4
 	cp "$T4_REJECT_STATE" "$run_dir/t4-control-rejection-final.json"
 	echo "PASS: T4 cap6 compatible start, incompatible reconnect rejection, and Rust-local SQL admission beyond 30s"
 }
+
+if [[ ${DATAPLANE_NATIVE_METER:-0} == 1 ]]; then
+    # Real SQL and recovery above ran through the production process pair.
+    # Join Rust explicitly so a failed final export cannot look like success.
+    kill -s INT "$RUST_PID"
+    for _ in {1..450}; do
+        kill -0 "$RUST_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$RUST_PID" 2>/dev/null; then
+        echo "native meter process did not join within 45 seconds" >&2
+        exit 1
+    fi
+    if ! wait "$RUST_PID"; then
+        echo "native meter process failed its coordinated shutdown" >&2
+        exit 1
+    fi
+    cp "${RUST_CONTROL_SOCKET}.metering.wal" "$run_dir/native-producer-final.wal"
+    curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+        "http://127.0.0.1:$T3_DROP_ADMIN_PORT/state" -o "$run_dir/native-control-final.json"
+    validate_t4_route_audit "$run_dir/native-control-final.json"
+    python3 "$repo_root/tests/controlplane/cpmeter/verify-native.py" "$run_dir"
+    exit 0
+fi
 
 if [[ $mode == rust && $variant == plain && ${DATAPLANE_T4_FOCUSED:-0} == 1 ]]; then
 	run_t4_route_owner_capability_probe
@@ -1783,9 +1825,20 @@ if [[ $mode == rust && ($variant == plain || ${DATAPLANE_T4_QUALIFICATION:-0} ==
 fi
 KA_DROP_SOCKET="${TMPDIR:-/tmp}/$tag-ka-drop.sock"
 ka_drop_admin_port=$((8100 + port_offset))
+# CP-ADMIN 5c: the Rust process is the only management API server and binds
+# the configured api.addr itself (RUST_API_OWNER), so the admin port is the
+# API port. M9 drives its operator drains through it; they never cross the
+# bridge.
+ka_admin_port=$ka_api_port
+# CP-ADMIN 5a: the Rust metric-owner endpoint gets a fixed port so the
+# management plane's backend/metrics answer can be compared with it.
+ka_metrics_owner_port=$((8102 + port_offset))
 ka_phase_ports=("$ka_sql_port" "$ka_api_port" "$ka_health_port")
 if [[ $ka_use_dropper == true ]]; then
 	ka_phase_ports+=("$ka_drop_admin_port")
+fi
+if [[ $mode == rust ]]; then
+	ka_phase_ports+=("$ka_admin_port" "$ka_metrics_owner_port")
 fi
 for port in "${ka_phase_ports[@]}"; do
 	if "$FAULT_PROXY_BIN" --probe "127.0.0.1:$port" >/dev/null 2>&1; then
@@ -1826,8 +1879,8 @@ text = re.sub(r'(?m)^graceful-wait-before-shutdown = 0$',
 open(path, 'w').write(text)
 PYKA
 if [[ $mode == rust ]]; then
-	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\n' \
-		"$KA_SOCKET" >>"$run_dir/tiproxy-ka.toml"
+	printf '\n[rust-dataplane]\nenabled = true\ncontrol-socket = "%s"\nmetrics-owner-port = %s\n' \
+		"$KA_SOCKET" "$ka_metrics_owner_port" >>"$run_dir/tiproxy-ka.toml"
 	if [[ $TLS_ENABLED == true ]]; then
 		# The keyspace-guard config strips the whole [rust-dataplane] block
 		# (and its tls-allowed-roots) when it is regenerated, so re-admit the
@@ -1836,25 +1889,33 @@ if [[ $mode == rust ]]; then
 	fi
 	printf 'KA_SOCKET=%q\n' "$KA_SOCKET" >>"$run_dir/state.env"
 fi
+# "Go control plane up" for the keyspace-guard instance. In Go mode that is
+# its management API. Under RUST_API_OWNER (CP-ADMIN 5c) the Go process
+# serves no HTTP at all: its readiness is the control socket it listens on,
+# and the management API is checked on the Rust process once that is ready.
+ka_wait_go_control_up() {
+	local pid=$1
+	for _ in {1..100}; do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			return 1
+		fi
+		if [[ $mode == rust ]]; then
+			[[ -S $KA_SOCKET ]] && return 0
+		elif curl --noproxy '*' --fail --silent \
+			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
 "$repo_root/bin/tiproxy" --config "$run_dir/tiproxy-ka.toml" \
 	>"$run_dir/tiproxy-ka.out" 2>&1 &
 KA_PID=$!
 record_t4_process go-ka start "$KA_PID" 0
 printf 'KA_PID=%q\n' "$KA_PID" >>"$run_dir/state.env"
-ka_api_up=false
-for _ in {1..100}; do
-	if ! kill -0 "$KA_PID" 2>/dev/null; then
-		break
-	fi
-	if curl --noproxy '*' --fail --silent \
-		"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
-		ka_api_up=true
-		break
-	fi
-	sleep 0.2
-done
-if [[ $ka_api_up != true ]]; then
-	echo "keyspace-guard instance API never came up" >&2
+if ! ka_wait_go_control_up "$KA_PID"; then
+	echo "keyspace-guard instance never came up" >&2
 	tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 	exit 1
 fi
@@ -1932,6 +1993,15 @@ if [[ $mode == rust ]]; then
 	done
 	if [[ $ka_ready != true ]]; then
 		echo "keyspace-guard rust dataplane never became ready" >&2
+		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
+		exit 1
+	fi
+	# CP-ADMIN 5c: the management API of this pair is the Rust process
+	# on api.addr (no --admin-addr); every later management call in this
+	# phase goes there.
+	if ! curl --noproxy '*' --fail --silent --max-time 5 \
+		"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+		echo "keyspace-guard management API (Rust, api.addr) did not answer" >&2
 		tail -20 "$run_dir/tiproxy-rs-ka.log" >&2 || true
 		exit 1
 	fi
@@ -2221,6 +2291,85 @@ if [[ $mode == rust ]]; then
 		exit 1
 	fi
 	echo "MIG-01 live migration: proxy_conn_id=$mig_proxy_conn_id A0=$TIDB_PORT_0 -> A1=$TIDB_PORT_1; database+user-variable restored ($mig_result)"
+
+	# CP-ADMIN 5a/5b real-process row. 5b: the management redirect sweep
+	# (Go debug/redirect) must self-migrate the persistent session on the
+	# backend it is on (A1): a new backend connection, database and user
+	# variable restored, the route ledger settled with the same active count.
+	# 5a: the admin backend/metrics answer must be the metric-owner
+	# endpoint's bytes, for a named cluster and for the empty name.
+	adm_ledger() {
+		curl --noproxy '*' --fail --silent --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/health" |
+			python3 -c 'import json,sys; l=json.load(sys.stdin)["route_ledger"]; print(l["active"], l["incoming"], l["outgoing"], l["unsettled_redirects"])'
+	}
+	read -r adm_active_before _ _ _ <<<"$(adm_ledger)" || exit 1
+	adm_log_offset=$(wc -l <"$run_dir/tiproxy-rs-ka.log")
+	adm_conn_before=$(cut -d'|' -f2 <<<"$mig_result")
+	adm_code=$(curl --noproxy '*' --silent --show-error -X POST \
+		"http://127.0.0.1:$ka_admin_port/api/debug/redirect" \
+		-o "$run_dir/cp-admin-redirect.json" -w '%{http_code}')
+	if [[ $adm_code != 200 || $(cat "$run_dir/cp-admin-redirect.json") != '""' ]]; then
+		echo "CP-ADMIN debug/redirect answered $adm_code: $(cat "$run_dir/cp-admin-redirect.json" 2>/dev/null)" >&2
+		exit 1
+	fi
+	adm_summary=
+	for _ in {1..40}; do
+		adm_summary=$(tail -n "+$((adm_log_offset + 1))" "$run_dir/tiproxy-rs-ka.log" |
+			grep '"event":"redirect_connections"' | head -1 || true)
+		[[ -n $adm_summary ]] && break
+		sleep 0.25
+	done
+	if [[ -z $adm_summary ]]; then
+		echo "CP-ADMIN redirect sweep logged no summary" >&2
+		exit 1
+	fi
+	adm_accepted=$(sed -n 's/.*"accepted":\([0-9]*\).*/\1/p' <<<"$adm_summary")
+	adm_offered=$(sed -n 's/.*"offered":\([0-9]*\).*/\1/p' <<<"$adm_summary")
+	if [[ -z $adm_accepted || $adm_accepted -lt 1 ]]; then
+		echo "CP-ADMIN redirect sweep accepted nothing: $adm_summary" >&2
+		exit 1
+	fi
+	adm_settled=false
+	for _ in {1..100}; do
+		read -r adm_active adm_incoming adm_outgoing adm_unsettled <<<"$(adm_ledger)" || exit 1
+		if [[ $adm_incoming == 0 && $adm_outgoing == 0 && $adm_unsettled == 0 ]]; then
+			adm_settled=true
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ $adm_settled != true || $adm_active != "$adm_active_before" ]]; then
+		echo "CP-ADMIN redirect sweep did not settle (active $adm_active_before -> $adm_active, incoming $adm_incoming, outgoing $adm_outgoing, unsettled $adm_unsettled)" >&2
+		exit 1
+	fi
+	adm_row=$(migration_query MIGADM \
+		"SELECT CONCAT('MIGADM|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(), 'NULL'), '|', COALESCE(@mig01_marker, 'NULL'));") || exit 1
+	adm_conn_after=$(cut -d'|' -f2 <<<"$adm_row")
+	if [[ $(cut -d'|' -f3 <<<"$adm_row") != "$TIDB_PORT_1" || $(cut -d'|' -f4 <<<"$adm_row") != mig01_live ||
+		$(cut -d'|' -f5 <<<"$adm_row") != state-live || $adm_conn_after == "$adm_conn_before" ]]; then
+		echo "CP-ADMIN self-migration lost state or stayed on the old backend connection: before conn $adm_conn_before, after $adm_row" >&2
+		exit 1
+	fi
+	for adm_cluster in cluster-a cluster-b ""; do
+		adm_admin_headers="$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.headers"
+		if ! curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			-D "$adm_admin_headers" -o "$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.json" \
+			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=$adm_cluster" ||
+			! curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+				-o "$run_dir/cp-owner-backend-metrics-${adm_cluster:-primary}.json" \
+				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=$adm_cluster"; then
+			echo "CP-ADMIN backend/metrics request failed for cluster '$adm_cluster'" >&2
+			exit 1
+		fi
+		if ! grep -qi '^content-type: application/json' "$adm_admin_headers" ||
+			! cmp -s "$run_dir/cp-admin-backend-metrics-${adm_cluster:-primary}.json" \
+				"$run_dir/cp-owner-backend-metrics-${adm_cluster:-primary}.json"; then
+			echo "CP-ADMIN backend/metrics for cluster '$adm_cluster' differs from the metric-owner endpoint" >&2
+			exit 1
+		fi
+	done
+	echo "CP-ADMIN: debug/redirect sweep offered=$adm_offered accepted=$adm_accepted settled with $adm_active active; persistent session self-migrated on A1 (backend conn $adm_conn_before -> $adm_conn_after, database+user-variable restored); backend/metrics admin == metric-owner bytes (cluster-a $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-a.json") B, cluster-b $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-b.json") B, primary $(wc -c <"$run_dir/cp-admin-backend-metrics-primary.json") B)"
 
 	# Close the migrated client, then restore the initial A0 pin before the
 	# separate cross-keyspace refusal phase establishes its own old session.
@@ -2941,18 +3090,8 @@ if [[ $ka_use_dropper == true && ${DATAPLANE_LEGACY_ROUTE_CHAOS:-0} == 1 ]]; the
 		exit 1
 	fi
 	echo "chain-c: Go restarted pid $cc_old_pid -> $KA_PID"
-	cc_api_up=false
-	for _ in {1..100}; do
-		if ! kill -0 "$KA_PID" 2>/dev/null; then break; fi
-		if curl --noproxy '*' --fail --silent \
-			"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
-			cc_api_up=true
-			break
-		fi
-		sleep 0.2
-	done
-	if [[ $cc_api_up != true ]]; then
-		echo "chain-c: restarted Go API never came up" >&2
+	if ! ka_wait_go_control_up "$KA_PID"; then
+		echo "chain-c: restarted Go control plane never came up" >&2
 		tail -20 "$run_dir/tiproxy-ka.out" >&2 || true
 		exit 1
 	fi
@@ -3251,9 +3390,9 @@ if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && $ka_use_dropper 
 		m9_wait_go() {
 			local ready=false
 			for _ in {1..150}; do
-				if kill -0 "$KA_PID" 2>/dev/null && [[ -S $KA_SOCKET ]] &&
-					curl --noproxy '*' --fail --silent --max-time 5 \
-						"http://127.0.0.1:$ka_api_port/api/admin/namespace/" -o /dev/null; then
+				# Under RUST_API_OWNER the Go process serves no HTTP; its
+				# readiness is the control socket.
+				if kill -0 "$KA_PID" 2>/dev/null && [[ -S $KA_SOCKET ]]; then
 					ready=true
 					break
 				fi
@@ -3406,11 +3545,28 @@ PYM9WATERMARK
 			cat "$evidence" >&2 2>/dev/null || true
 			exit 1
 		}
+		m9_wait_health_watermark() {
+			# The Rust readiness probe reports the gate's drain watermark: the
+			# sequence a Rust-admin drain consumed, and the value the next
+			# reconcile carries to Go.
+			local expected=$1 evidence=$2 observed=
+			for _ in {1..100}; do
+				if curl --noproxy '*' --fail --silent --max-time 5 \
+					"http://127.0.0.1:$ka_health_port/health" -o "$evidence"; then
+					observed=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("drain_watermark", -1))' "$evidence")
+					[[ $observed == "$expected" ]] && return 0
+				fi
+				sleep 0.1
+			done
+			echo "M9 Rust drain watermark is ${observed:-<none>}, want exactly $expected" >&2
+			cat "$evidence" >&2 2>/dev/null || true
+			exit 1
+		}
 		m9_wait_drain() {
 			local drain_id=$1 evidence=$2 expected=$3
 			for _ in {1..100}; do
 				if curl --noproxy '*' --fail --silent --max-time 5 \
-					"http://127.0.0.1:$ka_api_port/api/dataplane/drain/$drain_id" \
+					"http://127.0.0.1:$ka_admin_port/api/dataplane/drain/$drain_id" \
 					-o "$evidence" &&
 					python3 - "$evidence" "$expected" <<'PYM9DRAIN'
 import json
@@ -3555,14 +3711,16 @@ PYM9DRAIN
 			printf 'KA_SESSION_PID=\nKA_FIFO=\n' >>"$run_dir/state.env"
 		}
 
-		# Seed the Rust gate's drain watermark without selecting any live SQL
-		# session. A later Go incarnation must learn this exact sequence from
-		# ReconcileRequest before it may issue sequence 2.
+		# Seed the Rust gate's drain watermark through the Rust admin port
+		# without selecting any live SQL session. The drain is issued inside
+		# the Rust process (sequence 1 on the shared gate lineage); a later
+		# Go incarnation must learn this exact sequence from ReconcileRequest.
 		curl --noproxy '*' --fail --silent --show-error -X POST \
 			-H 'Content-Type: application/json' \
 			-d '{"drain_id":"m9-pre-restart","listener_names":["m9-no-such-listener"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
-			"http://127.0.0.1:$ka_api_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-pre-post.json"
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-pre-post.json"
 		m9_wait_drain m9-pre-restart "$m9_pre_status" 0
+		m9_wait_health_watermark 1 "$run_dir/t4-m9-health-watermark-pre.json"
 
 		# Bridge loss lasts beyond the legacy 30-second grace. During that
 		# interval a config-driven A0->A1 redirect and post-grace admission
@@ -3660,14 +3818,39 @@ PYM9DRAIN
 		fi
 		m9_wait_tap_watermark 1 "$run_dir/t4-m9-reconcile-after-go-inflight.json"
 
-		# Sequence 2 targets exactly the one retained session. Its terminal
-		# result must report exactly one close, and the tap proves both restored
-		# watermark and monotonic next command on the actual wire.
+		# Sequence 2 targets exactly the one retained session, issued through
+		# the Rust admin port. Its terminal result must report exactly one
+		# close; the Rust health watermark proves the consumed sequence and the
+		# tap proves the restored reconcile watermark and that no drain command
+		# ever crossed the bridge.
 		curl --noproxy '*' --fail --silent --show-error -X POST \
 			-H 'Content-Type: application/json' \
 			-d '{"drain_id":"m9-post-restart","listener_names":["sql-0"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
-			"http://127.0.0.1:$ka_api_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-post-post.json"
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" -o "$run_dir/t4-m9-drain-post-post.json"
 		m9_wait_drain m9-post-restart "$m9_post_status" 1
+		m9_wait_health_watermark 2 "$run_dir/t4-m9-health-watermark-post.json"
+		# CP-FAULT-ADMIN-DRAIN-REPLAY: re-posting the completed label answers
+		# the same 202 binding and the retained terminal, consumes no sequence,
+		# and closes nothing again (the single close for the targeted session
+		# is asserted below on the Rust connection log).
+		local m9_replay_code
+		m9_replay_code=$(curl --noproxy '*' --silent --show-error -X POST \
+			-H 'Content-Type: application/json' \
+			-d '{"drain_id":"m9-post-restart","listener_names":["sql-0"],"graceful_wait_ms":0,"force_timeout_ms":1000}' \
+			"http://127.0.0.1:$ka_admin_port/api/dataplane/drain" \
+			-o "$run_dir/t4-m9-drain-post-replay.json" -w '%{http_code}')
+		if [[ $m9_replay_code != 202 ]] ||
+			! cmp -s "$run_dir/t4-m9-drain-post-post.json" "$run_dir/t4-m9-drain-post-replay.json"; then
+			echo "M9 drain replay answered $m9_replay_code, want 202 with the original binding" >&2
+			cat "$run_dir/t4-m9-drain-post-replay.json" >&2 2>/dev/null || true
+			exit 1
+		fi
+		m9_wait_drain m9-post-restart "$run_dir/t4-m9-drain-post-replay-status.json" 1
+		if ! cmp -s "$m9_post_status" "$run_dir/t4-m9-drain-post-replay-status.json"; then
+			echo "M9 drain replay changed the retained terminal" >&2
+			exit 1
+		fi
+		m9_wait_health_watermark 2 "$run_dir/t4-m9-health-watermark-replay.json"
 		local m9_close_count m9_backend_gone=false
 		for _ in {1..80}; do
 			m9_close_count=$(grep -c "\"event\":\"connection_closed\".*\"connection_id\":$m9_go_proxy," \
@@ -3713,8 +3896,8 @@ import sys
 audit = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("route_audit", {})
 if audit.get("max_reconcile_request_drain_sequence") != 1:
     raise SystemExit(f"reconcile watermark is not exactly 1: {audit}")
-if audit.get("max_drain_command_sequence") != 2:
-    raise SystemExit(f"post-restart drain sequence is not exactly 2: {audit}")
+if audit.get("drain_commands", 0) != 0 or audit.get("max_drain_command_sequence", 0) != 0:
+    raise SystemExit(f"an operator drain crossed the bridge: {audit}")
 PYM9SEQUENCE
 		then
 			exit 1
@@ -3801,19 +3984,24 @@ path.write_text(json.dumps({
     "rust_restart": {"quiet": "pass", "in_flight": "pass", "replacement_ledger_zero": True},
     "whole_restart": {"quiet": "pass", "in_flight": "pass", "same_endpoints_rebound": True},
     "admin_drain": {
+        "issuer": "rust-admin",
         "pre_restart_sequence": 1,
         "restored_reconcile_watermark": 1,
         "post_restart_sequence": 2,
+        "bridge_drain_commands": 0,
         "targeted_sessions_closed_exactly_once": 1,
+        "replay": {"http_status": 202, "same_binding_and_terminal": True, "sequence_consumed": False},
     },
     "evidence": {
         "pre_drain_status": pathlib.Path(sys.argv[4]).name,
         "post_drain_status": pathlib.Path(sys.argv[5]).name,
+        "post_drain_replay_status": "t4-m9-drain-post-replay-status.json",
+        "health_watermarks": ["t4-m9-health-watermark-pre.json", "t4-m9-health-watermark-post.json", "t4-m9-health-watermark-replay.json"],
         "route_audit": pathlib.Path(sys.argv[6]).name,
     },
 }, sort_keys=True, indent=2) + "\n")
 PYM9RECEIPT
-		echo "PASS: T4 M9 bridge loss ${m9_disconnect_seconds}s, Go/Rust/whole quiet+in-flight restarts, drain watermark 1->2"
+		echo "PASS: T4 M9 bridge loss ${m9_disconnect_seconds}s, Go/Rust/whole quiet+in-flight restarts, Rust-admin drains 1->2 with zero bridge drain commands and an idempotent replay"
 	}
 	run_t4_m9_probe
 	if [[ -z ${KA_DROP_PID:-} ]] || ! kill -0 "$KA_DROP_PID" 2>/dev/null; then

@@ -1,0 +1,4438 @@
+{
+  "rows": [
+    {
+      "name": "success",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "empty",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "missing-crc",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-crc",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "invalid",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "leading-zero-crc",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "00",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "crc-retry",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "empty404",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed404",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-xml-root",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cOther\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Other\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "partial-xml-code",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003cbad",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "partial-xml-field",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "encoded-code",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuch\u0026#75;ey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "key-leading-separators",
+      "method": "HEAD",
+      "key": "//nested//.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "///nested//.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "key-escaped",
+      "method": "HEAD",
+      "key": "space here/汉字+%.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/space%20here/%E6%B1%89%E5%AD%97%2B%25.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey403",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey503",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "header-NoSuchKey",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "PEVycm9yPjxDb2RlPk5vU3VjaEtleTwvQ29kZT48L0Vycm9yPg=="
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "body-before-header",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "PEVycm9yPjxDb2RlPk5vU3VjaEtleTwvQ29kZT48L0Vycm9yPg=="
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "bad-header-error",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "!invalid!"
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status400",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status401",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 401,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status403",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status408",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 408,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status429",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status500",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status501",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 501,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status503",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status599",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 599,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "exhausted503",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "BadRequest",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "badrequest",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003ebadrequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestExpired",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "NoSuchBucket",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchBucket\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "connection reset",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "connection reset",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "connection refused",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "connection refused",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "EOF",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "EOF",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "unexpected EOF",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "unexpected EOF",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "synthetic terminal error",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "synthetic terminal error",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "tls: unknown certificate",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "tls: unknown certificate",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "clock-600",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            }
+          ],
+          "exists": true,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock--600",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "-600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": -600
+            }
+          ],
+          "exists": true,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": -600
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-bad",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "bad",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-repeated",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-failure-not-saved",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "other-code-no-clock",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "default-real-http",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "default-real-crc",
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "0",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "success",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "empty",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "missing-crc",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "malformed-crc",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "invalid",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "leading-zero-crc",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "018350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "crc-retry",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "empty404",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "malformed404",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 404,
+              "body": "\u003cbad",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "wrong-xml-root",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cOther\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Other\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "partial-xml-code",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003cbad",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "partial-xml-field",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "encoded-code",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuch\u0026#75;ey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "key-leading-separators",
+      "method": "PUT",
+      "key": "//nested//.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "///nested//.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "key-escaped",
+      "method": "PUT",
+      "key": "space here/汉字+%.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/space%20here/%E6%B1%89%E5%AD%97%2B%25.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey403",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "NoSuchKey503",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchKey\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "header-NoSuchKey",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "PEVycm9yPjxDb2RlPk5vU3VjaEtleTwvQ29kZT48L0Vycm9yPg=="
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "body-before-header",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eDenied\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "PEVycm9yPjxDb2RlPk5vU3VjaEtleTwvQ29kZT48L0Vycm9yPg=="
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "bad-header-error",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": "!invalid!"
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status400",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status401",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 401,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status403",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "status408",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 408,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status429",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 429,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status500",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 500,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status501",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 501,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status503",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "status599",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 599,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "exhausted503",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "BadRequest",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "badrequest",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003ebadrequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "RequestTimeTooSkewed",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "RequestExpired",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestExpired\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "SlowDown",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eSlowDown\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "NoSuchBucket",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 400,
+              "body": "\u003cError\u003e\u003cCode\u003eNoSuchBucket\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "connection reset",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "connection reset",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "connection refused",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "connection refused",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "EOF",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "EOF",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "unexpected EOF",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "unexpected EOF",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "synthetic terminal error",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "synthetic terminal error",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "tls: unknown certificate",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 0,
+              "body": "",
+              "crc": "",
+              "transport": "tls: unknown certificate",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        }
+      ]
+    },
+    {
+      "name": "clock-600",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            }
+          ],
+          "exists": false,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock--600",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "-600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": -600
+            }
+          ],
+          "exists": false,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": -600
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-bad",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "bad",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-repeated",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "clock-failure-not-saved",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 403,
+              "body": "\u003cError\u003e\u003cCode\u003eRequestTimeTooSkewed\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 600
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": true
+        },
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "other-code-no-clock",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": false,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "\u003cError\u003e\u003cCode\u003eBadRequest\u003c/Code\u003e\u003c/Error\u003e",
+              "crc": "",
+              "transport": "",
+              "date": "600",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "default-real-http",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 503,
+              "body": "",
+              "crc": "",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "name": "default-real-crc",
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "payload": "汉字\u0000payload",
+      "real_http": true,
+      "operations": [
+        {
+          "responses": [
+            {
+              "status": 200,
+              "body": "",
+              "crc": "1",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            },
+            {
+              "status": 200,
+              "body": "",
+              "crc": "18350002009662028172",
+              "transport": "",
+              "date": "",
+              "header_error": ""
+            }
+          ],
+          "attempts": [
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            },
+            {
+              "body": "汉字\u0000payload",
+              "content_type": "application/x-gzip",
+              "path": "/bucket/meter.json.gz",
+              "signed": true,
+              "offset": 0
+            }
+          ],
+          "exists": false,
+          "error": false
+        }
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "method": "HEAD",
+      "key": "meter.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=bebb33b5e57ad1b5df907795ff0467f10e061fca0cc436a28f67058087ede32b"
+    },
+    {
+      "method": "PUT",
+      "key": "meter.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "application/x-gzip",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=32d18c3eead6a753a90fde86e9659f1494ab2dd5ee0a46701ef0b5795734c292"
+    },
+    {
+      "method": "HEAD",
+      "key": "space here/汉字+%.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=e8acc2f3817ad5b1c4ec6772a6d658412852aa46e814b4b0843e687ef22072c7"
+    },
+    {
+      "method": "PUT",
+      "key": "space here/汉字+%.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "application/x-gzip",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=cc17f881e35eadc343c960351dbda370916c96532640195308431f071e7f8cfb"
+    },
+    {
+      "method": "HEAD",
+      "key": "//nested//.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=e4bc999f54a60bbe6c4457bcbb64ac8b6ded32361a28895058c1078abf642c6a"
+    },
+    {
+      "method": "PUT",
+      "key": "//nested//.json.gz",
+      "time": "2026-09-21T00:00:01Z",
+      "content_type": "application/x-gzip",
+      "authorization": "OSS4-HMAC-SHA256 Credential=key/20260921/cn-hangzhou/oss/aliyun_v4_request,Signature=263f7fed2ed5876e5a5cfb8263481e9a556b452c4a67c1a0ce7dfce578cd5a86"
+    }
+  ]
+}
