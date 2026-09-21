@@ -1861,46 +1861,62 @@ mod tests {
         );
     }
 
-    /// Ordering must follow dial completion, not probe completion. A backend
-    /// that connects first but greets slowly finishes its probe last, so
-    /// ordering by probe completion would publish its dial as the newer one
-    /// and overwrite a dial that actually happened later.
+    /// Ordering must follow dial completion, not probe completion.
+    ///
+    /// The two probes have to overlap for this to mean anything. The slow
+    /// backend accepts first -- so its dial completes first -- then holds its
+    /// greeting until the fast probe has finished entirely. Probe-completion
+    /// order is therefore the reverse of dial-completion order, and ordering
+    /// by the wrong one would put the fast dial first.
     #[tokio::test]
     async fn a_slow_greeting_does_not_reorder_the_dials() {
         let (_registry, lease) = owner_lease();
         let network = network(&lease);
         let (_publisher, handle, source) = published_source();
 
-        // Connects first, greets after a long pause: its probe finishes last.
         let slow = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|e| unreachable!("bind: {e}"));
         let slow_addr = slow
             .local_addr()
             .unwrap_or_else(|e| unreachable!("address: {e}"));
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_accepted = Arc::clone(&accepted);
+        let server_release = Arc::clone(&release);
         let slow_server = tokio::spawn(async move {
             let (mut stream, _) = slow
                 .accept()
                 .await
                 .unwrap_or_else(|e| unreachable!("accept: {e}"));
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The dial is done; tell the test, then stall the greeting.
+            server_accepted.notify_one();
+            server_release.notified().await;
             let _ = stream.write_all(&[3, 0, 0, 0, 0x0a, b'8', 0]).await;
         });
 
-        let (_, first) = network
-            .probe_sql_port(
-                &handle,
-                &source,
-                &merged_backend_at(CLUSTER, &slow_addr.to_string()),
-                0,
-                SQL_RETRY_INTERVAL,
-            )
-            .await;
-        let first = first.unwrap_or_else(|| unreachable!("the slow backend was dialled"));
+        let probe_network = Arc::new(network);
+        let network = Arc::clone(&probe_network);
+        let probe_handle = handle.clone();
+        let probe_source = Arc::clone(&source);
+        let slow_probe = tokio::spawn(async move {
+            probe_network
+                .probe_sql_port(
+                    &probe_handle,
+                    &probe_source,
+                    &merged_backend_at(CLUSTER, &slow_addr.to_string()),
+                    0,
+                    SQL_RETRY_INTERVAL,
+                )
+                .await
+        });
 
-        // Dialled afterwards, greets at once: its probe finishes first.
+        // The slow dial has completed and is now stuck on its greeting.
+        accepted.notified().await;
+
+        // Dial the fast backend afterwards: later dial, earlier probe finish.
         let (port, _accepted, _first) = bind_greeter(Greeting::V10).await;
-        let (_, second) = network
+        let (fast_live, fast) = network
             .probe_sql_port(
                 &handle,
                 &source,
@@ -1909,15 +1925,32 @@ mod tests {
                 SQL_RETRY_INTERVAL,
             )
             .await;
-        let second = second.unwrap_or_else(|| unreachable!("the fast backend was dialled"));
+        assert!(fast_live, "the fast backend greeted");
+        let fast = fast.unwrap_or_else(|| unreachable!("the fast backend was dialled"));
+        // Falsifiable premise: the slow probe must still be running. If a
+        // change ever serialises the probes -- as an earlier version of this
+        // test did, making the ordering claim hold trivially -- this fails
+        // instead of passing for the wrong reason.
+        assert!(
+            !slow_probe.is_finished(),
+            "the probes must overlap for this to test ordering at all"
+        );
+
+        // Only now let the slow probe finish, so it finishes last.
+        release.notify_one();
+        let (_, slow_observed) = slow_probe
+            .await
+            .unwrap_or_else(|e| unreachable!("slow probe: {e}"));
+        let slow_observed =
+            slow_observed.unwrap_or_else(|| unreachable!("the slow backend was dialled"));
 
         assert!(
-            second.completed_at >= first.completed_at,
-            "the later dial must not be ordered before the earlier one"
+            slow_observed.completed_at <= fast.completed_at,
+            "the slow backend's dial completed first even though its probe finished last"
         );
         assert!(
-            second.sequence > first.sequence,
-            "and the sequence breaks any tie deterministically"
+            slow_observed.sequence < fast.sequence,
+            "so it must order first; ordering by probe completion would reverse them"
         );
         let _ = slow_server.await;
     }
