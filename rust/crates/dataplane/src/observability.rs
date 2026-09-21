@@ -123,7 +123,7 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 20] = [
+pub const METRIC_SPECS: [MetricSpec; 22] = [
     MetricSpec {
         name: "tiproxy_backend_dial_backend_fail",
         help: "Counter of failing to dial backends.",
@@ -150,6 +150,20 @@ pub const METRIC_SPECS: [MetricSpec; 20] = [
         help: "Counter of health-driven backend keepalive policy updates.",
         kind: MetricKind::Counter,
         labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_monitor_keep_alive_total",
+        help: "Counter of proxy keep alive.",
+        kind: MetricKind::Counter,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_monitor_time_jump_back_total",
+        help: "Counter of system time jumps backward.",
+        kind: MetricKind::Counter,
+        labels: &[],
         buckets: &[],
     },
     MetricSpec {
@@ -1220,6 +1234,92 @@ async fn run_exporter(
     }
 }
 
+/// Go's process monitor, reproduced rule for rule (`lib/util/systimemon`).
+///
+/// It samples the wall clock every 100ms and counts a jump when the clock
+/// reads earlier after the wait than it did before it, calls back every tenth
+/// tick, and `pkg/metrics/metrics.go` raises the keepalive every fifth
+/// callback. The keepalive is therefore this monitor's own heartbeat, not a
+/// lease. Sampling less often, or comparing the wall delta against a
+/// monotonic delta, would answer a different question, so the timer only
+/// schedules: the predicate and the counting stay Go's.
+pub struct SystemTimeMonitor {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl SystemTimeMonitor {
+    /// Stops the monitor and waits for its task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the task's join error if it panicked.
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.shutdown.send_replace(true);
+        self.task.await
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, saturating before it.
+fn wall_clock_nanos() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i128::try_from(since.as_nanos()).unwrap_or(i128::MAX)
+        })
+}
+
+/// Spawns the monitor against a clock, so tests can move time backwards.
+pub fn spawn_system_time_monitor_with_clock<F>(
+    registry: Arc<MetricsRegistry>,
+    now: F,
+) -> SystemTimeMonitor
+where
+    F: Fn() -> i128 + Send + 'static,
+{
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        let jump = MetricKey::new("tiproxy_monitor_time_jump_back_total", Vec::new());
+        let alive = MetricKey::new("tiproxy_monitor_keep_alive_total", Vec::new());
+        let mut ticks = 0_u32;
+        let mut callbacks = 0_u32;
+        loop {
+            let last = now();
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                _ = ticker.tick() => {}
+            }
+            if now() < last {
+                registry.add_counter(&jump, 1);
+            }
+            ticks += 1;
+            if ticks >= 10 {
+                ticks = 0;
+                callbacks += 1;
+                if callbacks >= 5 {
+                    callbacks = 0;
+                    registry.add_counter(&alive, 1);
+                }
+            }
+        }
+    });
+    SystemTimeMonitor { shutdown, task }
+}
+
+/// Spawns the monitor against the system wall clock.
+#[must_use]
+pub fn spawn_system_time_monitor(registry: Arc<MetricsRegistry>) -> SystemTimeMonitor {
+    spawn_system_time_monitor_with_clock(registry, wall_clock_nanos)
+}
+
 /// Payload-free stable fields used by the two session lifecycle logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLogContext {
@@ -1535,6 +1635,69 @@ mod tests {
         // Unlabeled families are always present; labeled ones only once used.
         assert!(text.contains("tiproxy_server_create_connection_total 0\n"));
         assert!(!text.contains("tiproxy_session_query_total{"));
+    }
+
+    /// Go's monitor counts a jump only when the clock reads earlier after the
+    /// wait than before it, calls back every tenth tick, and the keepalive
+    /// rises every fifth callback: one heartbeat per 50 ticks (5s), while a
+    /// rewind inside a single 100ms wait is still caught.
+    #[tokio::test(start_paused = true)]
+    async fn system_time_monitor_counts_jumps_and_heartbeats_like_go() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let clock = Arc::new(Mutex::new(0_i128));
+        let step = Arc::new(Mutex::new(100_000_000_i128));
+        let reader = {
+            let clock = Arc::clone(&clock);
+            let step = Arc::clone(&step);
+            move || {
+                let mut value = clock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let delta = *step
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *value += delta;
+                *value
+            }
+        };
+        let monitor = spawn_system_time_monitor_with_clock(Arc::clone(&registry), reader);
+        let jump = MetricKey::new("tiproxy_monitor_time_jump_back_total", Vec::new());
+        let alive = MetricKey::new("tiproxy_monitor_keep_alive_total", Vec::new());
+        // Let the task consume the interval's immediate first tick and reach
+        // its wait, so each advance below delivers exactly one counted tick.
+        tokio::task::yield_now().await;
+
+        // Advance one tick at a time: the interval skips missed ticks, as Go's
+        // ticker drops them, so a single long jump forward would deliver one.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.lock().counters.get(&jump),
+            None,
+            "a forward clock is not a jump"
+        );
+        assert_eq!(
+            registry.lock().counters.get(&alive),
+            Some(&1),
+            "one heartbeat per 50 ticks"
+        );
+
+        *step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = -1;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            registry.lock().counters.get(&jump),
+            Some(&1),
+            "a backward reading across one 100ms wait is one jump"
+        );
+        monitor
+            .shutdown()
+            .await
+            .unwrap_or_else(|e| unreachable!("{e}"));
     }
 
     #[test]
