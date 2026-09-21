@@ -58,8 +58,9 @@ impl RedirectAllSummary {
         self.accepted += other.accepted;
     }
 }
+pub use ledger::{MigrationObservation, MigrationOutcome};
 pub use retry::Selector;
-pub use selector::Router;
+pub use selector::{MigrationSink, Router};
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
 #[cfg(test)]

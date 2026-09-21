@@ -454,3 +454,67 @@ async fn balance_plan_cross_keyspace_refusal_retains_factor_history_only() -> Te
     sim.router().close(&sessions[0]);
     Ok(())
 }
+
+/// A settled migration must reach an installed sink. The families it feeds are
+/// otherwise served as standing zeros by a real process, which no golden
+/// fixture or ledger unit test can detect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_observations_reach_an_installed_sink() -> TestResult {
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<crate::MigrationObservation>>);
+    impl crate::MigrationSink for Recording {
+        fn record(&self, observation: crate::MigrationObservation) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(observation);
+        }
+    }
+
+    let h = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let sim = simulation(&h, 1);
+    let sink = Arc::new(Recording::default());
+    sim.router().set_migration_sink(sink.clone());
+
+    let c = ready(&sim).await;
+    let a = active(&sim, &c);
+    let prepared = must(sim.prepare(&a, &c, B));
+    assert!(must(sim.offer_at(&prepared, Instant::now())));
+
+    let observed = sink
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        observed.len(),
+        1,
+        "an accepted offer publishes exactly once"
+    );
+    assert_eq!(observed[0].outcome, crate::MigrationOutcome::Issued);
+    assert_eq!(observed[0].to, "127.0.0.1:4001");
+
+    let Some(crate::MigrationCommand::Redirect(redirect)) = sim.take_command() else {
+        unreachable!("the accepted offer queued a redirect")
+    };
+    assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
+
+    let observed = sink
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(observed.len(), 2, "settlement publishes the second end");
+    let crate::MigrationOutcome::Settled { success, .. } = observed[1].outcome else {
+        unreachable!("the terminal is a settlement")
+    };
+    assert!(success);
+    assert_eq!(observed[1].from, "127.0.0.1:4000");
+    assert_eq!(observed[1].to, "127.0.0.1:4001");
+    Ok(())
+}

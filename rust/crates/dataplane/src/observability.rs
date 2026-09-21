@@ -710,6 +710,47 @@ impl Observation {
     }
 }
 
+/// Publishes router migration observations onto the metrics path.
+///
+/// `control-router` records migrations but owns no registry, and it cannot
+/// depend on this crate, so the composition root installs this adapter. The
+/// recorder is non-blocking: a full queue drops the sample rather than stalling
+/// a routing settlement.
+pub struct MigrationMetrics {
+    recorder: MetricsRecorder,
+}
+
+impl MigrationMetrics {
+    /// Wraps the process recorder as a router migration sink.
+    #[must_use]
+    pub const fn new(recorder: MetricsRecorder) -> Self {
+        Self { recorder }
+    }
+}
+
+impl control_router::MigrationSink for MigrationMetrics {
+    fn record(&self, observation: control_router::MigrationObservation) {
+        let reason = observation.reason.metric_name();
+        let sample = match observation.outcome {
+            control_router::MigrationOutcome::Issued => Observation::MigrationIssued {
+                from: observation.from,
+                to: observation.to,
+                reason,
+            },
+            control_router::MigrationOutcome::Settled { success, elapsed } => {
+                Observation::MigrationSettled {
+                    from: observation.from,
+                    to: observation.to,
+                    reason,
+                    succeeded: success,
+                    elapsed,
+                }
+            }
+        };
+        self.recorder.try_record(sample);
+    }
+}
+
 /// Cloneable non-blocking SQL-path metrics surface.
 #[derive(Clone, Default)]
 pub struct MetricsRecorder {

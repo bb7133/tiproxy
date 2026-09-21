@@ -30,7 +30,8 @@ use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyM
 use crate::authority::{Candidate, RouteError, Sources};
 use crate::factors::RedirectReason;
 use crate::ledger::{
-    AccountIdentity, Accounting, Ledger, Redirect, Reservation, Session, Settlement,
+    AccountIdentity, Accounting, Ledger, MigrationObservation, Redirect, Reservation, Session,
+    Settlement,
 };
 use crate::policy::{RoutingIdentity, label_matches};
 
@@ -132,6 +133,9 @@ pub struct Router {
     metrics: Option<control_topology::MetricOverlayHandle>,
     input_diagnostics: Option<Arc<crate::plane::RouteInputDiagnostics>>,
     sources: Sources,
+    /// Where settled migration observations are published. Installed by the
+    /// composition owner; absent in tests and in any build with no exporter.
+    migrations: Mutex<Option<Arc<dyn MigrationSink>>>,
     state: Mutex<State>,
     #[cfg(test)]
     next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -143,7 +147,46 @@ pub struct Router {
     next_failover_commit: Mutex<Option<FailoverCommitBarrier>>,
 }
 
+/// Receives migration observations drained from the ledger.
+///
+/// The ledger records; publication is someone else's job. The router owns no
+/// metric registry, and the dataplane cannot be depended on from here, so the
+/// composition owner installs the sink.
+pub trait MigrationSink: Send + Sync {
+    /// Publishes one settled or issued migration. Called with no router lock
+    /// held, so an implementation may do bounded work.
+    fn record(&self, observation: MigrationObservation);
+}
+
 impl Router {
+    /// Installs the sink that receives migration observations.
+    pub fn set_migration_sink(&self, sink: Arc<dyn MigrationSink>) {
+        *self
+            .migrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Publishes everything the ledger buffered, with the state lock already
+    /// released. Every ledger mutation path funnels through here, including
+    /// the terminal guard's drop, so no settlement can escape publication.
+    fn publish_migrations(&self, drained: Vec<MigrationObservation>) {
+        if drained.is_empty() {
+            return;
+        }
+        let sink = self
+            .migrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(sink) = sink else {
+            return;
+        };
+        for observation in drained {
+            sink.record(observation);
+        }
+    }
+
     /// Builds one router from handles supplied by the same composition owner.
     /// `max_sessions` bounds live session state, including sessions awaiting a
     /// backend. A removed namespace requires a new router incarnation.
@@ -161,6 +204,7 @@ impl Router {
         Ok(Self {
             #[cfg(test)]
             replay_wall: Mutex::new(None),
+            migrations: Mutex::new(None),
             factors_enabled: false,
             metrics: None,
             input_diagnostics: None,
@@ -200,6 +244,7 @@ impl Router {
         Ok(Self {
             #[cfg(test)]
             replay_wall: Mutex::new(None),
+            migrations: Mutex::new(None),
             factors_enabled: true,
             metrics,
             input_diagnostics: Some(input_diagnostics),
@@ -677,11 +722,14 @@ impl Router {
         now: Instant,
     ) -> Result<bool, RouteError> {
         let mut rejected = Vec::new();
-        let result = {
+        let (result, drained) = {
             let mut state = self.lock();
-            self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected)
+            let result =
+                self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected);
+            (result, state.ledger.drain_migrations())
         };
         drop(rejected);
+        self.publish_migrations(drained);
         result
     }
 
@@ -785,6 +833,7 @@ impl Router {
     ) -> crate::RedirectAllSummary {
         let mut summary = crate::RedirectAllSummary::default();
         let mut rejected = Vec::new();
+        let drained;
         {
             let mut state = self.lock();
             summary.active = state.ledger.evidence().active;
@@ -804,8 +853,10 @@ impl Router {
                 state.ledger.admit_redirect(redirect, accepted, now);
                 summary.accepted += u64::from(accepted);
             }
+            drained = state.ledger.drain_migrations();
         }
         drop(rejected);
+        self.publish_migrations(drained);
         summary
     }
 
@@ -815,7 +866,13 @@ impl Router {
         success: bool,
         now: Instant,
     ) -> Settlement {
-        self.lock().ledger.finish_redirect(redirect, success, now)
+        let (settlement, drained) = {
+            let mut state = self.lock();
+            let settlement = state.ledger.finish_redirect(redirect, success, now);
+            (settlement, state.ledger.drain_migrations())
+        };
+        self.publish_migrations(drained);
+        settlement
     }
 
     /// Settles an exact pending attempt, even after its C/R/H inputs retire.
@@ -827,7 +884,13 @@ impl Router {
     /// Closes the exact session incarnation and returns any remaining accounting.
     /// Closing twice or closing a foreign session has no effect.
     pub fn close(&self, session: &Session) -> Settlement {
-        self.lock().ledger.close(session)
+        let (settlement, drained) = {
+            let mut state = self.lock();
+            let settlement = state.ledger.close(session);
+            (settlement, state.ledger.drain_migrations())
+        };
+        self.publish_migrations(drained);
+        settlement
     }
 
     /// Number of currently healthy backends, independent of matching groups.

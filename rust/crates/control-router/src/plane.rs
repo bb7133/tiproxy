@@ -390,10 +390,21 @@ pub struct RoutePlane {
     registry: Arc<Mutex<RegistryState>>,
     input_diagnostics: Arc<RouteInputDiagnostics>,
     ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
+    /// Installed on every router this plane creates, including incarnations
+    /// created later, so a migration cannot go unpublished because its router
+    /// was built after the exporter started.
+    migrations: Option<Arc<dyn crate::selector::MigrationSink>>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
 impl RoutePlane {
+    /// Installs the sink that receives migration observations from every
+    /// router this plane owns. Call before `run`, so no incarnation is built
+    /// without it.
+    pub fn set_migration_sink(&mut self, sink: Arc<dyn crate::selector::MigrationSink>) {
+        self.migrations = Some(sink);
+    }
+
     /// Creates the route-plane module and its readiness/admission handle.
     #[must_use]
     pub fn new(
@@ -416,6 +427,7 @@ impl RoutePlane {
                 updates,
                 registry: Arc::clone(&registry),
                 input_diagnostics: Arc::clone(&input_diagnostics),
+                migrations: None,
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
@@ -475,6 +487,9 @@ impl RoutePlane {
                 self.metrics.clone(),
                 Arc::clone(&self.input_diagnostics),
             )?);
+            if let Some(sink) = self.migrations.clone() {
+                router.set_migration_sink(sink);
+            }
             self.ledger_diagnostics.register(&router);
             let dispatcher = RouteCommandDispatcher::new(Arc::clone(&router));
             let (stop_worker, stop) = watch::channel(false);

@@ -65,8 +65,8 @@ use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
-    SystemTimeMonitor, install_session_log_writer, spawn_metrics_exporter,
+    MetricsExporter, MetricsRecorder, MetricsRegistry, MigrationMetrics, ServerError,
+    SystemMemoryProbe, SystemTimeMonitor, install_session_log_writer, spawn_metrics_exporter,
     spawn_system_time_monitor,
 };
 use tokio::sync::watch;
@@ -762,11 +762,15 @@ async fn run(options: Options) -> Result<(), String> {
         Arc::new(config_owner.handle.source().clone());
     // CP-ADMIN reads the owner history bytes through the same collector.
     let backend_metrics = metric_overlay.backend_metrics_reader();
-    let (route_plane, mut route_plane_handle) = RoutePlane::new(
+    let (mut route_plane, mut route_plane_handle) = RoutePlane::new(
         Arc::clone(&route_config_source),
         topology_handle.clone(),
         Some(metric_overlay),
     );
+    // The router records migrations but owns no registry; publish them onto
+    // the same non-blocking recorder the SQL path uses, before the plane runs
+    // so no router incarnation is built without a sink.
+    route_plane.set_migration_sink(Arc::new(MigrationMetrics::new(metrics.clone())));
     // CP-ADMIN's debug redirect sweeps every current router.
     let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {
