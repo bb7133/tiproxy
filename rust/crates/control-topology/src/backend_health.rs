@@ -1856,4 +1856,54 @@ mod tests {
             "refused is terminal in the SQL stage too: no 1s backoff"
         );
     }
+
+    /// Dial timing excludes waiting for the MySQL greeting after TCP accepts.
+    #[tokio::test]
+    async fn review_sql_dial_excludes_delayed_greeting() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("address: {e}"));
+        let delay = Duration::from_millis(400);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|e| unreachable!("accept: {e}"));
+            tokio::time::sleep(delay).await;
+            stream
+                .write_all(&[3, 0, 0, 0, 0x0a, b'8', 0])
+                .await
+                .unwrap_or_else(|e| unreachable!("greeting: {e}"));
+        });
+        let started = Instant::now();
+        let (healthy, sql_dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &address.to_string()),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        server
+            .await
+            .unwrap_or_else(|e| unreachable!("server join: {e}"));
+        assert!(healthy);
+        let sql_dial = sql_dial.unwrap_or_else(|| unreachable!("a dial occurred"));
+        eprintln!(
+            "healthy={healthy}, sql_dial={sql_dial:?}, stage={elapsed:?}, scripted_greeting_delay={delay:?}"
+        );
+        assert!(elapsed >= delay, "fixture must await the delayed greeting");
+        assert!(
+            sql_dial < delay / 2,
+            "SQL dial metric must exclude the scripted 400ms greeting wait: {sql_dial:?}"
+        );
+    }
 }
