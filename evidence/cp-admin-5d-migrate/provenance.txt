@@ -1,17 +1,8 @@
-# Pull-at-scrape smoke provenance
-head          : f528a07ae6d0270d1801e23cfe9a4365ec268910
-binary        : rust/target/debug/tiproxy-rs
-binary sha256 : cc06789ab8fe2bb4d24d72ecf9f883abee8c7c3ff8a31f5d51ed6efe79982bc2
-binary mtime  : 2026-09-21T17:09:28Z
-rebuilt from  : cargo build -p tiproxy-rs, after the head above was committed
+# Smoke provenance
+built at head : 78893da29bbadcf951ec037dca1b9c605c58d538
+binary sha256 : 721e1726a6b79c165ff50a2056df7579f03dd9755679413f654aae40b2f53047
+evidence sealed at: c1e4f826745eb6df7997098573b830f72677ee47 (later; c1e4f826 changes retention admission only, not the exposition path)
 harness       : PATH=/opt/homebrew/opt/mysql-client/bin:$PATH DATAPLANE_PORT_OFFSET=11300 DATAPLANE_T3_FOCUSED=1 ./tests/dataplane/integration/run.sh --mode rust --variant plain
-harness exit  : 0 (T3 local redirect PASS)
-run dir       : tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-59625
-capture       : curl --noproxy '*' 127.0.0.1:14380/metrics, 1s poll, settled sample 17:10:07Z
-
-## served from authoritative state (no notification accumulation)
-=== settled sample 17:10:07Z ===
-tiproxy_balance_migrate_duration_seconds_sum{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1.276636666
-tiproxy_balance_migrate_duration_seconds_count{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1
-tiproxy_balance_migrate_total{from="127.0.0.1:15300",migrate_res="succeed",reason="status",to="127.0.0.1:15301"} 1
-tiproxy_balance_pending_migrate{from="127.0.0.1:15300",reason="status",to="127.0.0.1:15301"} 0
+harness exit  : 0
+run dir       : tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340
+full response : full-metrics-78893da2.txt (475 lines, entire /metrics body, not an excerpt)

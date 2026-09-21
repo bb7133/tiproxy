@@ -1,6 +1,6 @@
 ready: two TiDB backends and proxied SELECT 1 (plain)
-MTR-005 lifecycle addresses: peer=127.0.0.1:64129 proxy-client=127.0.0.1:64129
+MTR-005 lifecycle addresses: peer=127.0.0.1:58128 proxy-client=127.0.0.1:58128
 PASS: T3 local redirect A0->15301, direct ForceClose, and fresh admission survived bridge disconnect (connection 11)
-redacted diagnostics: /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-59625/diagnostics
-integration artifacts: /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-59625
+redacted diagnostics: /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340/diagnostics
+integration artifacts: /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340
 EXIT=0

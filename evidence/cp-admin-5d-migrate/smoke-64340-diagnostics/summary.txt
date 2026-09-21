@@ -1,0 +1,24 @@
+tag=tiproxy-dp-rust-plain-64340
+collected_at=2026-09-21T17:21:06Z
+go=go version go1.25.12 darwin/arm64
+tiup=1.17.0 tiup
+mysql=mysql  Ver 26.7.0 for macos15.7 on arm64 (Homebrew)
+
+playground:
+
+[33mA new version of [1mplayground[0m[33m is available:[0m [31m[1mv1.17.0[0m -> [32m[1mv1.17.1[0m
+
+    To update this component:   [96;1mtiup update playground[0m
+    To update all components:   [96;1mtiup update --all[0m
+[0m
+]0;TiUP Playground: tiproxy-dp-rust-plain-64340Pid    Role     Uptime
+---    ----     ------
+64542  pd       22.182790583s
+64545  tikv     22.166866209s
+64588  tidb     19.387932s
+64589  tidb     19.369211209s
+64590  tiproxy  19.364294416s
+
+owned_processes:
+64536 64340 tiup playground:v1.17.0 v8.5.1 --tag tiproxy-dp-rust-plain-64340 --without-monitor --host 127.0.0.1 --port-offset 11300 --pd 1 --kv 1 --db 2 --tiflash 0 --db.config /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340/tidb.toml --tiproxy 1 --tiproxy.binpath /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/bin/tiproxy --tiproxy.config /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340/tiproxy.toml
+64609 64340 /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340/faultproxy --listen 127.0.0.1:17400 --admin 127.0.0.1:29774 --target 127.0.0.1:17300
