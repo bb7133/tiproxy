@@ -1,2 +1,0 @@
-=== captured 15:30:56Z ===
-tiproxy_balance_pending_migrate{from="127.0.0.1:15300",reason="status",to="127.0.0.1:15301"} 1

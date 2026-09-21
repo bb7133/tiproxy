@@ -1,6 +1,6 @@
 # Generated for the TiProxy dataplane integration topology. Do not use in production.
 
-workdir = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855/tiproxy-work"
+workdir = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-59625/tiproxy-work"
 enable-traffic-replay = false
 
 [proxy]
@@ -37,7 +37,7 @@ level = "debug"
 encoder = "json"
 
 [log.log-file]
-filename = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855/tiproxy.log"
+filename = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-59625/tiproxy.log"
 max-size = 50
 max-days = 1
 max-backups = 1
@@ -60,4 +60,4 @@ min-tls-version = "1.2"
 
 [rust-dataplane]
 enabled = true
-control-socket = "/var/folders/01/53g4v3f51137mbqd82f4xf0c0000gp/T//tiproxy-dp-rust-plain-40855.sock"
+control-socket = "/var/folders/01/53g4v3f51137mbqd82f4xf0c0000gp/T//tiproxy-dp-rust-plain-59625.sock"

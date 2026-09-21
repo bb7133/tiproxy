@@ -1,2 +1,0 @@
-# processes matching this run's tag, after cleanup
-44255 40855 S          00:00 bash /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/collect-teardown-diagnostics.sh /Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855

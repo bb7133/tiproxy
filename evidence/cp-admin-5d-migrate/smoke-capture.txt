@@ -1,0 +1,5 @@
+=== settled sample 17:10:07Z ===
+tiproxy_balance_migrate_duration_seconds_sum{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1.276636666
+tiproxy_balance_migrate_duration_seconds_count{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1
+tiproxy_balance_migrate_total{from="127.0.0.1:15300",migrate_res="succeed",reason="status",to="127.0.0.1:15301"} 1
+tiproxy_balance_pending_migrate{from="127.0.0.1:15300",reason="status",to="127.0.0.1:15301"} 0

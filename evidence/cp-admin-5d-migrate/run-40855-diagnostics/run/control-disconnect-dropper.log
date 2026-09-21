@@ -1,1 +1,0 @@
-controldropper: 2026/09/21 15:30:47.238363 ready front=/var/folders/01/53g4v3f51137mbqd82f4xf0c0000gp/T//tiproxy-dp-rust-plain-40855-t3-drop.sock admin=127.0.0.1:19391 target=/var/folders/01/53g4v3f51137mbqd82f4xf0c0000gp/T//tiproxy-dp-rust-plain-40855.sock pause_after_drop=false
