@@ -18,6 +18,7 @@ use super::{
     Arc, Duration, GenerationGate, MetricCapture, Mutex, PoisonError, Shared, service, watch,
 };
 use crate::metric_owner::{PeerSet, election_name};
+use crate::owner_metrics::ElectionOwnerHistory;
 use control_etcd::{ElectionAuthority, ElectionConfig, ElectionSession, ElectionState};
 use control_external::IoFence;
 
@@ -177,8 +178,17 @@ impl OwnerWorker {
         let (current, receiver) = watch::channel(None);
         let active = Arc::clone(&scope);
         let scoped_zone = zone.clone();
+        let owner_history = shared.owner_history();
         let task = tokio::spawn(async move {
-            Box::pin(run(active, cluster, scoped_zone, stop, current)).await;
+            Box::pin(run(
+                active,
+                cluster,
+                scoped_zone,
+                stop,
+                current,
+                owner_history,
+            ))
+            .await;
         });
         Self {
             scope,
@@ -245,6 +255,7 @@ async fn run(
     zone: String,
     mut stop: watch::Receiver<bool>,
     current: watch::Sender<Option<Arc<LocalOwner>>>,
+    owner_history: Option<Arc<ElectionOwnerHistory>>,
 ) {
     let _guard = ScopeGuard(Arc::clone(&scope));
     let address = scope.serving.address.to_string();
@@ -254,8 +265,10 @@ async fn run(
         service::encode_query(&cluster),
         service::encode_query(&zone)
     );
-    let Ok(config) = ElectionConfig::new(election_name(&cluster, &zone), address, presence, 15)
-    else {
+    // Kept alongside the config because `ElectionConfig` does not expose the
+    // name back, and this is the exact key `server_owner` labels with.
+    let election_key = election_name(&cluster, &zone);
+    let Ok(config) = ElectionConfig::new(election_key.clone(), address, presence, 15) else {
         return;
     };
     while scope.is_live() && !*stop.borrow() {
@@ -274,8 +287,18 @@ async fn run(
         }
         let local = LocalOwner::from_session(&session);
         current.send_replace(Some(local));
+        // Go `onElected`. The key is the one this worker campaigned on, so
+        // the label is its own election rather than anything derived at the
+        // exposition.
+        if let Some(history) = &owner_history {
+            history.won(&election_key);
+        }
         Box::pin(maintain(&mut session, &scope, &mut stop)).await;
         current.send_replace(None);
+        // Go `onRetired`, which deletes the child rather than zeroing it.
+        if let Some(history) = &owner_history {
+            history.retired(&election_key);
+        }
         let _ = session.shutdown().await;
     }
 }

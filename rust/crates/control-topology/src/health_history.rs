@@ -87,6 +87,18 @@ pub struct HealthMetricsSnapshot {
     /// higher sequence and recreates the series normally, at which point the
     /// watermark is redundant and dropped.
     pub retired_above: BTreeMap<String, u64>,
+    /// The fallback watermark for retirements that could not keep a slot of
+    /// their own in [`Self::retired_above`].
+    ///
+    /// Capacity must not be allowed to cost the guard: counting a dropped
+    /// watermark would document the loss without preventing a stale dial
+    /// from recreating the series. Folding into one number keeps the
+    /// constraint in constant space, at the price of being coarser -- an
+    /// observation older than the most recent overflowing retirement is
+    /// refused whichever address it belongs to. Those are exactly the
+    /// observations already in flight when a retirement ran, and any new
+    /// dial carries a higher sequence, so recreation still works.
+    pub retired_above_floor: u64,
     /// Addresses refused because a retained map was full.
     pub labels_dropped: u64,
 }
@@ -159,11 +171,13 @@ impl BackendHealthHistory {
         // already in flight when the purge ran must not recreate it with a
         // stale value; only a dial newer than anything the address had
         // reached may.
-        if state
+        let watermark = state
             .retired_above
             .get(address)
-            .is_some_and(|watermark| sample.sequence <= *watermark)
-        {
+            .copied()
+            .unwrap_or(0)
+            .max(state.retired_above_floor);
+        if sample.sequence <= watermark {
             return;
         }
         if state.ping.len() >= MAX_RETAINED_BACKENDS {
@@ -218,11 +232,16 @@ impl BackendHealthHistory {
         };
         // Keep the stale-rejection watermark the freed series was carrying,
         // under its own bound so retiring many addresses cannot grow this
-        // without limit. Losing it only costs the guard against a
-        // pre-purge dial arriving late, and the loss is counted.
+        // without limit. When the per-address map is full the watermark is
+        // folded into the shared floor rather than discarded: dropping it
+        // would let a pre-purge dial recreate the series, and a counter
+        // recording that we allowed it is not the same as not allowing it.
+        // The fold loses precision, not the guard, and is counted as the
+        // shed it is.
         if state.retired_above.len() >= MAX_RETAINED_BACKENDS
             && !state.retired_above.contains_key(address)
         {
+            state.retired_above_floor = state.retired_above_floor.max(retired.sequence);
             state.labels_dropped = state.labels_dropped.saturating_add(1);
             return;
         }
@@ -723,15 +742,33 @@ mod tests {
         assert_eq!(snapshot.retired_above.len(), MAX_RETAINED_BACKENDS);
         assert_eq!(snapshot.labels_dropped, 0);
 
-        // One more retired address has nowhere to record its watermark.
-        history.observe_dial("extra:4000", &dial(0.1, 2), &|| true);
+        // One more retired address has nowhere of its own to record a
+        // watermark, so it folds into the shared floor.
+        history.observe_dial("extra:4000", &dial(0.1, 500), &|| true);
         history.forget_backend("extra:4000");
         let snapshot = history.snapshot();
         assert_eq!(snapshot.retired_above.len(), MAX_RETAINED_BACKENDS);
         assert_eq!(
             snapshot.labels_dropped, 1,
-            "losing a stale-rejection guard is shed, not silent"
+            "the loss of per-address precision is shed, not silent"
         );
+        assert_eq!(
+            snapshot.retired_above_floor, 500,
+            "the watermark is folded into the floor rather than discarded"
+        );
+
+        // The point of the fold: that address's late pre-retirement dial
+        // still cannot recreate the series. Counting the shed would document
+        // the hole; it would not close it.
+        history.observe_dial("extra:4000", &dial(9.0, 499), &|| true);
+        assert!(
+            !history.snapshot().ping.contains_key("extra:4000"),
+            "an over-capacity retirement must still reject an older observation"
+        );
+
+        // A genuinely newer dial is admitted, as for any other address.
+        history.observe_dial("extra:4000", &dial(0.75, 501), &|| true);
+        assert_seconds(history.snapshot().ping["extra:4000"].seconds, 0.75);
     }
 
     /// Go's `DelBackend` is one call that deletes across every collector, so
