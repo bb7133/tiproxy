@@ -142,8 +142,13 @@ impl MigrationHistory {
 
     /// Notes a backend address that holds a connection, so its series keeps
     /// reporting zero once the connections go away. Returns whether it is
-    /// retained; the ceiling is the same one the migration label sets use, so
-    /// the two cannot admit different things.
+    /// retained.
+    ///
+    /// This is `b_conn`'s own retained set, separate from the migration label
+    /// sets: they are different families and admit independently, sharing
+    /// only the same ceiling constant and the same drop counter. What must
+    /// agree is every path touching *this* set -- registration, aggregation,
+    /// zero retention and capacity all follow this one decision.
     pub fn remember_backend(&self, address: &str) -> bool {
         let mut state = self.lock();
         if state.known_backends.contains(address) {
