@@ -115,7 +115,7 @@ pub struct MigrationHistory {
 impl MigrationHistory {
     /// Notes that a label set exists, so its pending series keeps reporting
     /// zero after the migration ends.
-    pub(crate) fn remember(&self, from: &str, to: &str, reason: RedirectReason) {
+    pub fn remember(&self, from: &str, to: &str, reason: RedirectReason) {
         let mut state = self.lock();
         let key = (from.to_owned(), to.to_owned(), reason);
         if state.known_pending.contains(&key) {
@@ -131,7 +131,7 @@ impl MigrationHistory {
     /// Records one settled migration. Called exactly once per `Applied`
     /// terminal; a duplicate or late settlement is `Ignored` upstream and
     /// never reaches here.
-    pub(crate) fn settle(
+    pub fn settle(
         &self,
         from: &str,
         to: &str,

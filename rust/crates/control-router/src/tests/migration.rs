@@ -110,6 +110,12 @@ async fn review_interrupted_round_publishes_accepted_prefix() -> TestResult {
         1,
         "round error must publish its accepted prefix before returning"
     );
+    // A green notification assertion must not be able to hide a regression in
+    // the metric itself.
+    assert!(
+        sim.router().pending_migrations().values().sum::<u64>() > 0,
+        "the redirects accepted before the abort are still in flight"
+    );
     Ok(())
 }
 
@@ -170,6 +176,23 @@ async fn review_force_close_publishes_migration_terminal() -> TestResult {
         observed[1].outcome,
         crate::MigrationOutcome::Settled { success: false, .. }
     ));
+    // The notification alone would keep passing if the real metric regressed,
+    // so the authoritative state is asserted in the same scenario.
+    assert_eq!(
+        sim.router().pending_migrations().values().sum::<u64>(),
+        0,
+        "the force-closed migration is no longer in flight"
+    );
+    assert_eq!(
+        sim.router()
+            .migration_history()
+            .snapshot()
+            .terminals
+            .values()
+            .sum::<u64>(),
+        1,
+        "and it is counted exactly once as a terminal"
+    );
     assert_eq!(sim.finish(&redirect, true), Settlement::Ignored);
     Ok(())
 }
@@ -216,6 +239,11 @@ async fn review_automatic_round_publishes_before_terminal() -> TestResult {
         events
             .iter()
             .all(|e| matches!(e.outcome, crate::MigrationOutcome::Issued))
+    );
+    assert_eq!(
+        sim.router().pending_migrations().values().sum::<u64>(),
+        1,
+        "the automatic admission is in flight in the authoritative state too"
     );
     Ok(())
 }

@@ -39,6 +39,13 @@ fn review_close_settles_accepted_migration_once() {
         events[0].outcome,
         MigrationOutcome::Settled { success: false, .. }
     ));
+    // Not only the notification: the authoritative state must show the
+    // migration finished and counted exactly once.
+    assert_eq!(ledger.pending_migrations().values().sum::<u64>(), 0);
+    assert_eq!(
+        ledger.history().snapshot().terminals.values().sum::<u64>(),
+        1
+    );
 }
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {

@@ -1961,6 +1961,118 @@ mod tests {
     /// batch. Must equal the generator's constants.
     const FIXED_KEEP_ALIVES: u32 = 3;
     const FIXED_TIME_JUMPS: u32 = 2;
+    /// `CodexM5`'s full-queue regression, restated for the pull design. Its
+    /// point is unchanged: once the terminal notification is lost and no
+    /// further event will arrive, the exposition must still be right.
+    #[test]
+    fn review_full_queue_cannot_leave_settled_migration_pending() {
+        struct Settled;
+        impl MigrationStateSource for Settled {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let mut snapshot = control_router::MigrationSnapshot::default();
+                // The migration finished; nothing is in flight.
+                snapshot.history.known_pending.insert((
+                    "127.0.0.1:4000".to_owned(),
+                    "127.0.0.1:4001".to_owned(),
+                    control_router::RedirectReason::Test,
+                ));
+                snapshot.history.terminals.insert(
+                    control_router::TerminalKey {
+                        from: "127.0.0.1:4000".to_owned(),
+                        to: "127.0.0.1:4001".to_owned(),
+                        reason: control_router::RedirectReason::Test,
+                        succeeded: true,
+                    },
+                    1,
+                );
+                snapshot
+            }
+        }
+
+        // Reproduce the real loss: a capacity-one queue cannot carry both
+        // ends, so one of them is genuinely dropped.
+        let (recorder, _receiver) = MetricsRecorder::channel(1);
+        let sink = MigrationMetrics::new(recorder.clone());
+        let event = |outcome| control_router::MigrationObservation {
+            from: "127.0.0.1:4000".to_owned(),
+            to: "127.0.0.1:4001".to_owned(),
+            reason: control_router::RedirectReason::Test,
+            outcome,
+        };
+        control_router::MigrationSink::record(
+            &sink,
+            event(control_router::MigrationOutcome::Issued),
+        );
+        control_router::MigrationSink::record(
+            &sink,
+            event(control_router::MigrationOutcome::Settled {
+                success: true,
+                elapsed: Duration::from_millis(2),
+            }),
+        );
+        assert_eq!(
+            recorder.dropped(),
+            1,
+            "fixture must reach real bounded queue loss"
+        );
+
+        let registry = MetricsRegistry::new();
+        registry.set_migration_state_source(Arc::new(Settled));
+        let rendered = registry.render_prometheus_text();
+        assert!(
+            rendered.contains(
+                "tiproxy_balance_pending_migrate{from=\"127.0.0.1:4000\",reason=\"test\",to=\"127.0.0.1:4001\"} 0"
+            ),
+            "a dropped terminal must not leave a phantom pending:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("tiproxy_balance_migrate_total{") && rendered.contains("} 1"),
+            "and the terminal must still be counted:\n{rendered}"
+        );
+    }
+
+    /// `CodexM5`'s capacity regression, restated: the bound has to hold on the
+    /// structures that actually grow, and be visible at the render entry.
+    #[test]
+    fn review_migration_state_is_bounded_with_registry() {
+        struct Flood;
+        impl MigrationStateSource for Flood {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let history = control_router::MigrationHistory::default();
+                for index in 0..(control_router::MAX_RETAINED_LABEL_SETS + 64) {
+                    history.remember(
+                        &format!("10.0.0.1:{index}"),
+                        "10.0.0.2:4000",
+                        control_router::RedirectReason::Test,
+                    );
+                }
+                control_router::MigrationSnapshot {
+                    pending: BTreeMap::new(),
+                    history: history.snapshot(),
+                }
+            }
+        }
+
+        let state = Flood.migration_state();
+        assert_eq!(
+            state.history.known_pending.len(),
+            control_router::MAX_RETAINED_LABEL_SETS,
+            "retention is bounded on the structure that grows"
+        );
+        assert_eq!(state.history.labels_dropped, 64);
+        let registry = MetricsRegistry::new();
+        registry.set_migration_state_source(Arc::new(Flood));
+        let rendered = registry.render_prometheus_text();
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("tiproxy_balance_pending_migrate{"))
+                .count(),
+            control_router::MAX_RETAINED_LABEL_SETS,
+            "the exposition cannot emit more series than are retained"
+        );
+    }
+
     /// The duration bounds exist in two crates: the router buckets a
     /// settlement when it records it, and this catalogue declares the same
     /// bounds for the exposition. They must stay identical or the rendered

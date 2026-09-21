@@ -63,8 +63,8 @@ impl RedirectAllSummary {
 }
 pub use ledger::{MigrationLabels, MigrationObservation, MigrationOutcome, MigrationTotals};
 pub use migration_history::{
-    DurationKey, DurationSeries, MIGRATE_DURATION_BUCKETS, MigrationHistory,
-    MigrationHistorySnapshot, TerminalKey,
+    DurationKey, DurationSeries, MAX_RETAINED_LABEL_SETS, MIGRATE_DURATION_BUCKETS,
+    MigrationHistory, MigrationHistorySnapshot, TerminalKey,
 };
 pub use retry::Selector;
 pub use selector::{MigrationSink, Router};

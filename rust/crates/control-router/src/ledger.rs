@@ -23,9 +23,10 @@ use control_routing::RouteAssignment;
 #[cfg(test)]
 use crate::factors::Factor;
 use crate::factors::RedirectReason;
+use crate::migration_history::MAX_RETAINED_LABEL_SETS;
 use crate::migration_history::MigrationHistory;
 #[cfg(test)]
-use crate::migration_history::{DurationKey, MAX_RETAINED_LABEL_SETS, TerminalKey};
+use crate::migration_history::{DurationKey, TerminalKey};
 
 /// Live connection accounting for one backend owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -452,6 +453,15 @@ impl Ledger {
     fn issue_migration(&mut self, labels: &MigrationLabels) {
         self.history
             .remember(&labels.from, &labels.to, labels.reason);
+        // Bounded like the history, and for the same reason: this map is
+        // label-keyed, so it is the second place cardinality could grow
+        // without limit. A refusal costs the series, never the migration --
+        // the redirect proceeds either way.
+        if !self.pending_migrations.contains_key(labels)
+            && self.pending_migrations.len() >= MAX_RETAINED_LABEL_SETS
+        {
+            return;
+        }
         *self.pending_migrations.entry(labels.clone()).or_default() += 1;
     }
 
