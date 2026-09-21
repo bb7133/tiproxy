@@ -41,6 +41,7 @@
 //! fence failure is terminal and wins over any coincident I/O error.
 
 use std::time::Duration;
+use tokio::time::Instant;
 
 use mysql_wire::{PacketHeader, ResponseHeader};
 use thiserror::Error;
@@ -207,32 +208,55 @@ impl SqlGreetingProbe {
         port: u16,
         source_gate: &GenerationGate,
     ) -> Result<(), SqlGreetingError> {
+        self.check_once_timed(host, port, source_gate).await.1
+    }
+
+    /// As [`Self::check_once`], also reporting how long the **connect** took.
+    ///
+    /// Go updates `ping_duration_seconds` as soon as `DialContext` returns and
+    /// before it reads the greeting, so the reported duration must exclude the
+    /// greeting read. Timing the whole check instead would fold a slow
+    /// greeting into what Go reports as a dial. The duration is returned on
+    /// failure and on timeout as well, because Go sets the gauge there too.
+    pub async fn check_once_timed(
+        &self,
+        host: &str,
+        port: u16,
+        source_gate: &GenerationGate,
+    ) -> (Duration, Result<(), SqlGreetingError>) {
+        let started = Instant::now();
         let dialed = tokio::time::timeout(
             self.dial_timeout,
             self.connector.connect_once(host, port, source_gate),
         )
         .await;
+        // Measured here: the dial is done, the greeting is not yet read.
+        let dial = started.elapsed();
         let mut stream = match dialed {
-            Ok(result) => result?,
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return (dial, Err(error.into())),
             Err(_elapsed) => {
                 // A revoke coincident with the deadline is terminal and wins over
                 // the timeout classification.
-                self.connector.fence(source_gate)?;
-                return Err(SqlGreetingError::Timeout);
+                if let Err(error) = self.connector.fence(source_gate) {
+                    return (dial, Err(error.into()));
+                }
+                return (dial, Err(SqlGreetingError::Timeout));
             }
         };
-        match tokio::time::timeout(
+        let greeting = match tokio::time::timeout(
             self.dial_timeout,
             self.judge_first_packet(&mut stream, source_gate),
         )
         .await
         {
             Ok(result) => result,
-            Err(_elapsed) => {
-                self.connector.fence(source_gate)?;
-                Err(SqlGreetingError::Timeout)
-            }
-        }
+            Err(_elapsed) => match self.connector.fence(source_gate) {
+                Ok(()) => Err(SqlGreetingError::Timeout),
+                Err(error) => Err(error.into()),
+            },
+        };
+        (dial, greeting)
     }
 
     /// Go `pnet.CheckSqlPort`'s minimal criterion: the complete four-byte header,

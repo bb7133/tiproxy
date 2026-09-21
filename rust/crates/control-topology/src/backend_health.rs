@@ -59,7 +59,6 @@
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use control_external::{
     ClusterHttpClient, ClusterHttpConfigError, EtcdClientConfig, HttpProbePolicy,
@@ -509,9 +508,14 @@ impl ClusterHealthNetwork {
             if !handle.still_current(source) {
                 return (false, last_dial);
             }
-            let started = Instant::now();
-            let attempt = self.sql.check_once(host, port, source.source_gate()).await;
-            last_dial = Some(started.elapsed());
+            // Timed inside the probe, around the connect alone: Go updates the
+            // gauge as soon as `DialContext` returns and before it reads the
+            // greeting, so a slow greeting must not land in this value.
+            let (dial, attempt) = self
+                .sql
+                .check_once_timed(host, port, source.source_gate())
+                .await;
+            last_dial = Some(dial);
             match attempt {
                 // Never accept a live result from a superseded source.
                 Ok(()) => return (handle.still_current(source), last_dial),
@@ -1539,6 +1543,55 @@ mod tests {
         assert!(
             started.elapsed() >= dial * (MAX_RETRIES + 1),
             "each attempt spent its own fresh read budget"
+        );
+    }
+
+    /// Go updates the ping gauge as soon as `DialContext` returns, before it
+    /// reads the greeting. A backend that accepts instantly and then never
+    /// writes must therefore report a fast dial, even though the check itself
+    /// spends the whole read budget. Timing the check rather than the connect
+    /// would report the read timeout as if it were the dial.
+    #[tokio::test]
+    async fn a_slow_greeting_is_not_counted_as_dial_time() {
+        let (_registry, lease) = owner_lease();
+        let dial_budget = Duration::from_millis(200);
+        let network = ClusterHealthNetwork::from_cluster_material(
+            &plaintext_config(),
+            lease.token(),
+            HttpProbePolicy {
+                attempt_timeout: dial_budget,
+                max_response_bytes: 64 * 1024,
+            },
+            NETWORK_EPOCH,
+            Arc::from(CLUSTER),
+        )
+        .unwrap_or_else(|error| unreachable!("network: {error}"));
+        let (_publisher, handle, source) = published_source();
+        // Accepts at once, then never writes a greeting.
+        let (port, _accepted, _first) = bind_greeter(Greeting::Hang).await;
+
+        let started = Instant::now();
+        let (live, recorded) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let whole_check = started.elapsed();
+        assert!(!live, "a hung greeting is unhealthy");
+        let recorded = recorded.unwrap_or_else(|| unreachable!("the connect happened"));
+
+        assert!(
+            whole_check >= dial_budget,
+            "the fixture must actually spend the read budget ({whole_check:?})"
+        );
+        assert!(
+            recorded < dial_budget / 4,
+            "the recorded dial is the connect alone ({recorded:?}), not the greeting read \
+             that took {whole_check:?}"
         );
     }
 
