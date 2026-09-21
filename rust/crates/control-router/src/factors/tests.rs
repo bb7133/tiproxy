@@ -271,6 +271,7 @@ fn shared_go_factor_observations() {
                         .entry(Arc::clone(&id))
                         .or_insert_with(|| must(ledger.add_account()));
                     Input {
+                        address: String::new(),
                         instance: format!("{id}:10080"),
                         id,
                         owner: Arc::clone(owner),
@@ -314,6 +315,7 @@ fn retained_cache_requires_exact_ledger_owner() {
     let mut inputs: Vec<_> = ["a", "b"]
         .into_iter()
         .map(|id| Input {
+            address: String::new(),
             id: Arc::from(id),
             owner: must(ledger.add_account()),
             instance: format!("{id}:10080"),
@@ -388,6 +390,7 @@ fn other_cluster_lineage_preserves_cached_health_indicator() {
     let inputs: Vec<_> = ["a", "b"]
         .into_iter()
         .map(|id| Input {
+            address: String::new(),
             id: Arc::from(id),
             owner: must(ledger.add_account()),
             instance: format!("{id}:10080"),
@@ -544,6 +547,7 @@ fn single_time_entry_matches_ordered_windows_and_next_history() {
     let inputs: Vec<_> = ["a", "b"]
         .into_iter()
         .map(|id| Input {
+            address: String::new(),
             id: Arc::from(id),
             owner: must(ledger.add_account()),
             instance: format!("{id}:10080"),

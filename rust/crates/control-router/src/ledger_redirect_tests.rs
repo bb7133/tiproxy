@@ -434,6 +434,7 @@ fn redirect_connection_factor_reads_transferred_score_not_physical_count() {
     let inputs: Vec<_> = [("a", a), ("b", b)]
         .into_iter()
         .map(|(id, owner)| crate::factors::Input {
+            address: String::new(),
             id: id.into(),
             counts: ledger.counts(&owner).unwrap_or_default(),
             owner,

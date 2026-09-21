@@ -307,6 +307,7 @@ pub struct RoutePlaneHandle {
     input_diagnostics: Arc<RouteInputDiagnostics>,
     ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
     score_history: Arc<crate::ScoreHistory>,
+    backend_metrics: Arc<crate::BackendMetricHistory>,
 }
 
 impl RoutePlaneHandle {
@@ -314,6 +315,12 @@ impl RoutePlaneHandle {
     #[must_use]
     pub fn score_history(&self) -> Arc<crate::ScoreHistory> {
         Arc::clone(&self.score_history)
+    }
+
+    /// The retained `backend_metric` observations, for the exposition.
+    #[must_use]
+    pub fn backend_metrics(&self) -> Arc<crate::BackendMetricHistory> {
+        Arc::clone(&self.backend_metrics)
     }
 
     /// Resolves once every namespace in the initial committed configuration has
@@ -506,6 +513,8 @@ pub struct RoutePlane {
     migration_history: Arc<crate::MigrationHistory>,
     /// Retained per-factor scores, shared by every router this plane builds.
     score_history: Arc<crate::ScoreHistory>,
+    /// Retained raw backend observations, likewise shared.
+    backend_metrics: Arc<crate::BackendMetricHistory>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -530,6 +539,7 @@ impl RoutePlane {
         let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
         let migration_history = Arc::new(crate::MigrationHistory::default());
         let score_history = Arc::new(crate::ScoreHistory::new());
+        let backend_metrics = Arc::new(crate::BackendMetricHistory::new());
         let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics {
             routers: Mutex::new(Vec::new()),
             history: Arc::clone(&migration_history),
@@ -548,6 +558,9 @@ impl RoutePlane {
         retirement.register(
             Arc::clone(&score_history) as Arc<dyn control_topology::BackendRetirementSink>
         );
+        retirement.register(
+            Arc::clone(&backend_metrics) as Arc<dyn control_topology::BackendRetirementSink>
+        );
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {
@@ -561,11 +574,13 @@ impl RoutePlane {
                 migrations: None,
                 migration_history: Arc::clone(&migration_history),
                 score_history: Arc::clone(&score_history),
+                backend_metrics: Arc::clone(&backend_metrics),
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
             RoutePlaneHandle {
                 score_history: Arc::clone(&score_history),
+                backend_metrics: Arc::clone(&backend_metrics),
                 ready: ready_rx,
                 updates: updates_rx,
                 source,
@@ -621,6 +636,7 @@ impl RoutePlane {
                 self.metrics.clone(),
                 crate::selector::RouterShared {
                     scores: Arc::clone(&self.score_history),
+                    backend_metrics: Arc::clone(&self.backend_metrics),
                     input_diagnostics: Arc::clone(&self.input_diagnostics),
                     history: Arc::clone(&self.migration_history),
                 },

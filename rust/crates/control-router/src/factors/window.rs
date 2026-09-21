@@ -133,6 +133,14 @@ impl Count {
 
 pub(crate) trait Backend {
     fn key(&self) -> &str;
+    /// The backend's dial address: the `backend` label Go writes
+    /// `backend_metric` with.
+    ///
+    /// Distinct from [`Self::key`], which is the opaque routing identity,
+    /// and from [`Self::instance`], which is the Prometheus instance label
+    /// derived from the address and IP. Using either of those would label
+    /// the series with something Go never writes.
+    fn address(&self) -> &str;
     fn touch_address(&self) {}
     fn instance(&self) -> Cow<'_, str>;
     fn cluster(&self) -> Cow<'_, str>;
@@ -182,7 +190,7 @@ impl<T> Default for Snapshot<T> {
         }
     }
 }
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct History<Q: Query> {
     pub cache: BTreeMap<Arc<str>, Snapshot<Q::Time>>,
     pub cpu_time: Option<Q::Time>,
@@ -192,7 +200,34 @@ pub(crate) struct History<Q: Query> {
     pub usage_per_conn: f64,
     pub zero: Q::Time,
     pub go_arch: GoArch,
+    /// Where accepted observations publish `backend_metric`, or `None` when
+    /// nothing exposes them.
+    ///
+    /// Published from inside the factors rather than from their results,
+    /// because Go writes the value it just accepted and skips the backends
+    /// it rejected -- a skip leaves the previous value exposed, which a
+    /// pass over the finished cache could not distinguish from a fresh one.
+    pub backend_metrics: Option<Arc<crate::BackendMetricHistory>>,
 }
+/// Equality over the observed state alone.
+///
+/// `backend_metrics` is a publication sink, not state: two histories that
+/// have seen the same samples are the same history whether or not one of
+/// them is wired to the exposition. Including it would make the
+/// differential comparison depend on whether metrics are being served.
+impl<Q: Query + PartialEq> PartialEq for History<Q> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cache == other.cache
+            && self.cpu_time == other.cpu_time
+            && self.memory_time == other.memory_time
+            && self.health_queries == other.health_queries
+            && self.health_dirty == other.health_dirty
+            && self.usage_per_conn == other.usage_per_conn
+            && self.zero == other.zero
+            && self.go_arch == other.go_arch
+    }
+}
+
 impl<Q: Query> History<Q> {
     pub(crate) fn new(zero: Q::Time) -> Self {
         Self {
@@ -204,6 +239,7 @@ impl<Q: Query> History<Q> {
             usage_per_conn: 0.0,
             // Preserve the preexisting staged API's saturating conversion.
             go_arch: GoArch::Arm64,
+            backend_metrics: None,
             zero,
         }
     }
@@ -274,6 +310,12 @@ impl<Q: Query> History<Q> {
                 let (avg, latest) = cpu_usage(samples);
                 if avg < 0.0 {
                     continue;
+                }
+                // Go publishes `calcAvgUsage`'s average here, past the same
+                // freshness and negative-usage guards. The latest sample is
+                // a different number and is not what the `cpu` label means.
+                if let Some(metrics) = &self.backend_metrics {
+                    metrics.observe(input.address(), crate::BackendMetric::Cpu, avg);
                 }
                 cache.cpu = Some(Cpu {
                     time,
@@ -363,6 +405,11 @@ impl<Q: Query> History<Q> {
                 let (usage, horizon) = memory_usage::<Q::Time>(samples, self.go_arch);
                 if usage < 0.0 {
                     continue;
+                }
+                // Go publishes `calcMemUsage`'s latest usage here, past the
+                // same guards.
+                if let Some(metrics) = &self.backend_metrics {
+                    metrics.observe(input.address(), crate::BackendMetric::Memory, usage);
                 }
                 let risk = if usage > 0.75 || horizon < 45 * NS {
                     2
@@ -460,7 +507,18 @@ impl<Q: Query> History<Q> {
                     };
                     updated =
                         Some(updated.map_or(time, |old| if old.before(time) { time } else { old }));
-                    risk = risk.max(health_risk(value(fq, input), value(tq, input), threshold));
+                    let (failure_value, total_value) = (value(fq, input), value(tq, input));
+                    // Go writes both raw samples here, and only when both
+                    // are present -- its `failureSample == nil ||
+                    // totalSample == nil` skips the pair together, so one
+                    // half is never published alone.
+                    if let (Some(metrics), Some(failure_value), Some(total_value)) =
+                        (&self.backend_metrics, failure_value, total_value)
+                    {
+                        metrics.observe(input.address(), failure.into(), failure_value);
+                        metrics.observe(input.address(), total.into(), total_value);
+                    }
+                    risk = risk.max(health_risk(failure_value, total_value, threshold));
                 }
                 let Some(time) = updated.filter(|time| !time.is_zero()) else {
                     continue;

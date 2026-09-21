@@ -68,6 +68,23 @@ impl BackendMetric {
     }
 }
 
+/// The health indicators' query ids map onto their `metric` labels exactly,
+/// which is what lets the publication name the label from the query it just
+/// read rather than from a string written beside it.
+impl From<control_topology::metrics::QueryId> for BackendMetric {
+    fn from(id: control_topology::metrics::QueryId) -> Self {
+        use control_topology::metrics::QueryId;
+        match id {
+            QueryId::Cpu => Self::Cpu,
+            QueryId::Memory => Self::Memory,
+            QueryId::FailurePd => Self::FailurePd,
+            QueryId::TotalPd => Self::TotalPd,
+            QueryId::FailureTikv => Self::FailureTikv,
+            QueryId::TotalTikv => Self::TotalTikv,
+        }
+    }
+}
+
 /// A read-only copy of the retained observations.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BackendMetricSnapshot {

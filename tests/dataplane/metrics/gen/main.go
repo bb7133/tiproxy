@@ -146,6 +146,15 @@ func run(input, nativeList string) error {
 		metrics.BackendScoreGauge.WithLabelValues(score.addr, score.factor).Set(float64(score.score))
 	}
 
+	// Raw backend observations. Two of the six are derived rather than
+	// sampled -- memory is calcMemUsage's latest and cpu is calcAvgUsage's
+	// average -- but the fixture only pins the label pairs and values, so
+	// it writes them the same way.
+	for _, observation := range fixedBackendMetrics {
+		metrics.BackendMetricGauge.WithLabelValues(observation.addr, observation.metric).
+			Set(observation.value)
+	}
+
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
 		return err
@@ -251,6 +260,23 @@ var fixedBackendScores = []struct {
 	{addr: "10.0.0.1:4000", factor: "cpu", score: 1},
 	{addr: "10.0.0.2:4000", factor: "conn", score: 7},
 	{addr: "10.0.0.3:4000", factor: "status", score: 0},
+}
+
+// Raw backend observations, mirrored exactly by the Rust golden test. A
+// backend carries only the metrics its factors accepted, so a partial row
+// is a real shape: 10.0.0.2:4000 has health indicators and no resource
+// samples.
+var fixedBackendMetrics = []struct {
+	addr   string
+	metric string
+	value  float64
+}{
+	{addr: "10.0.0.1:4000", metric: "cpu", value: 0.25},
+	{addr: "10.0.0.1:4000", metric: "memory", value: 0.5},
+	{addr: "10.0.0.2:4000", metric: "failure_pd", value: 2},
+	{addr: "10.0.0.2:4000", metric: "total_pd", value: 100},
+	{addr: "10.0.0.2:4000", metric: "failure_tikv", value: 0},
+	{addr: "10.0.0.2:4000", metric: "total_tikv", value: 40},
 }
 
 type nativeFamilies struct {

@@ -14,6 +14,9 @@ impl Backend for Input {
     fn key(&self) -> &str {
         &self.id
     }
+    fn address(&self) -> &str {
+        &self.address
+    }
     fn instance(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.instance)
     }

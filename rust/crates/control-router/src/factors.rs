@@ -188,6 +188,8 @@ impl FactorReport {
 pub(crate) struct Input {
     pub id: Arc<str>,
     pub owner: Arc<AccountIdentity>,
+    /// The backend's dial address, for metric labels that Go keys by it.
+    pub address: String,
     pub instance: String,
     pub cluster: String,
     pub counts: Accounting,
@@ -208,6 +210,14 @@ pub(crate) struct State {
     owners: BTreeMap<Arc<str>, Owner>,
     history: window::History<QueryResult>,
 }
+impl State {
+    /// Installs where accepted resource and health observations publish
+    /// `backend_metric`.
+    pub(crate) fn set_backend_metrics(&mut self, sink: Option<Arc<crate::BackendMetricHistory>>) {
+        self.history.backend_metrics = sink;
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {

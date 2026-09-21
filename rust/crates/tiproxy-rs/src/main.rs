@@ -781,6 +781,8 @@ async fn run(options: Options) -> Result<(), String> {
     metrics_registry.set_migration_state_source(Arc::new(PlaneMigrationState::new(
         route_plane_handle.clone(),
     )));
+    // `backend_metric` from the store the resource and health factors write.
+    metrics_registry.set_backend_metric_state_source(route_plane_handle.backend_metrics());
     // `b_score` likewise, from the store the balance rounds write into.
     metrics_registry.set_score_state_source(route_plane_handle.score_history());
     // The three backend health families are served the same way, from the

@@ -125,12 +125,19 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 31] = [
+pub const METRIC_SPECS: [MetricSpec; 32] = [
     MetricSpec {
         name: "tiproxy_backend_b_status",
         help: "Gauge of backend status.",
         kind: MetricKind::Gauge,
         labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_backend_metric",
+        help: "The backend metric.",
+        kind: MetricKind::Gauge,
+        labels: &["backend", "metric"],
         buckets: &[],
     },
     MetricSpec {
@@ -471,6 +478,19 @@ impl HealthStateSource for control_topology::BackendHealthHistory {
     }
 }
 
+/// Authoritative source for `backend_metric`.
+pub trait BackendMetricStateSource: Send + Sync {
+    /// The retained raw backend observations.
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl BackendMetricStateSource for control_router::BackendMetricHistory {
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+        self.snapshot()
+    }
+}
+
 /// Authoritative source for `b_score`.
 ///
 /// Held separately again because the writer is the balance round and the
@@ -523,6 +543,8 @@ pub struct MetricsRegistry {
     owner: Mutex<Option<Arc<dyn OwnerStateSource>>>,
     /// `b_score`'s source, held for the same reason.
     scores: Mutex<Option<Arc<dyn ScoreStateSource>>>,
+    /// `backend_metric`'s source, held for the same reason.
+    backend_metrics: Mutex<Option<Arc<dyn BackendMetricStateSource>>>,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -567,6 +589,32 @@ impl MetricsRegistry {
         source
             .map(|source| source.health_state())
             .unwrap_or_default()
+    }
+
+    /// Installs the authoritative source for `backend_metric`.
+    pub fn set_backend_metric_state_source(&self, source: Arc<dyn BackendMetricStateSource>) {
+        *self
+            .backend_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads the observations while holding no registry lock, as for the rest.
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+        let source = self
+            .backend_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.backend_metric_state())
+            .unwrap_or_default()
+    }
+
+    /// Label pairs the observation retention refused.
+    #[must_use]
+    pub fn backend_metric_labels_dropped(&self) -> u64 {
+        self.backend_metric_state().labels_dropped
     }
 
     /// Installs the authoritative source for `b_score`.
@@ -723,9 +771,15 @@ impl MetricsRegistry {
         let health = self.health_state();
         let owner = self.owner_state();
         let scores = self.score_state();
+        let observations = self.backend_metric_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_backend_metric_family(spec, &observations) {
+                // Owned by the resource and health factors.
+                out.push_str(&rendered);
+                continue;
+            }
             if let Some(rendered) = render_score_family(spec, &scores) {
                 // Owned by the balance round, never accumulated here.
                 out.push_str(&rendered);
@@ -986,6 +1040,46 @@ fn render_health_family(
             );
         }
         _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `backend_metric`: one sample per retained `(backend, metric)` pair.
+fn render_backend_metric_family(
+    spec: &MetricSpec,
+    state: &control_router::BackendMetricSnapshot,
+) -> Option<String> {
+    if spec.name != "tiproxy_backend_backend_metric" {
+        return None;
+    }
+    let mut lines = String::new();
+    // Ordered by the rendered label, for the same reason `b_score` is: the
+    // enum's order is not the label's.
+    let mut rows: Vec<(&str, &'static str, f64)> = state
+        .values
+        .iter()
+        .map(|((address, metric), value)| (address.as_str(), metric.label(), *value))
+        .collect();
+    rows.sort_unstable_by_key(|(address, metric, _)| (*address, *metric));
+    for (address, metric, value) in rows {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[
+                ("backend", address.to_owned()),
+                ("metric", metric.to_owned()),
+            ],
+            None,
+            value,
+        );
     }
     if lines.is_empty() {
         return Some(String::new());
@@ -1894,7 +1988,8 @@ async fn run_exporter(
                         .saturating_add(registry.migration_labels_dropped())
                         .saturating_add(registry.health_labels_dropped())
                         .saturating_add(registry.owner_labels_dropped())
-                        .saturating_add(registry.score_labels_dropped()),
+                        .saturating_add(registry.score_labels_dropped())
+                        .saturating_add(registry.backend_metric_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -2484,6 +2579,36 @@ mod tests {
         );
     }
 
+    /// Mirrors `fixedBackendMetrics` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// `10.0.0.2:4000` carries health indicators and no resource samples:
+    /// Go writes only what each factor accepted, so a backend with a
+    /// partial row is the ordinary case, not a fixture shortcut.
+    struct FixedBackendMetrics;
+
+    impl BackendMetricStateSource for FixedBackendMetrics {
+        fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+            use control_router::BackendMetric;
+            control_router::BackendMetricSnapshot {
+                values: [
+                    (("10.0.0.1:4000".to_owned(), BackendMetric::Cpu), 0.25),
+                    (("10.0.0.1:4000".to_owned(), BackendMetric::Memory), 0.5),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::FailurePd), 2.0),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::TotalPd), 100.0),
+                    (
+                        ("10.0.0.2:4000".to_owned(), BackendMetric::FailureTikv),
+                        0.0,
+                    ),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::TotalTikv), 40.0),
+                ]
+                .into_iter()
+                .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
     /// Mirrors `fixedBackendScores` in
     /// `tests/dataplane/metrics/gen/main.go`.
     ///
@@ -2978,6 +3103,9 @@ mod tests {
         aggregator
             .registry
             .set_score_state_source(Arc::new(FixedScores));
+        aggregator
+            .registry
+            .set_backend_metric_state_source(Arc::new(FixedBackendMetrics));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");

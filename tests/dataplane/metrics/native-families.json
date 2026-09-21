@@ -8,6 +8,7 @@
   ],
   "families": [
     "tiproxy_backend_b_status",
+    "tiproxy_backend_backend_metric",
     "tiproxy_backend_dial_backend_fail",
     "tiproxy_backend_get_backend",
     "tiproxy_backend_get_backend_duration_seconds",

@@ -2,6 +2,14 @@
 # TYPE tiproxy_backend_b_status gauge
 tiproxy_backend_b_status{backend="10.0.0.1:4000"} 1
 tiproxy_backend_b_status{backend="10.0.0.2:4000"} 0
+# HELP tiproxy_backend_backend_metric The backend metric.
+# TYPE tiproxy_backend_backend_metric gauge
+tiproxy_backend_backend_metric{backend="10.0.0.1:4000",metric="cpu"} 0.25
+tiproxy_backend_backend_metric{backend="10.0.0.1:4000",metric="memory"} 0.5
+tiproxy_backend_backend_metric{backend="10.0.0.2:4000",metric="failure_pd"} 2
+tiproxy_backend_backend_metric{backend="10.0.0.2:4000",metric="failure_tikv"} 0
+tiproxy_backend_backend_metric{backend="10.0.0.2:4000",metric="total_pd"} 100
+tiproxy_backend_backend_metric{backend="10.0.0.2:4000",metric="total_tikv"} 40
 # HELP tiproxy_backend_dial_backend_fail Counter of failing to dial backends.
 # TYPE tiproxy_backend_dial_backend_fail counter
 tiproxy_backend_dial_backend_fail{backend="10.0.0.1:4000"} 1
