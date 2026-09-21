@@ -101,8 +101,29 @@ impl BackendHealthHistory {
     /// An observation older than the stored one is discarded. `sequence` is
     /// assigned when the dial returns, so this compares completion order, not
     /// the order the observations happened to reach this method.
-    pub fn observe_dial(&self, address: &str, dial: &SqlDialObservation) {
+    ///
+    /// `still_valid` is the caller's source fence, evaluated **while this
+    /// lock is held**. Checking it before the call would leave a window in
+    /// which the source retires between the check and the write, so the
+    /// fence would describe a guarantee the code does not make. Go has no
+    /// such fence at all and always writes, so this can only ever be
+    /// stricter than Go -- but it should be exactly as strict as it claims.
+    ///
+    /// The predicate must not acquire a lock that any holder takes before
+    /// this one. The production fence reads the routing publisher's watch
+    /// slot and a generation gate, and nothing on the publishing side ever
+    /// reaches for this history, so that order has no counterpart to invert
+    /// against.
+    pub fn observe_dial(
+        &self,
+        address: &str,
+        dial: &SqlDialObservation,
+        still_valid: &dyn Fn() -> bool,
+    ) {
         let mut state = self.lock();
+        if !still_valid() {
+            return;
+        }
         let sample = PingSample {
             seconds: dial.duration.as_secs_f64(),
             sequence: dial.sequence,
@@ -175,6 +196,74 @@ impl BackendHealthHistory {
 /// series are deleted.
 pub const BACKEND_METRIC_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// Deletes every metric series a family keys by backend address.
+///
+/// Go's `metrics.DelBackend` does this across all collectors at once when a
+/// backend has been down past the retention window, matching `backend`,
+/// `from` and `to` labels alike. The families do not live in one crate, so
+/// each owner implements this and registers with [`BackendRetirement`].
+///
+/// This deletes *metrics only*. A retirement says nothing about the
+/// connections or migrations themselves: Go drops the series while the
+/// session and redirect state carry on untouched, and an implementation that
+/// also dropped real state would turn a metric-retention rule into a
+/// correctness bug.
+pub trait BackendRetirementSink: Send + Sync {
+    /// Drops this address's series from the implementor's families.
+    fn retire_backend(&self, address: &str);
+}
+
+/// The registered owners of backend-keyed metric families.
+///
+/// Registration is open after construction because the owners are built
+/// later than the health child that retires through them -- the route plane
+/// does not exist when the topology module is created.
+#[derive(Default)]
+pub struct BackendRetirement {
+    sinks: Mutex<Vec<Arc<dyn BackendRetirementSink>>>,
+}
+
+impl std::fmt::Debug for BackendRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackendRetirement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackendRetirement {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an owner of backend-keyed families.
+    pub fn register(&self, sink: Arc<dyn BackendRetirementSink>) {
+        self.sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(sink);
+    }
+
+    /// Retires the address from every registered owner.
+    ///
+    /// The sinks are cloned out and the registry lock released before any of
+    /// them runs: a sink takes its own lock, and holding this one across that
+    /// call would put the registry into every family's lock order for no
+    /// reason.
+    pub fn retire(&self, address: &str) {
+        let sinks: Vec<Arc<dyn BackendRetirementSink>> = self
+            .sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for sink in sinks {
+            sink.retire_backend(address);
+        }
+    }
+}
+
 /// One observer's edge-detection state for the backend health gauges.
 ///
 /// The values live in the shared [`BackendHealthHistory`]; the *edges* live
@@ -196,6 +285,10 @@ pub struct ObserverHealthMetrics {
     /// keeps its original timestamp and one that was never healthy has no
     /// entry at all.
     down_since: BTreeMap<String, Instant>,
+    /// The other families' owners, notified when this observer's retention
+    /// clock expires. `None` leaves the retirement local to the health
+    /// families, which is what a test wants by default.
+    retirement: Option<Arc<BackendRetirement>>,
 }
 
 impl ObserverHealthMetrics {
@@ -207,7 +300,16 @@ impl ObserverHealthMetrics {
             history,
             current: BTreeMap::new(),
             down_since: BTreeMap::new(),
+            retirement: None,
         }
+    }
+
+    /// Extends this observer's purge to the families it does not own, for
+    /// the whole of Go's `DelBackend`.
+    #[must_use]
+    pub fn with_retirement(mut self, retirement: Arc<BackendRetirement>) -> Self {
+        self.retirement = Some(retirement);
+        self
     }
 
     /// Go `updateHealthResult`: applies one round's whole-map verdict.
@@ -262,6 +364,12 @@ impl ObserverHealthMetrics {
             .collect();
         for address in &expired {
             self.history.forget_backend(address);
+            // The rest of Go's `DelBackend`: b_conn and the migration
+            // families key series by this address too, and Go deletes them in
+            // the same call.
+            if let Some(retirement) = &self.retirement {
+                retirement.retire(address);
+            }
             // Go deletes the timer with the series: a backend still down when
             // the next cycle runs must not be purged again every cycle.
             self.down_since.remove(address);
@@ -446,7 +554,7 @@ mod tests {
     async fn a_dial_is_reported_for_a_backend_with_no_status_series() {
         let (history, mut observer) = observer();
         let now = Instant::now();
-        history.observe_dial("a:4000", &dial(0.5, 1));
+        history.observe_dial("a:4000", &dial(0.5, 1), &|| true);
         observer.apply_round(&round(&[("a:4000", false)]), now);
 
         let snapshot = history.snapshot();
@@ -459,12 +567,12 @@ mod tests {
     #[tokio::test]
     async fn an_older_dial_never_overwrites_a_newer_one() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.2, 7));
-        history.observe_dial("a:4000", &dial(9.0, 3));
+        history.observe_dial("a:4000", &dial(0.2, 7), &|| true);
+        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
 
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.2);
 
-        history.observe_dial("a:4000", &dial(0.4, 8));
+        history.observe_dial("a:4000", &dial(0.4, 8), &|| true);
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.4);
     }
 
@@ -473,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn a_forgotten_backend_can_come_back() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.1, 1));
+        history.observe_dial("a:4000", &dial(0.1, 1), &|| true);
         history.set_status("a:4000", true);
         history.forget_backend("a:4000");
         assert!(history.snapshot().ping.is_empty());
@@ -512,8 +620,63 @@ mod tests {
 
         // The ping family has its own room: a full status map does not
         // refuse a dial.
-        history.observe_dial("overflow:4000", &dial(0.1, 1));
+        history.observe_dial("overflow:4000", &dial(0.1, 1), &|| true);
         assert!(history.snapshot().ping.contains_key("overflow:4000"));
+    }
+
+    /// Go's `DelBackend` is one call that deletes across every collector, so
+    /// the health families' purge must reach the owners of the others.
+    #[tokio::test]
+    async fn the_retention_purge_reaches_the_other_families() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<String>>);
+        impl BackendRetirementSink for Recorder {
+            fn retire_backend(&self, address: &str) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(address.to_owned());
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let second = Arc::new(Recorder::default());
+        let retirement = Arc::new(BackendRetirement::new());
+        retirement.register(Arc::clone(&recorder) as Arc<dyn BackendRetirementSink>);
+        retirement.register(Arc::clone(&second) as Arc<dyn BackendRetirementSink>);
+
+        let history = Arc::new(BackendHealthHistory::new());
+        let mut observer = ObserverHealthMetrics::new(Arc::clone(&history))
+            .with_retirement(Arc::clone(&retirement));
+
+        let start = Instant::now();
+        observer.apply_round(&round(&[("a:4000", true), ("b:4000", true)]), start);
+        observer.apply_round(&round(&[("a:4000", false), ("b:4000", true)]), start);
+
+        // Before the window: nothing retires anywhere.
+        assert!(observer.purge(start + Duration::from_secs(60)).is_empty());
+        assert!(
+            recorder
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+
+        let past = start + BACKEND_METRIC_RETENTION + Duration::from_secs(1);
+        assert_eq!(observer.purge(past), vec!["a:4000".to_owned()]);
+
+        for sink in [&recorder, &second] {
+            assert_eq!(
+                *sink.0.lock().unwrap_or_else(PoisonError::into_inner),
+                vec!["a:4000".to_owned()],
+                "every registered owner is told, and only about the retired address"
+            );
+        }
+        assert!(
+            history.snapshot().status.contains_key("b:4000"),
+            "a backend that is still healthy keeps its series"
+        );
     }
 
     /// A `Duration` round-trip is not bit-exact for every decimal, so the

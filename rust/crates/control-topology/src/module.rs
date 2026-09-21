@@ -71,7 +71,7 @@ use crate::discovery_publish::{
 };
 use crate::health_config::{HealthConfigError, HealthRuntime};
 use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
-use crate::health_history::{BackendHealthHistory, ObserverHealthMetrics};
+use crate::health_history::{BackendHealthHistory, BackendRetirement, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
@@ -270,6 +270,10 @@ pub struct TopologyModule {
     /// [`TopologyModuleHandle::health_history`], so both see one set of
     /// series the way Go's package-level collectors are one set.
     health_history: Arc<BackendHealthHistory>,
+    /// The owners of the other backend-keyed metric families, retired
+    /// together with the health ones when a backend has been down past the
+    /// retention window (Go `DelBackend`).
+    backend_retirement: Arc<BackendRetirement>,
     #[cfg(test)]
     refresh_override: Option<RefreshFactory>,
     #[cfg(test)]
@@ -357,6 +361,7 @@ pub struct TopologyModuleHandle {
     mode: watch::Receiver<Arc<ModeEpoch>>,
     statics: Arc<StaticRegistry>,
     health_history: Arc<BackendHealthHistory>,
+    backend_retirement: Arc<BackendRetirement>,
     #[cfg(test)]
     mode_hook: crate::static_source::PublishHook,
 }
@@ -397,6 +402,13 @@ impl TopologyModuleHandle {
     #[must_use]
     pub fn health_history(&self) -> Arc<BackendHealthHistory> {
         Arc::clone(&self.health_history)
+    }
+
+    /// The registry an owner of backend-keyed metric families registers with,
+    /// so the health child's retention purge reaches its series too.
+    #[must_use]
+    pub fn backend_retirement(&self) -> Arc<BackendRetirement> {
+        Arc::clone(&self.backend_retirement)
     }
 
     /// Creates a wake-only observer for consumers that must rebuild a derived
@@ -729,6 +741,7 @@ impl TopologyModule {
         let mode_hook = mode.publish_hook();
         let statics = Arc::new(StaticRegistry::default());
         let health_history = Arc::new(BackendHealthHistory::new());
+        let backend_retirement = Arc::new(BackendRetirement::new());
         let (metrics, metric_source) = MetricPublication::new(Arc::clone(&source), health);
         Ok((
             Self {
@@ -753,6 +766,7 @@ impl TopologyModule {
                 metrics,
                 statics: Arc::clone(&statics),
                 health_history: Arc::clone(&health_history),
+                backend_retirement: Arc::clone(&backend_retirement),
                 #[cfg(test)]
                 refresh_override: None,
                 #[cfg(test)]
@@ -769,6 +783,7 @@ impl TopologyModule {
                 mode: mode_reader,
                 statics,
                 health_history,
+                backend_retirement,
                 #[cfg(test)]
                 mode_hook,
             },
@@ -994,7 +1009,10 @@ impl TopologyModule {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             Arc::clone(&self.source),
-            Some(ObserverHealthMetrics::new(Arc::clone(&self.health_history))),
+            Some(
+                ObserverHealthMetrics::new(Arc::clone(&self.health_history))
+                    .with_retirement(Arc::clone(&self.backend_retirement)),
+            ),
         ))
     }
 
@@ -1290,6 +1308,7 @@ impl TopologyModule {
                 &self.source,
                 self.mode.applied(),
                 &self.health_history,
+                &self.backend_retirement,
             )
             .await;
         let outcome = self

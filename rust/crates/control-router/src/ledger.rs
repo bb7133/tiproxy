@@ -1121,6 +1121,15 @@ impl Ledger {
                     account.counts.active -= 1;
                     account.physical.retain(|id| *id != session.sequence);
                 }
+                // Go's `removeConn` calls `setBackendConnMetrics` just as
+                // `addConn` does, so a close recreates the child if the
+                // address was deleted in between. Ordinarily a no-op -- the
+                // address was admitted when the connection landed -- this
+                // only matters after a retention purge, where Go would show
+                // the address again at its new count and dropping the write
+                // would leave it silently absent.
+                self.history
+                    .remember_backend(&active.assignment.backend_address);
             }
         }
         Settlement::Applied

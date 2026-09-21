@@ -534,18 +534,19 @@ impl ClusterHealthNetwork {
         // freeze point instead, which is where Go calls
         // `setPingBackendMetrics`.
         //
-        // Fence before publishing, never after: a stale source may no longer
-        // map this address to this cluster, and a dial's sequence orders
-        // observations without authorising them, so a later dial from a
-        // retired source must not overwrite a live one.
+        // The fence runs inside the history's lock, not before the call: a
+        // stale source may no longer map this address to this cluster, and a
+        // dial's sequence orders observations without authorising them, so a
+        // later dial from a retired source must not overwrite a live one.
+        // Checking out here would leave a window in which the source retires
+        // between the check and the write.
         let publish_dial = |dial: &SqlDialObservation| {
             let Some(history) = self.health_history.as_ref() else {
                 return;
             };
-            if !handle.still_current(source) {
-                return;
-            }
-            history.observe_dial(&backend.backend.addr, dial);
+            history.observe_dial(&backend.backend.addr, dial, &|| {
+                handle.still_current(source)
+            });
         };
         loop {
             if !handle.still_current(source) {

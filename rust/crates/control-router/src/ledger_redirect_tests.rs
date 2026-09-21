@@ -1008,3 +1008,64 @@ fn a_refused_backend_address_is_not_exposed() {
         "the retained set stays at its ceiling"
     );
 }
+
+/// A retention purge deletes metric series. It must not reach the ledger:
+/// Go's `DelBackend` drops the collectors' children while the redirect it
+/// was counting carries on and still settles. Dropping real state instead
+/// would turn a metric-retention rule into lost connections.
+#[test]
+fn retiring_a_backend_deletes_series_without_disturbing_the_ledger() {
+    let history = Arc::new(MigrationHistory::default());
+    let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = active(&mut ledger, &a);
+    let now = Instant::now();
+    let op = must(redirect(&ledger, &session, &b, assignment("b"), now));
+    ledger.admit_redirect(op.clone(), true, now);
+    let _ = ledger.drain_migrations();
+
+    let pending_before = ledger.pending_migrations().clone();
+    let sessions_before = ledger.evidence();
+    assert!(
+        !pending_before.is_empty(),
+        "the fixture must have a migration in flight to protect"
+    );
+
+    history.forget_backend(&op.to.backend_address);
+    history.forget_backend(&op.from.backend_address);
+
+    assert_eq!(
+        ledger.pending_migrations(),
+        &pending_before,
+        "retirement is a metric delete; the in-flight migration is ledger state"
+    );
+    assert_eq!(
+        (
+            ledger.evidence().active,
+            ledger.evidence().incoming,
+            ledger.evidence().outgoing
+        ),
+        (
+            sessions_before.active,
+            sessions_before.incoming,
+            sessions_before.outgoing
+        ),
+        "no session accounting may move because a metric series was deleted"
+    );
+
+    // And the migration still settles, recreating its series through a real
+    // write exactly as Go's next `Inc` recreates a deleted child.
+    assert_eq!(
+        ledger.finish_redirect(&op, true, Instant::now()),
+        Settlement::Applied
+    );
+    let snapshot = history.snapshot();
+    assert!(
+        snapshot
+            .terminals
+            .keys()
+            .any(|key| key.to == op.to.backend_address && key.succeeded),
+        "settling after a retirement records the terminal again"
+    );
+}

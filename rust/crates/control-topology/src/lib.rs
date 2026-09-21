@@ -65,8 +65,8 @@ pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryCapture, DiscoveryError, DiscoveryHandle, EpochResult};
 pub use health_config::HealthConfigError;
 pub use health_history::{
-    BACKEND_METRIC_RETENTION, BackendHealthHistory, HealthMetricsSnapshot, MAX_RETAINED_BACKENDS,
-    ObserverHealthMetrics, PingSample,
+    BACKEND_METRIC_RETENTION, BackendHealthHistory, BackendRetirement, BackendRetirementSink,
+    HealthMetricsSnapshot, MAX_RETAINED_BACKENDS, ObserverHealthMetrics, PingSample,
 };
 pub use health_overlay::{HealthOverlayHandle, HealthSnapshot, ObserverError};
 pub use merge::{

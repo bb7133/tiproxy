@@ -524,6 +524,14 @@ impl RoutePlane {
             routers: Mutex::new(Vec::new()),
             history: Arc::clone(&migration_history),
         });
+        // Go's `DelBackend` deletes b_conn and the migration series together
+        // with the health ones, and the health child owns the retention
+        // clock, so this history registers as one of its targets. Done here
+        // rather than at the composition root because the plane is where the
+        // history is created and where the topology handle already is.
+        topology.backend_retirement().register(
+            Arc::clone(&migration_history) as Arc<dyn control_topology::BackendRetirementSink>
+        );
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {

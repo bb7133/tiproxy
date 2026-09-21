@@ -50,7 +50,7 @@ use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::EpochResult;
 use crate::health_config::HealthRuntime;
 use crate::health_feed::HealthGenerationFeeder;
-use crate::health_history::{BackendHealthHistory, ObserverHealthMetrics};
+use crate::health_history::{BackendHealthHistory, BackendRetirement, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
@@ -400,6 +400,7 @@ impl StaticBackendProducer {
         updates: watch::Sender<u64>,
         activate: bool,
         health_history: &Arc<BackendHealthHistory>,
+        retirement: &Arc<BackendRetirement>,
     ) -> Result<Self, ClusterHttpConfigError> {
         let networks = match runtime.probe_policy() {
             Some(policy) => {
@@ -436,7 +437,10 @@ impl StaticBackendProducer {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             zone,
-            Some(ObserverHealthMetrics::new(Arc::clone(health_history))),
+            Some(
+                ObserverHealthMetrics::new(Arc::clone(health_history))
+                    .with_retirement(Arc::clone(retirement)),
+            ),
         ));
         let mut producer = Self {
             incarnation,
@@ -534,6 +538,7 @@ impl StaticProducers {
     /// one, create a new one, and fence/join a removed producer once no retained
     /// lease remains. Independent of whether the generation's cluster material
     /// is applied.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn reconcile(
         &mut self,
         snapshot: &ConfigNamespaceSnapshot,
@@ -542,6 +547,7 @@ impl StaticProducers {
         zone: &Arc<dyn ConfigNamespaceSource>,
         mode: Option<BackendSourceMode>,
         health_history: &Arc<BackendHealthHistory>,
+        retirement: &Arc<BackendRetirement>,
     ) {
         self.retire_unused().await;
         let activate = mode == Some(BackendSourceMode::Static);
@@ -575,6 +581,7 @@ impl StaticProducers {
                 self.registry.updates.clone(),
                 activate,
                 health_history,
+                retirement,
             ) {
                 self.registry.insert(name.to_owned(), producer.registered());
                 self.producers.insert(name.to_owned(), producer);

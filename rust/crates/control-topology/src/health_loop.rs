@@ -452,14 +452,37 @@ enum CadenceOutcome {
 /// even when no feed change ever arrives.
 /// Narrows a round's verdict to what the `b_status` edges are decided from.
 ///
-/// The gauge carries only the healthy bit, and the address is the label, so
-/// the rest of [`BackendHealth`] is deliberately dropped here rather than
-/// held by the observer between rounds.
-fn healthy_by_address(health: &HashMap<Arc<str>, BackendHealth>) -> BTreeMap<String, bool> {
-    health
-        .iter()
-        .map(|(address, health)| (address.to_string(), health.healthy))
-        .collect()
+/// The verdict is keyed by `backend_id`, which is the opaque merge identity
+/// `"<cluster_name>/<addr>"` and explicitly not a network address. Go labels
+/// `b_status` with the address, and the same address is what
+/// `ping_duration_seconds` and the retention purge use, so the id is
+/// resolved here rather than passed through. Using the id as the label would
+/// give the two families different label sets for one backend and leave a
+/// status-triggered purge unable to match the ping series it should delete.
+///
+/// The gauge carries only the healthy bit, so the rest of [`BackendHealth`]
+/// is dropped rather than held by the observer between rounds.
+///
+/// Two clusters may advertise the same address. Go cannot represent that --
+/// its verdict map is keyed by address -- so they collapse onto one series
+/// here, the last in the source's deterministic `(cluster_name, addr)` order
+/// winning, the same shared-address behaviour `b_conn` documents.
+fn healthy_by_address(
+    health: &HashMap<Arc<str>, BackendHealth>,
+    source: &RoutingSnapshot,
+) -> BTreeMap<String, bool> {
+    let mut by_address = BTreeMap::new();
+    for backend in &source.backends.backends {
+        let Some(verdict) = health.get(&backend.backend_id) else {
+            continue;
+        };
+        let address = backend.backend.addr.as_str();
+        if address.is_empty() {
+            continue;
+        }
+        by_address.insert(address.to_owned(), verdict.healthy);
+    }
+    by_address
 }
 
 async fn wait_change_or_owner(
@@ -650,15 +673,30 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                     // stale map — it either loses the lock race (publish rejected) or
                     // wins it after the publish (and synchronously revokes the feed
                     // gate, so the just-published overlay is immediately non-current).
-                    if let Some(gauges) = gauges.as_mut() {
-                        // Go `updateHealthResult`, which runs only when the
-                        // backend list was fetched: a round with no verdict
-                        // leaves every `b_status` child at its last value
-                        // rather than zeroing it.
-                        gauges.apply_round(&healthy_by_address(&map), Instant::now());
-                    }
+                    // Resolved before the critical section because it only
+                    // reads the verdict and the source; applying it is what
+                    // must wait for the qualification below.
+                    let by_address = healthy_by_address(&map, &source);
                     feed.publish_current(&generation, |feed_gate| {
                         if round_authoritative(&routing, &source, &owner) {
+                            // Inside the same qualification as the overlay
+                            // publish, not before it. A round that loses this
+                            // check is a round whose verdict is discarded, and
+                            // a discarded verdict must not have moved a gauge.
+                            //
+                            // Go `updateHealthResult` additionally returns
+                            // early on `result.err`, leaving every `b_status`
+                            // child at its last value. The Rust analogue of
+                            // that error is the source's own `observer_error`,
+                            // NOT the absence of a verdict: this loop still
+                            // produces a whole-map verdict over the retained
+                            // topology of a failed fetch, and applying it
+                            // would rewrite exactly what Go preserves.
+                            if let Some(gauges) = gauges.as_mut()
+                                && source.observer_error().is_none()
+                            {
+                                gauges.apply_round(&by_address, Instant::now());
+                            }
                             guard.publisher.publish_observation(
                                 &source,
                                 map,
@@ -842,6 +880,7 @@ mod tests {
     use crate::backend_health::BackendHealth;
     use crate::discovery_publish::EpochResult;
     use crate::health_feed::HealthGenerationFeeder;
+    use crate::health_history::ObserverHealthMetrics;
     use crate::health_overlay::ObserverError;
     use crate::merge::{MergedBackend, MergedTopology};
     use crate::model::BackendInfo;
@@ -1901,6 +1940,183 @@ mod tests {
     // ================================================================
     // B2: rotation fails closed FIRST, then aborts + drains, then starts.
     // ================================================================
+
+    // ================================================================
+    // The gauge wiring, exercised on a real round rather than a hand-built
+    // snapshot: both of these are label/gate questions a fixture with
+    // hand-written addresses cannot reach.
+    // ================================================================
+
+    /// The verdict map is keyed by `backend_id` -- the opaque
+    /// `"<cluster>/<addr>"` merge identity -- while Go labels `b_status`
+    /// with the address, which is also what `ping_duration_seconds` and the
+    /// retention purge use. Passing the id straight through would give one
+    /// backend two different label sets and leave a status-driven purge
+    /// unable to find its ping series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b_status_is_labelled_by_address_not_by_backend_id() {
+        let (_registry, lease) = owner_lease();
+        let owner = lease.token();
+        let (_publisher, routing, source) = published_backends(vec![merged_backend(7)]);
+        let backend_id = source.backends.backends[0].backend_id.to_string();
+        let address = source.backends.backends[0].backend.addr.clone();
+        assert_ne!(backend_id, address, "the fixture must distinguish the two");
+
+        let history = Arc::new(crate::health_history::BackendHealthHistory::new());
+        let (overlay, _overlay_handle) = HealthOverlayPublisher::new();
+        let (feeder, feed) = HealthGenerationFeeder::new();
+        feeder.set(generation(&source, true));
+        let task = tokio::spawn(run_health_loop(
+            feed,
+            routing.clone(),
+            overlay,
+            HealthPolicy::go_defaults(),
+            owner,
+            4,
+            always_healthy_probe(),
+            TestZone::none(),
+            Some(ObserverHealthMetrics::new(Arc::clone(&history))),
+        ));
+        wait_until("the first round writes b_status", || {
+            !history.snapshot().status.is_empty()
+        })
+        .await;
+        task.abort();
+
+        let status = history.snapshot().status;
+        assert!(
+            status.contains_key(&address),
+            "b_status must be labelled with the address; got {:?}",
+            status.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !status.contains_key(&backend_id),
+            "the opaque merge identity must never reach a metric label"
+        );
+    }
+
+    /// Go's `updateHealthResult` returns early when the backend list could
+    /// not be fetched, so `b_status` keeps its last values. The Rust signal
+    /// for that is the source's `observer_error`, not the absence of a
+    /// verdict: this loop still produces a whole-map verdict over the
+    /// retained topology of a failed fetch, and applying it would rewrite
+    /// exactly the values Go preserves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_backend_list_fetch_does_not_rewrite_b_status() {
+        let (_registry, lease) = owner_lease();
+        let owner = lease.token();
+        let (publisher, routing) = RoutingSnapshotPublisher::new();
+        publisher
+            .publish(EpochResult {
+                client_epoch: 1,
+                value: MergedTopology {
+                    backends: vec![merged_backend(3)],
+                },
+            })
+            .unwrap_or_else(|_| unreachable!("first publish"));
+        let healthy_source = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("a snapshot is published"));
+        let address = healthy_source.backends.backends[0].backend.addr.clone();
+
+        let history = Arc::new(crate::health_history::BackendHealthHistory::new());
+        let (overlay, _overlay_handle) = HealthOverlayPublisher::new();
+        let (feeder, feed) = HealthGenerationFeeder::new();
+        feeder.set(generation(&healthy_source, true));
+
+        // Healthy while the source is clean, unhealthy once its fetch has
+        // failed: without the gate the second round flips the gauge to zero,
+        // which is precisely what Go does not do.
+        let error_probes = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let error_probes = Arc::clone(&error_probes);
+            move |_generation: Arc<HealthGeneration>,
+                  source: Arc<RoutingSnapshot>,
+                  _routing: RoutingSnapshotHandle,
+                  _backend: MergedBackend,
+                  _policy: HealthPolicy| {
+                let failed = source.observer_error().is_some();
+                if failed {
+                    error_probes.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    BackendHealth {
+                        healthy: !failed,
+                        server_version: None,
+                        local: false,
+                        sql_dial: None,
+                    }
+                }) as std::pin::Pin<Box<dyn Future<Output = BackendHealth> + Send>>
+            }
+        };
+
+        let task = tokio::spawn(run_health_loop(
+            feed,
+            routing.clone(),
+            overlay,
+            HealthPolicy::new(Duration::from_millis(5), 0, Duration::from_secs(1))
+                .unwrap_or_else(|_| unreachable!("a valid policy")),
+            owner,
+            4,
+            probe,
+            TestZone::none(),
+            Some(ObserverHealthMetrics::new(Arc::clone(&history))),
+        ));
+        wait_until("the healthy round writes b_status", || {
+            history.snapshot().status.get(&address) == Some(&true)
+        })
+        .await;
+
+        publisher
+            // The epoch must match the live source: publish_error keeps
+            // that generation's backends and only attaches the error.
+            .publish_error(1, ObserverError::TopologyUnavailable)
+            .unwrap_or_else(|_| unreachable!("no generation overflow"));
+        let error_source = routing
+            .current()
+            .unwrap_or_else(|| unreachable!("the error source is current"));
+        assert!(error_source.observer_error().is_some());
+        feeder.set(generation(&error_source, true));
+
+        // Two probes on the failed source: the loop is sequential, so the
+        // first round's post-round processing has certainly run by the time
+        // the second round's probe starts.
+        wait_until("two rounds run against the failed source", || {
+            error_probes.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        task.abort();
+
+        assert_eq!(
+            history.snapshot().status.get(&address),
+            Some(&true),
+            "a failed backend-list fetch must leave b_status alone, not zero it"
+        );
+    }
+
+    /// A probe that reports every backend healthy without any I/O.
+    #[allow(clippy::type_complexity)]
+    fn always_healthy_probe() -> impl Fn(
+        Arc<HealthGeneration>,
+        Arc<RoutingSnapshot>,
+        RoutingSnapshotHandle,
+        MergedBackend,
+        HealthPolicy,
+    )
+        -> std::pin::Pin<Box<dyn Future<Output = BackendHealth> + Send>>
+    + Send
+    + Sync {
+        move |_generation, _source, _routing, _backend, _policy| {
+            Box::pin(async move {
+                BackendHealth {
+                    healthy: true,
+                    server_version: None,
+                    local: false,
+                    sql_dial: None,
+                }
+            })
+        }
+    }
 
     /// Polls a causal condition with a hang guard. The label names the exact
     /// wait in the failure so a timeout is attributable without inference.
