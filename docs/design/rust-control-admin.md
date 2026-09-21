@@ -410,8 +410,43 @@ certificate.
   (health, metrics owner, management) bound before the control peer wait,
   so a bind conflict still fails fast; shutdown marks the process closing
   first and keeps the management plane readable through the session drain,
-  sampler stop and final export. The Go-only Prometheus series (balance,
-  backend, monitor, maxprocs, owner, replay and the Go runtime collectors;
-  inventory in `tests/controlplane/cpadmin/go-series-probe`) are no longer
-  exposed by the composed pair; their disposition is a separate decision.
-  The profiling residual (`pprof`) stays open.
+  sampler stop and final export. The profiling residual (`pprof`) stays open.
+
+### Retired Go-only Prometheus series
+
+`tests/controlplane/cpadmin/go-series-probe` enumerates 35 metric families: 20
+are already served natively by Rust, and the 15 below were produced only by Go
+and therefore disappear from the exposition once Rust owns `/metrics`.
+
+| Group | Families |
+| --- | --- |
+| backend | `b_status`, `backend_metric`, `health_check_seconds`, `ping_duration_seconds` |
+| balance | `b_conn`, `b_score`, `migrate_total`, `migrate_duration_seconds`, `pending_migrate` |
+| monitor | `keep_alive_total`, `time_jump_back_total` |
+| replay | `pending_cmds`, `wait_time` |
+| server | `maxprocs`, `owner` |
+
+The Go runtime collectors (`go_*`, `process_*`) describe the Go process and go
+with them.
+
+**Decision: retire them here and reimplement the ones that still describe
+something real from Rust's own state in a later slice.** Go keeps no listener
+for them, and they are not carried over the control bridge: that path is the
+`MetricsBatch` body this slice retires, so reviving it would undo slice 5c.
+
+Scope of the later slice, 13 of the 15:
+
+- `backend`, `monitor` and `server` (8 families) still have live Go producers
+  behind them (the health-check loop, the process monitor, owner election), so
+  Rust reproduces the same observations from its own topology and process state.
+- `balance` (5 families) must be re-sourced rather than copied. The Go values
+  stopped describing real routing when Rust took ownership under capability 6:
+  no Go `RouterAdapter` is constructed, so its connection ledger is never fed.
+  The observables themselves remain meaningful and Rust holds the data — the
+  route ledger carries per-session `sessions`/`active`/`incoming`/`outgoing`
+  counts and the migration and redirect paths run in Rust.
+- `replay` (2 families) stays retired: traffic capture and replay are
+  unsupported in Rust mode, so the series has no producer on either side.
+
+Until that slice lands, these observations are absent; this document is their
+declaration, not an implementation.
