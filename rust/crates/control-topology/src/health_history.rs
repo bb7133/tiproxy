@@ -77,6 +77,16 @@ pub struct HealthMetricsSnapshot {
     /// `health_check_seconds`: one process-wide value, `None` before the
     /// first cycle completes.
     pub cycle_seconds: Option<f64>,
+    /// The highest dial sequence each retired address had reached.
+    ///
+    /// A retirement frees the series but must not free the *reason* to
+    /// reject a stale observation. Without this, a dial still in flight when
+    /// the purge ran would recreate the series with its old value on
+    /// arrival, which is the "deleted series must not be resurrected by an
+    /// old observation" rule read backwards. A genuinely new dial carries a
+    /// higher sequence and recreates the series normally, at which point the
+    /// watermark is redundant and dropped.
+    pub retired_above: BTreeMap<String, u64>,
     /// Addresses refused because a retained map was full.
     pub labels_dropped: u64,
 }
@@ -145,11 +155,25 @@ impl BackendHealthHistory {
             }
             return;
         }
+        // No series, but possibly a retired one. An observation that was
+        // already in flight when the purge ran must not recreate it with a
+        // stale value; only a dial newer than anything the address had
+        // reached may.
+        if state
+            .retired_above
+            .get(address)
+            .is_some_and(|watermark| sample.sequence <= *watermark)
+        {
+            return;
+        }
         if state.ping.len() >= MAX_RETAINED_BACKENDS {
             state.labels_dropped = state.labels_dropped.saturating_add(1);
             return;
         }
         state.ping.insert(address.to_owned(), sample);
+        // The series carries its own sequence again, so the watermark has
+        // nothing left to say.
+        state.retired_above.remove(address);
     }
 
     /// Sets `b_status` for one address, at Go's `updateBackendStatusMetrics`
@@ -189,7 +213,21 @@ impl BackendHealthHistory {
     pub fn forget_backend(&self, address: &str) {
         let mut state = self.lock();
         state.status.remove(address);
-        state.ping.remove(address);
+        let Some(retired) = state.ping.remove(address) else {
+            return;
+        };
+        // Keep the stale-rejection watermark the freed series was carrying,
+        // under its own bound so retiring many addresses cannot grow this
+        // without limit. Losing it only costs the guard against a
+        // pre-purge dial arriving late, and the loss is counted.
+        if state.retired_above.len() >= MAX_RETAINED_BACKENDS
+            && !state.retired_above.contains_key(address)
+        {
+            state.labels_dropped = state.labels_dropped.saturating_add(1);
+            return;
+        }
+        let watermark = state.retired_above.entry(address.to_owned()).or_default();
+        *watermark = (*watermark).max(retired.sequence);
     }
 
     /// A consistent copy of all three families.
@@ -633,6 +671,67 @@ mod tests {
         // refuse a dial.
         history.observe_dial("overflow:4000", &dial(0.1, 1), &|| true);
         assert!(history.snapshot().ping.contains_key("overflow:4000"));
+    }
+
+    /// `CodexM5`'s retirement-ordering case, replayed exactly: sequence 7 is
+    /// recorded, the address is retired, and the still-valid older sequence 3
+    /// is then handed over. Deleting the series also deletes the sequence
+    /// that rejects a stale sample, so without a watermark the old 9s value
+    /// recreates the series -- a deleted series resurrected by an
+    /// observation older than the delete.
+    #[tokio::test]
+    async fn a_pre_retirement_dial_arriving_late_does_not_resurrect_the_series() {
+        let history = BackendHealthHistory::new();
+        history.observe_dial("a:4000", &dial(0.5, 7), &|| true);
+        history.forget_backend("a:4000");
+        assert!(history.snapshot().ping.is_empty());
+
+        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
+        assert!(
+            history.snapshot().ping.is_empty(),
+            "an observation older than the retirement must not recreate the series"
+        );
+
+        // A genuinely new dial still does, and it clears the watermark it no
+        // longer needs.
+        history.observe_dial("a:4000", &dial(0.25, 8), &|| true);
+        assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.25);
+        assert!(history.snapshot().retired_above.is_empty());
+
+        // And the recreated series rejects the stale one on its own again.
+        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
+        assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.25);
+    }
+
+    /// The watermark frees the series' capacity but is itself bounded, and a
+    /// refusal is counted rather than silent.
+    #[tokio::test]
+    async fn retirement_watermarks_are_bounded_and_counted() {
+        let history = BackendHealthHistory::new();
+        for index in 0..MAX_RETAINED_BACKENDS {
+            history.observe_dial(&format!("a{index}:4000"), &dial(0.1, 1), &|| true);
+        }
+        assert_eq!(history.snapshot().ping.len(), MAX_RETAINED_BACKENDS);
+        for index in 0..MAX_RETAINED_BACKENDS {
+            history.forget_backend(&format!("a{index}:4000"));
+        }
+        let snapshot = history.snapshot();
+        assert!(
+            snapshot.ping.is_empty(),
+            "retirement frees the series capacity"
+        );
+        assert_eq!(snapshot.retired_above.len(), MAX_RETAINED_BACKENDS);
+        assert_eq!(snapshot.labels_dropped, 0);
+
+        // One more retired address has nowhere to record its watermark.
+        history.observe_dial("extra:4000", &dial(0.1, 2), &|| true);
+        history.forget_backend("extra:4000");
+        let snapshot = history.snapshot();
+        assert_eq!(snapshot.retired_above.len(), MAX_RETAINED_BACKENDS);
+        assert_eq!(
+            snapshot.labels_dropped, 1,
+            "losing a stale-rejection guard is shed, not silent"
+        );
     }
 
     /// Go's `DelBackend` is one call that deletes across every collector, so
