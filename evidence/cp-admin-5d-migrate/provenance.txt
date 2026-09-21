@@ -1,0 +1,5 @@
+binary sha256: 8aced987979e3d6c6e4e00808795e2831c6cf811660180bce5c43dbdbd7ae5f2
+binary mtime : 2026-09-21T15:30Z (rust/target/debug/tiproxy-rs)
+run dir      : tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855
+harness      : DATAPLANE_PORT_OFFSET=11300 DATAPLANE_T3_FOCUSED=1 run.sh --mode rust --variant plain
+capture      : curl 127.0.0.1:14380/metrics, 1s poll; in-flight 15:30:56Z, settled 15:31:07Z

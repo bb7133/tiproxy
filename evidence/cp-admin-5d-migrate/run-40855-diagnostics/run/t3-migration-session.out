@@ -1,0 +1,4 @@
+T3BASE|1818230810|15300|t3_local_migration|state-live
+T3COMMIT|3447717916|15301|t3_local_migration|state-live
+T3TRY1|3447717916|15301|t3_local_migration|state-live
+ERROR 2013 (HY000) at line 4: Lost connection to MySQL server during query

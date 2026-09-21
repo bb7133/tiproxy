@@ -1,0 +1,63 @@
+# Generated for the TiProxy dataplane integration topology. Do not use in production.
+
+workdir = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855/tiproxy-work"
+enable-traffic-replay = false
+
+[proxy]
+addr = "127.0.0.1:17300"
+# Two consecutive SQL listeners: listener A (17300) is bound
+# to cluster-a and listener B (17301) to cluster-b through
+# the TiDB `tiproxy-port` topology labels plus routing-rule = "port".
+port-range = [17300, 17301]
+pd-addrs = "127.0.0.1:13679"
+proxy-protocol = ""
+max-connections = 100
+conn-buffer-size = 32768
+graceful-wait-before-shutdown = 0
+graceful-close-conn-timeout = 5
+
+# Two REAL PD-backed clusters (DPL-07 #41 cluster dimension). The
+# explicit list overrides the legacy proxy.pd-addrs fallback.
+[[proxy.backend-clusters]]
+name = "cluster-a"
+pd-addrs = "127.0.0.1:13679"
+
+[[proxy.backend-clusters]]
+name = "cluster-b"
+pd-addrs = "127.0.0.1:13779"
+
+[balance]
+routing-rule = ""
+
+[api]
+addr = "127.0.0.1:14380"
+
+[log]
+level = "debug"
+encoder = "json"
+
+[log.log-file]
+filename = "/Users/bb7133/.slock/agents/76292569-a70f-475c-9229-ceff55c83416/tiproxy-5c/tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-40855/tiproxy.log"
+max-size = 50
+max-days = 1
+max-backups = 1
+
+[security]
+require-backend-tls = false
+
+[security.sql-tls]
+ca = ""
+cert = ""
+key = ""
+skip-ca = true
+min-tls-version = "1.2"
+
+[security.server-tls]
+ca = ""
+cert = ""
+key = ""
+min-tls-version = "1.2"
+
+[rust-dataplane]
+enabled = true
+control-socket = "/var/folders/01/53g4v3f51137mbqd82f4xf0c0000gp/T//tiproxy-dp-rust-plain-40855.sock"
