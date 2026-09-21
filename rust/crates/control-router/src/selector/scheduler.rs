@@ -30,6 +30,21 @@ pub(crate) fn stopped(stop: &watch::Receiver<bool>) -> bool {
     *stop.borrow() || stop.has_changed().is_err()
 }
 impl Router {
+    /// This router's authoritative migration state, copied out under its own
+    /// lock and returned with that lock released. The caller must not hold a
+    /// metrics-registry lock while calling: the settlement path runs router
+    /// lock then registry, and inverting that here would deadlock against it.
+    #[must_use]
+    pub fn migration_totals(&self) -> BTreeMap<crate::MigrationLabels, crate::MigrationTotals> {
+        self.lock().ledger.migration_totals().clone()
+    }
+
+    /// Label sets this router refused because its retained map was full.
+    #[must_use]
+    pub fn migration_labels_dropped(&self) -> u64 {
+        self.lock().ledger.migration_labels_dropped()
+    }
+
     pub(crate) fn observe_close(&self, close: &crate::ForceClose) -> crate::Settlement {
         // A force-close terminal settles any redirect still pending on that
         // session, so it has to publish like every other terminal path.

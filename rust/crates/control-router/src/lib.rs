@@ -36,7 +36,9 @@ pub use ledger::{
     Accounting, ForceClose, Redirect, Reservation, RouteLedgerEvidence, Session, Settlement,
 };
 pub use namespace::{ResolvedNamespace, RouteCandidateValidator, UserNamespaceResolver};
-pub use plane::{RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle};
+pub use plane::{
+    MigrationSnapshot, RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle,
+};
 
 /// Outcome of one management redirect sweep (Go `RedirectConnections`):
 /// counts only, no authority.
@@ -58,7 +60,7 @@ impl RedirectAllSummary {
         self.accepted += other.accepted;
     }
 }
-pub use ledger::{MigrationObservation, MigrationOutcome};
+pub use ledger::{MigrationLabels, MigrationObservation, MigrationOutcome, MigrationTotals};
 pub use retry::Selector;
 pub use selector::{MigrationSink, Router};
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};

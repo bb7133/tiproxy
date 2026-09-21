@@ -130,6 +130,61 @@ impl RouteLedgerDiagnostics {
         }
         evidence
     }
+
+    /// The migration state of every router this plane has created, summed per
+    /// label set.
+    ///
+    /// Enumerating the plane's current routing table would be wrong: a router
+    /// retired by configuration can still own sessions with unsettled
+    /// migrations, and those are still pending. A weak reference is the right
+    /// test — an incarnation contributes for exactly as long as something
+    /// still holds it, and drops out only once nothing does.
+    ///
+    /// Summing matters as much as enumerating. Several namespaces, or a
+    /// retained incarnation beside its successor, can migrate between the same
+    /// backends for the same reason; they share one label set and must add up
+    /// rather than overwrite one another.
+    fn migration_snapshot(&self) -> MigrationSnapshot {
+        // Same discipline as `snapshot`: upgrade and prune under the weak-list
+        // lock alone, then take router locks one at a time, and never while a
+        // metrics-registry lock is held.
+        let routers = {
+            let mut registered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut live = Vec::with_capacity(registered.len());
+            registered.retain(|weak| {
+                if let Some(router) = weak.upgrade() {
+                    live.push(router);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        let mut snapshot = MigrationSnapshot::default();
+        for router in routers {
+            for (labels, totals) in router.migration_totals() {
+                let entry = snapshot.totals.entry(labels).or_default();
+                entry.pending = entry.pending.saturating_add(totals.pending);
+                entry.succeeded = entry.succeeded.saturating_add(totals.succeeded);
+                entry.failed = entry.failed.saturating_add(totals.failed);
+                entry.elapsed_nanos = entry.elapsed_nanos.saturating_add(totals.elapsed_nanos);
+            }
+            snapshot.labels_dropped = snapshot
+                .labels_dropped
+                .saturating_add(router.migration_labels_dropped());
+        }
+        snapshot
+    }
+}
+
+/// Migration state summed over every router incarnation still held anywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationSnapshot {
+    /// Totals per label set, including sets whose pending count is zero.
+    pub totals: BTreeMap<crate::MigrationLabels, crate::MigrationTotals>,
+    /// Label sets refused across all routers because a retained map was full.
+    pub labels_dropped: u64,
 }
 
 /// A newly admitted connection bound to one exact router incarnation.
@@ -340,6 +395,16 @@ impl RoutePlaneHandle {
     #[must_use]
     pub fn route_ledger_evidence(&self) -> RouteLedgerEvidence {
         self.ledger_diagnostics.snapshot()
+    }
+
+    /// Migration state summed across current and retained router
+    /// incarnations, for the exposition to read at scrape time.
+    ///
+    /// Must be called with no metrics-registry lock held; it takes router
+    /// locks, and the settlement path already runs router lock then registry.
+    #[must_use]
+    pub fn migration_snapshot(&self) -> MigrationSnapshot {
+        self.ledger_diagnostics.migration_snapshot()
     }
 
     /// Go `namespaceManager.RedirectConnections`: every current router offers
