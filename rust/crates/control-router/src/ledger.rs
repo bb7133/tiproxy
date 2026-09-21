@@ -23,10 +23,9 @@ use control_routing::RouteAssignment;
 #[cfg(test)]
 use crate::factors::Factor;
 use crate::factors::RedirectReason;
-use crate::migration_history::MAX_RETAINED_LABEL_SETS;
 use crate::migration_history::MigrationHistory;
 #[cfg(test)]
-use crate::migration_history::{DurationKey, TerminalKey};
+use crate::migration_history::{DurationKey, MAX_RETAINED_LABEL_SETS, TerminalKey};
 
 /// Live connection accounting for one backend owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -451,14 +450,15 @@ impl Ledger {
     /// Notes an accepted migration: in flight here, and its label set
     /// remembered process-wide so the series keeps reporting zero later.
     fn issue_migration(&mut self, labels: &MigrationLabels) {
-        self.history
-            .remember(&labels.from, &labels.to, labels.reason);
-        // Bounded like the history, and for the same reason: this map is
-        // label-keyed, so it is the second place cardinality could grow
-        // without limit. A refusal costs the series, never the migration --
-        // the redirect proceeds either way.
-        if !self.pending_migrations.contains_key(labels)
-            && self.pending_migrations.len() >= MAX_RETAINED_LABEL_SETS
+        // One admission decision governs both halves of the metric. Tracking
+        // pending under a separate per-ledger ceiling would let this ledger
+        // fill up with sets the history never retained, and then refuse a set
+        // the history did retain -- losing the real pending count of a series
+        // still being exposed. A refusal costs the series, never the
+        // migration: the redirect proceeds either way.
+        if !self
+            .history
+            .remember(&labels.from, &labels.to, labels.reason)
         {
             return;
         }

@@ -1997,3 +1997,108 @@ async fn migration_history_survives_every_incarnation_being_dropped() -> TestRes
     );
     Ok(())
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_pull_history_survives_zero_live_routers() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let admission = must(handle.admit(""));
+    admission.test_router().review_seed_settled_migrations(0, 1);
+    assert_eq!(
+        handle
+            .migration_snapshot()
+            .history
+            .terminals
+            .values()
+            .sum::<u64>(),
+        1
+    );
+    drop(admission);
+    let current = harness.source.store.current();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        Vec::new(),
+        SourceRevision {
+            file_revision: 3,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.route_ledger_evidence().router_incarnations != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let after = handle.migration_snapshot();
+    plane_task.abort();
+    let _ = plane_task.await;
+    assert_eq!(
+        after.history.terminals.values().sum::<u64>(),
+        1,
+        "the actual scrape source must retain cumulative terminals with zero live routers"
+    );
+    assert_eq!(
+        after
+            .history
+            .durations
+            .values()
+            .map(|v| v.count)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(after.history.known_pending.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_pull_pending_union_is_globally_bounded() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let first = must(handle.admit(""));
+    first
+        .test_router()
+        .review_seed_settled_migrations(0, crate::MAX_RETAINED_LABEL_SETS);
+    retire_namespace(&harness, 3)?;
+    let second = must(
+        handle
+            .admit_within("replacement", Duration::from_secs(5))
+            .await,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    second
+        .test_router()
+        .review_seed_settled_migrations(crate::MAX_RETAINED_LABEL_SETS, 1);
+    assert_eq!(handle.route_ledger_evidence().router_incarnations, 2);
+    let state = handle.migration_snapshot();
+    let entries = state.pending.len();
+    assert_eq!(
+        state.history.known_pending.len(),
+        crate::MAX_RETAINED_LABEL_SETS
+    );
+    assert!(state.history.labels_dropped > 0);
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    assert!(
+        entries <= crate::MAX_RETAINED_LABEL_SETS,
+        "actual pull-side aggregate has {entries} entries, beyond global {} bound",
+        crate::MAX_RETAINED_LABEL_SETS
+    );
+    Ok(())
+}

@@ -114,18 +114,26 @@ pub struct MigrationHistory {
 
 impl MigrationHistory {
     /// Notes that a label set exists, so its pending series keeps reporting
-    /// zero after the migration ends.
-    pub fn remember(&self, from: &str, to: &str, reason: RedirectReason) {
+    /// zero after the migration ends. Returns whether the label set is
+    /// retained.
+    ///
+    /// This is the single admission decision for the whole metric: a caller
+    /// that tracks per-label state must track exactly the sets this accepts.
+    /// Two independent ceilings would each keep their own arbitrary first
+    /// 4096, and a label retained here could then be refused there, losing a
+    /// real pending count for a series that is still being exposed.
+    pub fn remember(&self, from: &str, to: &str, reason: RedirectReason) -> bool {
         let mut state = self.lock();
         let key = (from.to_owned(), to.to_owned(), reason);
         if state.known_pending.contains(&key) {
-            return;
+            return true;
         }
         if state.known_pending.len() >= MAX_RETAINED_LABEL_SETS {
             state.labels_dropped = state.labels_dropped.saturating_add(1);
-            return;
+            return false;
         }
         state.known_pending.insert(key);
+        true
     }
 
     /// Records one settled migration. Called exactly once per `Applied`

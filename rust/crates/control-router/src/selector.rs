@@ -1480,3 +1480,48 @@ mod tests {
 #[cfg(test)]
 #[path = "composition_tests.rs"]
 mod composition_tests;
+
+// Independent review fixture: use the real ledger transitions, never inject maps.
+#[cfg(test)]
+impl Router {
+    pub(crate) fn review_seed_settled_migrations(&self, start: usize, count: usize) {
+        let mut state = self.lock();
+        let ledger = &mut state.ledger;
+        let a = ledger
+            .add_account()
+            .unwrap_or_else(|_| unreachable!("fixture account"));
+        let b = ledger
+            .add_account()
+            .unwrap_or_else(|_| unreachable!("fixture account"));
+        for index in start..start + count {
+            let session = ledger
+                .open()
+                .unwrap_or_else(|_| unreachable!("fixture session"));
+            let source = RouteAssignment {
+                backend_id: "review-from".into(),
+                backend_address: format!("10.0.0.1:{index}"),
+                ..RouteAssignment::default()
+            };
+            let target = RouteAssignment {
+                backend_id: "review-to".into(),
+                backend_address: "10.0.0.2:4000".into(),
+                ..RouteAssignment::default()
+            };
+            let reservation = ledger
+                .reserve(&session, &a, source)
+                .unwrap_or_else(|_| unreachable!("fixture reservation"));
+            assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+            let now = Instant::now();
+            let redirect = ledger
+                .prepare_redirect(&session, &b, target, now, RedirectReason::Test)
+                .unwrap_or_else(|_| unreachable!("fixture redirect"));
+            ledger.admit_redirect(redirect.clone(), true, now);
+            assert_eq!(
+                ledger.finish_redirect(&redirect, true, now),
+                Settlement::Applied
+            );
+            assert_eq!(ledger.close(&session, now), Settlement::Applied);
+            drop(ledger.drain_migrations());
+        }
+    }
+}

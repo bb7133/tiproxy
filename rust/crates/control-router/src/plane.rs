@@ -176,17 +176,12 @@ impl RouteLedgerDiagnostics {
             pending: BTreeMap::new(),
         };
         for router in routers {
+            // No ceiling of its own on purpose. Every ledger only tracks
+            // label sets the shared history retained, so this union is a
+            // subset of that set and is bounded by it. A second independent
+            // ceiling here would be free to keep a different arbitrary 4096
+            // and drop a set the history is still exposing.
             for (labels, pending) in router.pending_migrations() {
-                // Each ledger bounds its own map, but N of them summed is N
-                // times that bound, so the aggregate needs its own ceiling.
-                // Refusing a label set here costs only the series.
-                if !snapshot.pending.contains_key(&labels)
-                    && snapshot.pending.len() >= crate::MAX_RETAINED_LABEL_SETS
-                {
-                    snapshot.history.labels_dropped =
-                        snapshot.history.labels_dropped.saturating_add(1);
-                    continue;
-                }
                 let entry = snapshot.pending.entry(labels).or_default();
                 *entry = entry.saturating_add(pending);
             }

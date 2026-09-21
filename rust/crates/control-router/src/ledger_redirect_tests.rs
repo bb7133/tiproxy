@@ -765,3 +765,54 @@ fn retained_history_is_bounded_without_refusing_migrations() {
     assert_eq!(snapshot.known_pending.len(), MAX_RETAINED_LABEL_SETS);
     assert_eq!(snapshot.labels_dropped, 16);
 }
+
+#[test]
+fn review_retained_label_remains_counted_after_unretained_churn() {
+    fn issue(ledger: &mut Ledger, index: usize, settled: bool) -> MigrationLabels {
+        let a = must(ledger.add_account());
+        let b = must(ledger.add_account());
+        let session = must(ledger.open());
+        let from = format!("10.0.0.1:{index}");
+        let reservation = must(ledger.reserve(&session, &a, addressed("a", &from)));
+        assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+        let now = Instant::now();
+        let op = must(ledger.prepare_redirect(
+            &session,
+            &b,
+            addressed("b", "10.0.0.2:4000"),
+            now,
+            RedirectReason::Test,
+        ));
+        ledger.admit_redirect(op.clone(), true, now);
+        if settled {
+            assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Applied);
+            assert_eq!(ledger.close(&session, now), Settlement::Applied);
+        }
+        drop(ledger.drain_migrations());
+        MigrationLabels {
+            from,
+            to: "10.0.0.2:4000".to_owned(),
+            reason: RedirectReason::Test,
+        }
+    }
+    let history = Arc::new(MigrationHistory::default());
+    let mut old = Ledger::with_history(8, Arc::clone(&history));
+    for index in 0..MAX_RETAINED_LABEL_SETS {
+        issue(&mut old, index, true);
+    }
+    let mut new = Ledger::with_history(8, Arc::clone(&history));
+    for index in MAX_RETAINED_LABEL_SETS..MAX_RETAINED_LABEL_SETS * 2 {
+        issue(&mut new, index, true);
+    }
+    let retained = issue(&mut new, 0, false);
+    assert!(history.snapshot().known_pending.contains(&(
+        retained.from.clone(),
+        retained.to.clone(),
+        retained.reason,
+    )));
+    assert_eq!(
+        new.pending_migrations().get(&retained).copied(),
+        Some(1),
+        "unretained churn must not suppress a real pending migration for a globally retained label"
+    );
+}

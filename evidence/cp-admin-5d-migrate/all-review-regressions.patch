@@ -1,0 +1,160 @@
+diff --git a/rust/crates/control-router/src/ledger_redirect_tests.rs b/rust/crates/control-router/src/ledger_redirect_tests.rs
+index 2a9f958c..97707575 100644
+--- a/rust/crates/control-router/src/ledger_redirect_tests.rs
++++ b/rust/crates/control-router/src/ledger_redirect_tests.rs
+@@ -765,3 +765,42 @@ fn retained_history_is_bounded_without_refusing_migrations() {
+     assert_eq!(snapshot.known_pending.len(), MAX_RETAINED_LABEL_SETS);
+     assert_eq!(snapshot.labels_dropped, 16);
+ }
++
++
++#[test]
++fn review_retained_label_remains_counted_after_unretained_churn() {
++    fn issue(ledger: &mut Ledger, index: usize, settled: bool) -> MigrationLabels {
++        let a = must(ledger.add_account());
++        let b = must(ledger.add_account());
++        let session = must(ledger.open());
++        let from = format!("10.0.0.1:{index}");
++        let reservation = must(ledger.reserve(&session, &a, addressed("a", &from)));
++        assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
++        let now = Instant::now();
++        let op = must(ledger.prepare_redirect(
++            &session, &b, addressed("b", "10.0.0.2:4000"), now, RedirectReason::Test,
++        ));
++        ledger.admit_redirect(op.clone(), true, now);
++        if settled {
++            assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Applied);
++            assert_eq!(ledger.close(&session, now), Settlement::Applied);
++        }
++        drop(ledger.drain_migrations());
++        MigrationLabels { from, to: "10.0.0.2:4000".to_owned(), reason: RedirectReason::Test }
++    }
++    let history = Arc::new(MigrationHistory::default());
++    let mut old = Ledger::with_history(8, Arc::clone(&history));
++    for index in 0..MAX_RETAINED_LABEL_SETS {
++        issue(&mut old, index, true);
++    }
++    let mut new = Ledger::with_history(8, Arc::clone(&history));
++    for index in MAX_RETAINED_LABEL_SETS..MAX_RETAINED_LABEL_SETS * 2 {
++        issue(&mut new, index, true);
++    }
++    let retained = issue(&mut new, 0, false);
++    assert!(history.snapshot().known_pending.contains(&(
++        retained.from.clone(), retained.to.clone(), retained.reason,
++    )));
++    assert_eq!(new.pending_migrations().get(&retained).copied(), Some(1),
++        "unretained churn must not suppress a real pending migration for a globally retained label");
++}
+diff --git a/rust/crates/control-router/src/selector.rs b/rust/crates/control-router/src/selector.rs
+index 9396877a..a83200a1 100644
+--- a/rust/crates/control-router/src/selector.rs
++++ b/rust/crates/control-router/src/selector.rs
+@@ -1480,3 +1480,37 @@ mod tests {
+ #[cfg(test)]
+ #[path = "composition_tests.rs"]
+ mod composition_tests;
++
++// Independent review fixture: use the real ledger transitions, never inject maps.
++#[cfg(test)]
++impl Router {
++    pub(crate) fn review_seed_settled_migrations(&self, start: usize, count: usize) {
++        let mut state = self.lock();
++        let ledger = &mut state.ledger;
++        let a = ledger.add_account().unwrap();
++        let b = ledger.add_account().unwrap();
++        for index in start..start + count {
++            let session = ledger.open().unwrap();
++            let source = RouteAssignment {
++                backend_id: "review-from".into(),
++                backend_address: format!("10.0.0.1:{index}"),
++                ..RouteAssignment::default()
++            };
++            let target = RouteAssignment {
++                backend_id: "review-to".into(),
++                backend_address: "10.0.0.2:4000".into(),
++                ..RouteAssignment::default()
++            };
++            let reservation = ledger.reserve(&session, &a, source).unwrap();
++            assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
++            let now = Instant::now();
++            let redirect = ledger.prepare_redirect(
++                &session, &b, target, now, RedirectReason::Test,
++            ).unwrap();
++            ledger.admit_redirect(redirect.clone(), true, now);
++            assert_eq!(ledger.finish_redirect(&redirect, true, now), Settlement::Applied);
++            assert_eq!(ledger.close(&session, now), Settlement::Applied);
++            drop(ledger.drain_migrations());
++        }
++    }
++}
+diff --git a/rust/crates/control-router/src/tests.rs b/rust/crates/control-router/src/tests.rs
+index 4700e95d..c438c243 100644
+--- a/rust/crates/control-router/src/tests.rs
++++ b/rust/crates/control-router/src/tests.rs
+@@ -1997,3 +1997,66 @@ async fn migration_history_survives_every_incarnation_being_dropped() -> TestRes
+     );
+     Ok(())
+ }
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn review_pull_history_survives_zero_live_routers() -> TestResult {
++    let harness = Harness::new("", "connection").await?;
++    let (plane, mut handle) = RoutePlane::new(
++        Arc::new(harness.source.clone()), harness.topology.clone(), None,
++    );
++    let context = harness.runtime.handle().module_context();
++    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
++    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
++    let admission = must(handle.admit(""));
++    admission.test_router().review_seed_settled_migrations(0, 1);
++    assert_eq!(handle.migration_snapshot().history.terminals.values().sum::<u64>(), 1);
++    drop(admission);
++    let current = harness.source.store.current();
++    harness.source.store.apply(
++        (**current.effective()).clone(), Vec::new(),
++        SourceRevision { file_revision: 3, etcd_revision: 0 }, Path::new("/tmp"),
++    )?;
++    harness.source.deliver();
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while handle.route_ledger_evidence().router_incarnations != 0 {
++            tokio::task::yield_now().await;
++        }
++    }).await?;
++    let after = handle.migration_snapshot();
++    plane_task.abort();
++    let _ = plane_task.await;
++    assert_eq!(after.history.terminals.values().sum::<u64>(), 1,
++        "the actual scrape source must retain cumulative terminals with zero live routers");
++    assert_eq!(after.history.durations.values().map(|v| v.count).sum::<u64>(), 1);
++    assert_eq!(after.history.known_pending.len(), 1);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn review_pull_pending_union_is_globally_bounded() -> TestResult {
++    let harness = Harness::new("", "connection").await?;
++    let (plane, mut handle) = RoutePlane::new(
++        Arc::new(harness.source.clone()), harness.topology.clone(), None,
++    );
++    let context = harness.runtime.handle().module_context();
++    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
++    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
++    let first = must(handle.admit(""));
++    first.test_router().review_seed_settled_migrations(0, crate::MAX_RETAINED_LABEL_SETS);
++    retire_namespace(&harness, 3)?;
++    let second = must(handle.admit_within("replacement", Duration::from_secs(5)).await);
++    assert!(!first.same_router_incarnation(&second));
++    second.test_router().review_seed_settled_migrations(crate::MAX_RETAINED_LABEL_SETS, 1);
++    assert_eq!(handle.route_ledger_evidence().router_incarnations, 2);
++    let state = handle.migration_snapshot();
++    let entries = state.pending.len();
++    assert_eq!(state.history.known_pending.len(), crate::MAX_RETAINED_LABEL_SETS);
++    assert!(state.history.labels_dropped > 0);
++    drop(first);
++    drop(second);
++    plane_task.abort();
++    let _ = plane_task.await;
++    assert!(entries <= crate::MAX_RETAINED_LABEL_SETS,
++        "actual pull-side aggregate has {entries} entries, beyond global {} bound", crate::MAX_RETAINED_LABEL_SETS);
++    Ok(())
++}
