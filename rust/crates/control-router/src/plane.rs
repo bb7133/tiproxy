@@ -162,29 +162,35 @@ impl RouteLedgerDiagnostics {
             live
         };
         let mut snapshot = MigrationSnapshot::default();
+        // Cumulative history is process-level and identical for every router,
+        // so it is read once rather than summed; only the in-flight counts are
+        // per-incarnation and have to be added up.
+        let mut history = None;
         for router in routers {
-            for (labels, totals) in router.migration_totals() {
-                let entry = snapshot.totals.entry(labels).or_default();
-                entry.pending = entry.pending.saturating_add(totals.pending);
-                entry.succeeded = entry.succeeded.saturating_add(totals.succeeded);
-                entry.failed = entry.failed.saturating_add(totals.failed);
-                entry.elapsed_nanos = entry.elapsed_nanos.saturating_add(totals.elapsed_nanos);
+            for (labels, pending) in router.pending_migrations() {
+                let entry = snapshot.pending.entry(labels).or_default();
+                *entry = entry.saturating_add(pending);
             }
-            snapshot.labels_dropped = snapshot
-                .labels_dropped
-                .saturating_add(router.migration_labels_dropped());
+            if history.is_none() {
+                history = Some(router.migration_history());
+            }
+        }
+        if let Some(history) = history {
+            snapshot.history = history.snapshot();
         }
         snapshot
     }
 }
 
-/// Migration state summed over every router incarnation still held anywhere.
+/// Migration state for the exposition: in-flight counts summed over every
+/// router incarnation still held anywhere, plus the process-level cumulative
+/// history that outlives all of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationSnapshot {
-    /// Totals per label set, including sets whose pending count is zero.
-    pub totals: BTreeMap<crate::MigrationLabels, crate::MigrationTotals>,
-    /// Label sets refused across all routers because a retained map was full.
-    pub labels_dropped: u64,
+    /// In-flight migrations per label set, summed across incarnations.
+    pub pending: BTreeMap<crate::MigrationLabels, u64>,
+    /// Cumulative terminals and durations, plus every label set ever seen.
+    pub history: crate::MigrationHistorySnapshot,
 }
 
 /// A newly admitted connection bound to one exact router incarnation.
@@ -459,6 +465,9 @@ pub struct RoutePlane {
     /// created later, so a migration cannot go unpublished because its router
     /// was built after the exporter started.
     migrations: Option<Arc<dyn crate::selector::MigrationSink>>,
+    /// Cumulative migration history shared by every router this plane builds,
+    /// so a destroyed incarnation cannot take its history with it.
+    migration_history: Arc<crate::MigrationHistory>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -482,6 +491,7 @@ impl RoutePlane {
         let registry = Arc::new(Mutex::new(RegistryState::default()));
         let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
         let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics::default());
+        let migration_history = Arc::new(crate::MigrationHistory::default());
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {
@@ -493,6 +503,7 @@ impl RoutePlane {
                 registry: Arc::clone(&registry),
                 input_diagnostics: Arc::clone(&input_diagnostics),
                 migrations: None,
+                migration_history: Arc::clone(&migration_history),
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
@@ -550,7 +561,10 @@ impl RoutePlane {
                 &resolved,
                 max_sessions,
                 self.metrics.clone(),
-                Arc::clone(&self.input_diagnostics),
+                crate::selector::RouterShared {
+                    input_diagnostics: Arc::clone(&self.input_diagnostics),
+                    history: Arc::clone(&self.migration_history),
+                },
             )?);
             if let Some(sink) = self.migrations.clone() {
                 router.set_migration_sink(sink);

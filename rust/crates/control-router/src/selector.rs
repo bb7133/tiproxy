@@ -166,6 +166,14 @@ pub trait MigrationSink: Send + Sync {
     fn record(&self, observation: MigrationObservation);
 }
 
+/// Handles every router incarnation shares with the plane that built it.
+pub struct RouterShared {
+    /// Diagnostic counters proving live inputs were consumed.
+    pub input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
+    /// Cumulative migration history, which outlives any one incarnation.
+    pub history: Arc<crate::MigrationHistory>,
+}
+
 impl Router {
     /// Installs the sink that receives migration observations.
     pub fn set_migration_sink(&self, sink: Arc<dyn MigrationSink>) {
@@ -248,7 +256,7 @@ impl Router {
         resolved: &crate::ResolvedNamespace,
         max_sessions: usize,
         metrics: Option<control_topology::MetricOverlayHandle>,
-        input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
+        shared: RouterShared,
     ) -> Result<Self, RouteError> {
         Ok(Self {
             #[cfg(test)]
@@ -256,7 +264,7 @@ impl Router {
             migrations: Mutex::new(None),
             factors_enabled: true,
             metrics,
-            input_diagnostics: Some(input_diagnostics),
+            input_diagnostics: Some(shared.input_diagnostics),
             sources: Sources::new_retained(source, topology, context, resolved)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
@@ -267,7 +275,7 @@ impl Router {
             #[cfg(test)]
             next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
-                ledger: Ledger::new(max_sessions),
+                ledger: Ledger::with_history(max_sessions, shared.history),
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),

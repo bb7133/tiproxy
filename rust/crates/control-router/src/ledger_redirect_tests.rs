@@ -634,10 +634,11 @@ fn worker_close_tokens_reject_foreign_sequence_and_exhaustion() {
 
 /// The authoritative state must not depend on anyone consuming the
 /// notifications. Every observation is drained and thrown away here, exactly
-/// as a full queue would drop it, and the totals still describe reality.
+/// as a full queue would drop it, and the state still describes reality.
 #[test]
-fn migration_totals_survive_every_notification_being_dropped() {
+fn migration_state_survives_every_notification_being_dropped() {
     let mut ledger = Ledger::new(8);
+    let history = Arc::clone(ledger.history());
     let a = must(ledger.add_account());
     let b = must(ledger.add_account());
     let session = must(ledger.open());
@@ -661,7 +662,7 @@ fn migration_totals_survive_every_notification_being_dropped() {
         reason: RedirectReason::Balance(Factor::Cpu),
     };
     assert_eq!(
-        ledger.migration_totals().get(&labels).map(|t| t.pending),
+        ledger.pending_migrations().get(&labels).copied(),
         Some(1),
         "state is authoritative even though nothing consumed the event"
     );
@@ -672,61 +673,88 @@ fn migration_totals_survive_every_notification_being_dropped() {
     );
     drop(ledger.drain_migrations()); // the settlement notification is lost too
 
-    let totals = *ledger
-        .migration_totals()
-        .get(&labels)
-        .unwrap_or_else(|| unreachable!("label set retained"));
     // This is the case that permanently corrupted the delta-based gauge: the
     // terminal is gone and no future event will arrive, yet a reader still
     // sees a finished migration.
-    assert_eq!(totals.pending, 0);
-    assert_eq!(totals.succeeded, 1);
-    assert_eq!(totals.failed, 0);
-    assert_eq!(totals.elapsed_nanos, Duration::from_millis(80).as_nanos());
+    assert_eq!(ledger.pending_migrations().get(&labels).copied(), Some(0));
+    let snapshot = history.snapshot();
+    assert_eq!(
+        snapshot
+            .terminals
+            .get(&TerminalKey {
+                from: "10.0.0.1:4000".to_owned(),
+                to: "10.0.0.2:4000".to_owned(),
+                reason: RedirectReason::Balance(Factor::Cpu),
+                succeeded: true,
+            })
+            .copied(),
+        Some(1)
+    );
+    let duration = snapshot
+        .durations
+        .get(&DurationKey {
+            from: "10.0.0.1:4000".to_owned(),
+            to: "10.0.0.2:4000".to_owned(),
+            succeeded: true,
+        })
+        .unwrap_or_else(|| unreachable!("duration series recorded"));
+    assert_eq!(duration.count, 1);
+    assert_eq!(duration.sum_nanos, Duration::from_millis(80).as_nanos());
+    // 80ms falls in every bucket at or above 0.1024s and none below it.
+    let above: usize = duration.buckets.iter().filter(|count| **count == 1).count();
+    assert!(above > 0 && above < duration.buckets.len());
 }
 
-/// A label set that has returned to zero stays retained, because Go keeps a
-/// child registered once created and a scrape has to keep seeing the zero.
+/// Cumulative history must outlive the router that produced it: a counter
+/// that falls back to zero when an incarnation is destroyed is a false reset.
 #[test]
-fn a_settled_label_set_is_retained_at_zero() {
-    let mut ledger = Ledger::new(8);
-    let a = must(ledger.add_account());
-    let b = must(ledger.add_account());
-    let session = must(ledger.open());
-    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
-    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
-    let now = Instant::now();
-    let op = must(ledger.prepare_redirect(
-        &session,
-        &b,
-        addressed("b", "10.0.0.2:4000"),
-        now,
-        RedirectReason::Test,
-    ));
-    ledger.admit_redirect(op.clone(), true, now);
-    assert_eq!(ledger.finish_redirect(&op, false, now), Settlement::Applied);
+fn cumulative_history_outlives_the_ledger_that_recorded_it() {
+    let history = Arc::new(MigrationHistory::default());
+    {
+        let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+        let a = must(ledger.add_account());
+        let b = must(ledger.add_account());
+        let session = must(ledger.open());
+        let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+        assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+        let now = Instant::now();
+        let op = must(ledger.prepare_redirect(
+            &session,
+            &b,
+            addressed("b", "10.0.0.2:4000"),
+            now,
+            RedirectReason::Test,
+        ));
+        ledger.admit_redirect(op.clone(), true, now);
+        assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Applied);
+        assert_eq!(history.snapshot().terminals.values().sum::<u64>(), 1);
+    }
+    // The ledger is gone, as it would be when a router incarnation is dropped.
     assert_eq!(
-        ledger.migration_totals().len(),
+        history.snapshot().terminals.values().sum::<u64>(),
         1,
-        "the series must not vanish when it returns to zero"
+        "destroying the router must not roll the cumulative series backwards"
+    );
+    assert_eq!(
+        history.snapshot().known_pending.len(),
+        1,
+        "nor lose the label set, which would make the series disappear"
     );
 }
 
-/// The retained map is bounded against itself, which is the defect that made
-/// the previous bound useless: it consulted a different table.
+/// The retained history is bounded against itself, and a full map must never
+/// refuse the migration itself -- only its retention.
 #[test]
-fn retained_migration_label_sets_are_bounded() {
-    let mut ledger = Ledger::new(4);
-    for index in 0..(MAX_MIGRATION_LABEL_SETS + 16) {
-        ledger.record_migration(
-            MigrationLabels {
-                from: format!("10.0.0.1:{index}"),
-                to: "10.0.0.2:4000".to_owned(),
-                reason: RedirectReason::Test,
-            },
-            |totals| totals.pending = totals.pending.saturating_add(1),
+fn retained_history_is_bounded_without_refusing_migrations() {
+    let history = MigrationHistory::default();
+    for index in 0..(MAX_RETAINED_LABEL_SETS + 16) {
+        history.remember(
+            &format!("10.0.0.1:{index}"),
+            "10.0.0.2:4000",
+            RedirectReason::Test,
         );
     }
-    assert_eq!(ledger.migration_totals().len(), MAX_MIGRATION_LABEL_SETS);
-    assert_eq!(ledger.migration_labels_dropped(), 16);
+    let snapshot = history.snapshot();
+    assert_eq!(snapshot.known_pending.len(), MAX_RETAINED_LABEL_SETS);
+    assert_eq!(snapshot.labels_dropped, 16);
 }

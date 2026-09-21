@@ -23,6 +23,9 @@ use control_routing::RouteAssignment;
 #[cfg(test)]
 use crate::factors::Factor;
 use crate::factors::RedirectReason;
+use crate::migration_history::MigrationHistory;
+#[cfg(test)]
+use crate::migration_history::{DurationKey, MAX_RETAINED_LABEL_SETS, TerminalKey};
 
 /// Live connection accounting for one backend owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -388,12 +391,6 @@ pub struct MigrationTotals {
     pub elapsed_nanos: u128,
 }
 
-/// Ceiling on distinct migration label sets one ledger retains.
-///
-/// This bounds THIS map, not some other one: the defect being avoided here is
-/// a capacity check that consulted a different table than the one it limited.
-pub(crate) const MAX_MIGRATION_LABEL_SETS: usize = 4096;
-
 pub(crate) struct Ledger {
     identity: Arc<()>,
     next_session: u64,
@@ -407,16 +404,23 @@ pub(crate) struct Ledger {
     /// Settled migrations awaiting publication. The ledger records; it never
     /// touches a metric registry itself.
     migrations: Vec<MigrationObservation>,
-    /// Authoritative migration state per label set, retained after a label set
-    /// returns to zero so the exposition keeps reporting the series, exactly
-    /// as Go keeps a child registered once it has been created.
-    migration_totals: BTreeMap<MigrationLabels, MigrationTotals>,
-    /// Label sets refused because the retained map was full.
-    migration_labels_dropped: u64,
+    /// Migrations accepted here and not yet settled, per label set.
+    ///
+    /// Only the in-flight count lives on the router. Cumulative history does
+    /// not: destroying an incarnation would take it with them, and a
+    /// cumulative series must never fall.
+    pending_migrations: BTreeMap<MigrationLabels, u64>,
+    /// Process-level cumulative history, shared with every other router.
+    history: Arc<MigrationHistory>,
 }
 
 impl Ledger {
     pub(crate) fn new(max_sessions: usize) -> Self {
+        Self::with_history(max_sessions, Arc::new(MigrationHistory::default()))
+    }
+
+    /// Builds a ledger that shares one process-level cumulative history.
+    pub(crate) fn with_history(max_sessions: usize, history: Arc<MigrationHistory>) -> Self {
         Self {
             identity: Arc::new(()),
             next_session: 1,
@@ -428,54 +432,39 @@ impl Ledger {
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
             migrations: Vec::new(),
-            migration_totals: BTreeMap::new(),
-            migration_labels_dropped: 0,
+            pending_migrations: BTreeMap::new(),
+            history,
         }
     }
 
-    /// The authoritative migration state, for a reader that holds this
-    /// ledger's lock. Retained label sets with `pending == 0` are included:
-    /// dropping them would hide a completed migration from the next scrape.
-    pub(crate) fn migration_totals(&self) -> &BTreeMap<MigrationLabels, MigrationTotals> {
-        &self.migration_totals
+    /// Migrations in flight on this router, per label set.
+    pub(crate) const fn pending_migrations(&self) -> &BTreeMap<MigrationLabels, u64> {
+        &self.pending_migrations
     }
 
-    /// Label sets refused because this ledger's retained map was full.
-    pub(crate) const fn migration_labels_dropped(&self) -> u64 {
-        self.migration_labels_dropped
+    /// The process-level cumulative history this ledger writes to.
+    pub(crate) const fn history(&self) -> &Arc<MigrationHistory> {
+        &self.history
     }
 
-    /// Records a settlement in the authoritative state: the pending count
-    /// falls, and the matching cumulative total rises. `pending` saturates at
-    /// zero so an unmatched settlement cannot underflow, and the label set is
-    /// retained afterwards so the series keeps reporting.
-    fn settle_migration(&mut self, labels: MigrationLabels, success: bool, elapsed: Duration) {
-        self.record_migration(labels, |totals| {
-            totals.pending = totals.pending.saturating_sub(1);
-            if success {
-                totals.succeeded = totals.succeeded.saturating_add(1);
-            } else {
-                totals.failed = totals.failed.saturating_add(1);
-            }
-            totals.elapsed_nanos = totals.elapsed_nanos.saturating_add(elapsed.as_nanos());
-        });
+    /// Notes an accepted migration: in flight here, and its label set
+    /// remembered process-wide so the series keeps reporting zero later.
+    fn issue_migration(&mut self, labels: &MigrationLabels) {
+        self.history
+            .remember(&labels.from, &labels.to, labels.reason);
+        *self.pending_migrations.entry(labels.clone()).or_default() += 1;
     }
 
-    /// Applies one migration event to the authoritative state. A new label set
-    /// is refused once the retained map is full, so a hostile or pathological
-    /// label cardinality cannot grow this map without bound.
-    fn record_migration(
-        &mut self,
-        labels: MigrationLabels,
-        apply: impl FnOnce(&mut MigrationTotals),
-    ) {
-        if !self.migration_totals.contains_key(&labels)
-            && self.migration_totals.len() >= MAX_MIGRATION_LABEL_SETS
-        {
-            self.migration_labels_dropped = self.migration_labels_dropped.saturating_add(1);
-            return;
+    /// Records a settlement. The in-flight count falls here; the cumulative
+    /// terminal goes to the process-level history, which no router teardown
+    /// can roll back. `pending` saturates at zero so an unmatched settlement
+    /// cannot underflow.
+    fn settle_migration(&mut self, labels: &MigrationLabels, success: bool, elapsed: Duration) {
+        if let Some(pending) = self.pending_migrations.get_mut(labels) {
+            *pending = pending.saturating_sub(1);
         }
-        apply(self.migration_totals.entry(labels).or_default());
+        self.history
+            .settle(&labels.from, &labels.to, labels.reason, success, elapsed);
     }
 
     /// Takes the migrations settled since the last drain.
@@ -836,9 +825,7 @@ impl Ledger {
                 to: redirect.to.backend_address.clone(),
                 reason: redirect.reason,
             };
-            self.record_migration(labels.clone(), |totals| {
-                totals.pending = totals.pending.saturating_add(1);
-            });
+            self.issue_migration(&labels);
             self.migrations.push(MigrationObservation {
                 from: labels.from,
                 to: labels.to,
@@ -911,7 +898,7 @@ impl Ledger {
             to: redirect.to.backend_address.clone(),
             reason: redirect.reason,
         };
-        self.settle_migration(labels.clone(), success, elapsed);
+        self.settle_migration(&labels, success, elapsed);
         self.migrations.push(MigrationObservation {
             from: labels.from,
             to: labels.to,
@@ -1069,7 +1056,7 @@ impl Ledger {
                         to: redirect.to.backend_address.clone(),
                         reason: redirect.reason,
                     };
-                    self.settle_migration(labels.clone(), false, elapsed);
+                    self.settle_migration(&labels, false, elapsed);
                     self.migrations.push(MigrationObservation {
                         from: labels.from,
                         to: labels.to,

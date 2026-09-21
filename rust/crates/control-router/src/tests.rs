@@ -1782,12 +1782,7 @@ async fn label_fail_list_and_retry_preserve_exact_attempts_and_current_policy() 
 
 /// Pending migrations summed over every incarnation the plane still holds.
 fn pending_total(handle: &crate::RoutePlaneHandle) -> u64 {
-    handle
-        .migration_snapshot()
-        .totals
-        .values()
-        .map(|totals| totals.pending)
-        .sum()
+    handle.migration_snapshot().pending.values().sum()
 }
 
 /// Replaces the `default` namespace so the current incarnation is retired,
@@ -1919,12 +1914,12 @@ async fn migration_snapshot_sums_shared_labels_across_a_retired_incarnation() ->
 
     let snapshot = handle.migration_snapshot();
     assert_eq!(
-        snapshot.totals.len(),
+        snapshot.pending.len(),
         1,
         "one shared label set, not one series per router"
     );
     assert_eq!(
-        snapshot.totals.values().map(|t| t.pending).sum::<u64>(),
+        snapshot.pending.values().sum::<u64>(),
         2,
         "both incarnations are in flight; a per-router write would report 1"
     );
