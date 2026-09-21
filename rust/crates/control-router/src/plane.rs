@@ -97,11 +97,19 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 #[derive(Default)]
-struct RouteLedgerDiagnostics(Mutex<Vec<Weak<Router>>>);
+struct RouteLedgerDiagnostics {
+    routers: Mutex<Vec<Weak<Router>>>,
+    /// Held directly rather than reached through a router. Cumulative history
+    /// must be readable when no incarnation is alive at all; going through a
+    /// live router would make every counter vanish the moment the last one
+    /// is dropped, which is the same disappearance the process-level store
+    /// exists to prevent.
+    history: Arc<crate::MigrationHistory>,
+}
 
 impl RouteLedgerDiagnostics {
     fn register(&self, router: &Arc<Router>) {
-        self.0
+        self.routers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Arc::downgrade(router));
@@ -112,7 +120,7 @@ impl RouteLedgerDiagnostics {
         // are acquired afterwards, so diagnostics cannot invert registry or
         // route-ledger lock order.
         let routers = {
-            let mut registered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut registered = self.routers.lock().unwrap_or_else(PoisonError::into_inner);
             let mut live = Vec::with_capacity(registered.len());
             registered.retain(|weak| {
                 if let Some(router) = weak.upgrade() {
@@ -149,7 +157,7 @@ impl RouteLedgerDiagnostics {
         // lock alone, then take router locks one at a time, and never while a
         // metrics-registry lock is held.
         let routers = {
-            let mut registered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut registered = self.routers.lock().unwrap_or_else(PoisonError::into_inner);
             let mut live = Vec::with_capacity(registered.len());
             registered.retain(|weak| {
                 if let Some(router) = weak.upgrade() {
@@ -161,22 +169,27 @@ impl RouteLedgerDiagnostics {
             });
             live
         };
-        let mut snapshot = MigrationSnapshot::default();
-        // Cumulative history is process-level and identical for every router,
-        // so it is read once rather than summed; only the in-flight counts are
-        // per-incarnation and have to be added up.
-        let mut history = None;
+        let mut snapshot = MigrationSnapshot {
+            // Read directly, so the cumulative series survive even when no
+            // incarnation is alive.
+            history: self.history.snapshot(),
+            pending: BTreeMap::new(),
+        };
         for router in routers {
             for (labels, pending) in router.pending_migrations() {
+                // Each ledger bounds its own map, but N of them summed is N
+                // times that bound, so the aggregate needs its own ceiling.
+                // Refusing a label set here costs only the series.
+                if !snapshot.pending.contains_key(&labels)
+                    && snapshot.pending.len() >= crate::MAX_RETAINED_LABEL_SETS
+                {
+                    snapshot.history.labels_dropped =
+                        snapshot.history.labels_dropped.saturating_add(1);
+                    continue;
+                }
                 let entry = snapshot.pending.entry(labels).or_default();
                 *entry = entry.saturating_add(pending);
             }
-            if history.is_none() {
-                history = Some(router.migration_history());
-            }
-        }
-        if let Some(history) = history {
-            snapshot.history = history.snapshot();
         }
         snapshot
     }
@@ -490,8 +503,11 @@ impl RoutePlane {
         let (updates, updates_rx) = watch::channel(0);
         let registry = Arc::new(Mutex::new(RegistryState::default()));
         let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
-        let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics::default());
         let migration_history = Arc::new(crate::MigrationHistory::default());
+        let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics {
+            routers: Mutex::new(Vec::new()),
+            history: Arc::clone(&migration_history),
+        });
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {

@@ -1934,3 +1934,66 @@ async fn migration_snapshot_sums_shared_labels_across_a_retired_incarnation() ->
     let _ = plane_task.await;
     Ok(())
 }
+
+/// Cumulative history must be readable when no incarnation is alive at all.
+/// Reaching it through a live router made every counter vanish the moment the
+/// last one was dropped -- the same disappearance the process-level store
+/// exists to prevent, reintroduced one layer up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_history_survives_every_incarnation_being_dropped() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut admission = must(handle.admit(""));
+    let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+    let old_address = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        admission.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (registration, mut commands) = must(admission.register_commands(13201, 2));
+    harness.patch(
+        &format!(
+            "[proxy]\nfail-backend-list=[\"{old_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+        ),
+        3,
+    );
+    harness.source.deliver();
+    let envelope = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+        .await?
+        .ok_or("no redirect issued")?;
+    assert_eq!(envelope.finish_redirect(true), Settlement::Applied);
+    let settled: u64 = handle.migration_snapshot().history.terminals.values().sum();
+    assert_eq!(settled, 1);
+
+    // Drop everything that could hold an incarnation alive.
+    drop(registration);
+    drop(admission);
+    drop(commands);
+    plane_task.abort();
+    let _ = plane_task.await;
+
+    assert_eq!(
+        handle
+            .migration_snapshot()
+            .history
+            .terminals
+            .values()
+            .sum::<u64>(),
+        1,
+        "the cumulative series must not disappear with the last router"
+    );
+    Ok(())
+}
