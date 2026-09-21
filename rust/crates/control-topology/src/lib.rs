@@ -54,6 +54,7 @@ mod metric_source;
 pub mod metrics;
 mod model;
 mod module;
+mod owner_metrics;
 mod register;
 mod registrar;
 mod resolver;
@@ -84,6 +85,9 @@ pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topolo
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
     TopologyModuleHandle, TopologyStatus, TopologyUpdateObserver,
+};
+pub use owner_metrics::{
+    ElectionOwnerHistory, MAX_RETAINED_ELECTIONS, OwnerSnapshot, election_label,
 };
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,

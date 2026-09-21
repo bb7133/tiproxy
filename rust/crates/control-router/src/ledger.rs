@@ -505,6 +505,18 @@ impl Ledger {
         if let Some(pending) = self.pending_migrations.get_mut(labels) {
             *pending = pending.saturating_sub(1);
         }
+        // Go settles through `PendingMigrateGuage.Dec()`, which recreates the
+        // child if it was deleted, so a label set retired mid-flight comes
+        // back when its migration lands. Re-admitting here keeps the one
+        // admission decision in the one place the exposition reads.
+        //
+        // The value differs from Go in that case and deliberately so: Go's
+        // `Dec()` on a recreated child reports -1, because it accumulates
+        // decrements, while this pending count is read from the ledger and
+        // cannot go below zero. A negative in-flight count is a Go artefact
+        // of the delete, not a state the router can be in.
+        self.history
+            .remember(&labels.from, &labels.to, labels.reason);
         self.history
             .settle(&labels.from, &labels.to, labels.reason, success, elapsed);
     }
@@ -927,6 +939,13 @@ impl Ledger {
             // The connection is now physically the target's; register the
             // address at the moment it lands, for the same reason.
             self.history.remember_backend(&redirect.to.backend_address);
+            // Go moves the connection with `removeConn(from)` + `addConn(to)`
+            // and both call `setBackendConnMetrics`, so the source's series is
+            // rewritten too. Ordinarily a no-op here; it matters after a
+            // retention purge, where dropping the source's write would leave
+            // the address Go shows at its new count silently absent.
+            self.history
+                .remember_backend(&redirect.from.backend_address);
         }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("matching active session")

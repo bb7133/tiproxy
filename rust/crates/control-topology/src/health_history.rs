@@ -103,11 +103,22 @@ impl BackendHealthHistory {
     /// the order the observations happened to reach this method.
     ///
     /// `still_valid` is the caller's source fence, evaluated **while this
-    /// lock is held**. Checking it before the call would leave a window in
-    /// which the source retires between the check and the write, so the
-    /// fence would describe a guarantee the code does not make. Go has no
-    /// such fence at all and always writes, so this can only ever be
-    /// stricter than Go -- but it should be exactly as strict as it claims.
+    /// lock is held**. Be precise about what that does and does not buy:
+    ///
+    /// It *does* make the check and the write atomic with respect to other
+    /// observations. No competing sample can land between them, so a dial
+    /// admitted by the fence is ordered against exactly the value the fence
+    /// saw.
+    ///
+    /// It does *not* serialise against retirement, which this lock does not
+    /// govern: a source revoked one instruction after the predicate returns
+    /// still lets that dial through. Closing that would mean holding a
+    /// routing-generation lock across a metric write, which puts the
+    /// publisher in the metrics path to buy nothing -- Go has no fence here
+    /// at all and writes unconditionally, so the residual window degrades to
+    /// exactly Go's behaviour. The fence is a best-effort narrowing of a
+    /// stricter-than-Go rule, not a guarantee that no retired source ever
+    /// writes.
     ///
     /// The predicate must not acquire a lock that any holder takes before
     /// this one. The production fence reads the routing publisher's watch

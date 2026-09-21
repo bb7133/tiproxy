@@ -1019,9 +1019,24 @@ fn retiring_a_backend_deletes_series_without_disturbing_the_ledger() {
     let mut ledger = Ledger::with_history(8, Arc::clone(&history));
     let a = must(ledger.add_account());
     let b = must(ledger.add_account());
-    let session = active(&mut ledger, &a);
+    // Real addresses on both ends: the default assignment leaves
+    // `backend_address` empty, and every assertion below would then be about
+    // the empty string, which the b_conn read path filters out anyway.
+    let from_addr = "10.0.0.1:4000";
+    let to_addr = "10.0.0.2:4000";
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", from_addr)));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
     let now = Instant::now();
-    let op = must(redirect(&ledger, &session, &b, assignment("b"), now));
+    let op = must(redirect(
+        &ledger,
+        &session,
+        &b,
+        addressed("b", to_addr),
+        now,
+    ));
+    assert_eq!(op.from.backend_address, from_addr);
+    assert_eq!(op.to.backend_address, to_addr);
     ledger.admit_redirect(op.clone(), true, now);
     let _ = ledger.drain_migrations();
 
@@ -1067,5 +1082,24 @@ fn retiring_a_backend_deletes_series_without_disturbing_the_ledger() {
             .keys()
             .any(|key| key.to == op.to.backend_address && key.succeeded),
         "settling after a retirement records the terminal again"
+    );
+    // Go moves the connection with removeConn(from) + addConn(to), and both
+    // write b_conn, so BOTH addresses come back -- not just the destination.
+    assert!(
+        history.knows_backend(&op.to.backend_address),
+        "the destination's b_conn series returns when the connection lands"
+    );
+    assert!(
+        history.knows_backend(&op.from.backend_address),
+        "the source's b_conn series returns too: Go's removeConn writes it"
+    );
+    // Go's PendingMigrateGuage.Dec() recreates a deleted child, so the label
+    // set is exposed again once its migration settles.
+    assert!(
+        snapshot
+            .known_pending
+            .iter()
+            .any(|(from, to, _)| *from == op.from.backend_address && *to == op.to.backend_address),
+        "the pending label set returns when the migration settles"
     );
 }
