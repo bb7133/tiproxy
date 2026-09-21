@@ -1,7 +1,8 @@
-# Serving `tiproxy_balance_pending_migrate` from authoritative state
+# Serving the migration families from authoritative state
 
-Status: design agreed with CodexM5 (review of `fd36e35a`, defects 3 and 4);
-not yet implemented.
+Status: plan under the constraints CodexM5 set while reviewing `fd36e35a`
+and `62795759`. Direction is accepted; the implementation is neither written
+nor reviewed, and nothing here has passed.
 
 ## Why the event-driven version cannot work
 
@@ -35,9 +36,12 @@ Serve the family by asking authoritative state at render time.
 3. A dropped or missed update is therefore only briefly stale: the next
    scrape reconstructs the whole family from state that cannot drift.
 
-Retirement falls out of the same mechanism — a retired router is no longer
-enumerated, so its contribution disappears without anyone having to publish a
-compensating event.
+Retirement is **not** simply "drop whatever left the routing table". A router
+can be retired by configuration and still own sessions with unsettled work,
+and those migrations are still pending. Enumerating `RoutePlane`'s current
+routing table is therefore not sufficient. A router stops contributing only
+once it has no live references and no unsettled work; until then a retained
+incarnation is enumerated exactly like a current one.
 
 ## Constraints this must satisfy
 
@@ -50,13 +54,30 @@ compensating event.
 - **Keep known series at zero.** Once a label set has been observed it keeps
   reporting `0` rather than disappearing, matching Go, where a child stays
   registered once created. This is also what makes a return to zero visible
-  at all.
+  at all. The known set cannot be derived from the current pending set: a
+  migration that starts and finishes between two scrapes would never appear,
+  yet Go would have created its child. The known-label set is therefore its
+  own reliable, bounded structure.
 - **Bound the pull side's own series,** and bound it against *its own* table.
   Defect 4 was a capacity check that consulted a different map than the one it
   was meant to limit; the replacement must not repeat that in a new location.
+- **Concurrent scrapes must not move the value backwards.** Two renders can
+  overlap, and an older snapshot must never overwrite shared state that a
+  newer one has already written.
 
-## What this does not change
+## The two cumulative families
 
-`migrate_total` and `migrate_duration_seconds` are counters and a histogram:
-they are cumulative and additive, so a dropped sample undercounts once and
-never corrupts later values. They stay on the event path.
+An earlier draft of this document argued that `migrate_total` and
+`migrate_duration_seconds` could stay purely event-driven because a dropped
+sample "only undercounts once and never corrupts later values". That is a
+wrong way to describe it. An increment is not idempotent, and a lost terminal
+never repairs itself: the series is permanently short by that migration, and
+the fact that the error stops growing does not make the value correct. It is
+the same permanence as the gauge defect, only monotonic.
+
+So these two families also keep reliable cumulative state that the scrape
+reads. The event path may continue to carry the notification, but it is not
+the sole source of truth for any of the three families.
+
+Scope is exactly these three migration families. No other SQL-path metric
+chain changes.

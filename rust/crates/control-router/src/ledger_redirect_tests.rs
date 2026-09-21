@@ -14,6 +14,23 @@
 
 use super::*;
 
+#[test]
+fn review_close_settles_accepted_migration_once() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = active(&mut ledger, &a);
+    let now = Instant::now();
+    let op = must(redirect(&ledger, &session, &b, assignment("b"), now));
+    ledger.admit_redirect(op.clone(), true, now);
+    assert_eq!(ledger.drain_migrations().len(), 1);
+    assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
+    assert_eq!(ledger.finish_redirect(&op, true, Instant::now()), Settlement::Ignored);
+    let events = ledger.drain_migrations();
+    assert_eq!(events.len(), 1, "accepted migration closed early must emit a terminal");
+    assert!(matches!(events[0].outcome, MigrationOutcome::Settled { success: false, .. }));
+}
+
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
 }
