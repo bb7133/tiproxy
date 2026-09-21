@@ -591,6 +591,13 @@ async fn run(options: Options) -> Result<(), String> {
     // until its TTL); a successful startup ends with `guard.commit`.
     let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
     // STARTUP-GUARD:ARMED
+    // Go starts this with the metrics manager, before anything control-plane
+    // related, and it is the only producer behind
+    // tiproxy_monitor_time_jump_back_total and tiproxy_monitor_keep_alive_total.
+    // Start it as soon as the guard can own it: a process still waiting on its
+    // control peer is exactly when a clock step matters, and Go counts there
+    // too. The guard stops and joins it on rollback and on shutdown.
+    guard.set_system_time_monitor(spawn_system_time_monitor(Arc::clone(&metrics_registry)));
     guard.routing_shadow = routing_shadow_socket.map(legacy_router_shadow::consumer::Task::spawn);
     if let Err(error) = guard.spawn_module(config_owner.module) {
         return Err(guard
@@ -869,11 +876,6 @@ async fn run(options: Options) -> Result<(), String> {
     }
     // Native Prometheus exposition (B0): bound before ready so a bad address
     // fails fast; the task is owned by the guard and aborted at exit.
-    // Go starts this with the metrics manager: it is the producer behind
-    // tiproxy_monitor_time_jump_back_total and tiproxy_monitor_keep_alive_total,
-    // so without it the process would serve those two families as standing
-    // zeros. Registered with the guard so a failed startup stops and joins it.
-    guard.set_system_time_monitor(spawn_system_time_monitor(Arc::clone(&metrics_registry)));
     match spawn_metrics_http(options.metrics_addr, Arc::clone(&metrics_registry)).await {
         Ok(Some(task)) => guard.set_metrics_http_task(task),
         Ok(None) => {}
