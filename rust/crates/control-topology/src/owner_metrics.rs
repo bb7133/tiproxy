@@ -128,6 +128,39 @@ mod tests {
         assert_eq!(election_label("odd-key"), "odd-key");
     }
 
+    /// The label must come from the very key the campaign runs on.
+    ///
+    /// `b_status` was shipped labelled with an internal identifier because
+    /// the fixture typed the expected label by hand on both sides and never
+    /// touched the function that derives it. This composes the two real
+    /// functions -- the campaign's `election_name` and the metric's
+    /// `election_label` -- so a change to either that breaks the pairing
+    /// fails here rather than in production.
+    #[test]
+    fn the_label_is_derived_from_the_key_the_campaign_uses() {
+        use crate::metric_owner::election_name;
+
+        // Go's four documented shapes, from backend_reader.go:40-43.
+        for (cluster, zone, expected) in [
+            ("", "", "metric_reader"),
+            ("default", "", "metric_reader"),
+            ("", "z1", "metric_reader/z1"),
+            ("c1", "", "metric_reader/c1"),
+            ("c1", "z1", "metric_reader/c1/z1"),
+        ] {
+            let key = election_name(cluster, zone);
+            assert_eq!(
+                election_label(&key),
+                expected,
+                "cluster={cluster:?} zone={zone:?} produced key {key:?}"
+            );
+            assert!(
+                !election_label(&key).starts_with('/'),
+                "a raw etcd key must never reach a metric label"
+            );
+        }
+    }
+
     /// The series exists while held and is gone once retired -- never zero.
     #[test]
     fn retiring_deletes_the_series_rather_than_zeroing_it() {

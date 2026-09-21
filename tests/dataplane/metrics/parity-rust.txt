@@ -146,6 +146,10 @@ tiproxy_server_err{type="rust_control_stale_dropped"} 2
 # HELP tiproxy_server_event Counter of TiProxy event.
 # TYPE tiproxy_server_event counter
 tiproxy_server_event{type="rust_control_reconnect"} 1
+# HELP tiproxy_server_owner The TiProxy owner of each job type.
+# TYPE tiproxy_server_owner gauge
+tiproxy_server_owner{type="metric_reader"} 1
+tiproxy_server_owner{type="metric_reader/z1"} 1
 # HELP tiproxy_server_reject_connection_total Number of rejected connections.
 # TYPE tiproxy_server_reject_connection_total counter
 tiproxy_server_reject_connection_total{type="max_connections"} 1

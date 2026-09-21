@@ -749,6 +749,11 @@ async fn run(options: Options) -> Result<(), String> {
                 .await);
         }
     };
+    // Installed before the collector runs, so no election worker can win
+    // without somewhere to report it. `server_owner` then renders from the
+    // same history at scrape.
+    metric_overlay.set_owner_history(topology_handle.owner_history());
+    metrics_registry.set_owner_state_source(topology_handle.owner_history());
     if let Err(error) = guard.spawn_module(metric_collector) {
         return Err(guard
             .rollback(format!("start metric collector module: {error}"))

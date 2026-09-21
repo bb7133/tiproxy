@@ -98,7 +98,12 @@ pub struct HealthMetricsSnapshot {
     /// refused whichever address it belongs to. Those are exactly the
     /// observations already in flight when a retirement ran, and any new
     /// dial carries a higher sequence, so recreation still works.
-    pub retired_above_floor: u64,
+    ///
+    /// `None` means no retirement has ever overflowed. It must not be
+    /// conflated with `Some(0)`: `DIAL_SEQUENCE` starts at zero, so the
+    /// process's very first dial carries sequence 0, and treating "no
+    /// watermark" as "retired at 0" would silently drop it.
+    pub retired_above_floor: Option<u64>,
     /// Addresses refused because a retained map was full.
     pub labels_dropped: u64,
 }
@@ -171,13 +176,18 @@ impl BackendHealthHistory {
         // already in flight when the purge ran must not recreate it with a
         // stale value; only a dial newer than anything the address had
         // reached may.
-        let watermark = state
-            .retired_above
-            .get(address)
-            .copied()
-            .unwrap_or(0)
-            .max(state.retired_above_floor);
-        if sample.sequence <= watermark {
+        // An absent watermark is not a watermark of zero. The first dial a
+        // process makes has sequence 0, so folding absence into 0 would
+        // refuse it.
+        let watermark = match (
+            state.retired_above.get(address).copied(),
+            state.retired_above_floor,
+        ) {
+            (Some(own), Some(floor)) => Some(own.max(floor)),
+            (Some(own), None) => Some(own),
+            (None, floor) => floor,
+        };
+        if watermark.is_some_and(|watermark| sample.sequence <= watermark) {
             return;
         }
         if state.ping.len() >= MAX_RETAINED_BACKENDS {
@@ -241,7 +251,11 @@ impl BackendHealthHistory {
         if state.retired_above.len() >= MAX_RETAINED_BACKENDS
             && !state.retired_above.contains_key(address)
         {
-            state.retired_above_floor = state.retired_above_floor.max(retired.sequence);
+            state.retired_above_floor = Some(
+                state
+                    .retired_above_floor
+                    .map_or(retired.sequence, |floor| floor.max(retired.sequence)),
+            );
             state.labels_dropped = state.labels_dropped.saturating_add(1);
             return;
         }
@@ -692,6 +706,29 @@ mod tests {
         assert!(history.snapshot().ping.contains_key("overflow:4000"));
     }
 
+    /// `DIAL_SEQUENCE` starts at zero, so a process's very first dial has
+    /// sequence 0. Treating "this address has no watermark" as "retired at
+    /// sequence 0" refuses it -- and refuses it only on the first dial of a
+    /// fresh process, which a whole-suite run hides because other tests have
+    /// already consumed sequences from the shared counter.
+    #[tokio::test]
+    async fn the_first_dial_of_a_process_is_admitted() {
+        let history = BackendHealthHistory::new();
+        history.observe_dial("a:4000", &dial(0.5, 0), &|| true);
+        assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.5);
+
+        // And a retirement at sequence 0 really does refuse sequence 0,
+        // which is what the absent case must not be confused with.
+        let retired = BackendHealthHistory::new();
+        retired.observe_dial("b:4000", &dial(0.5, 0), &|| true);
+        retired.forget_backend("b:4000");
+        retired.observe_dial("b:4000", &dial(9.0, 0), &|| true);
+        assert!(
+            retired.snapshot().ping.is_empty(),
+            "a real watermark of 0 still rejects sequence 0"
+        );
+    }
+
     /// `CodexM5`'s retirement-ordering case, replayed exactly: sequence 7 is
     /// recorded, the address is retired, and the still-valid older sequence 3
     /// is then handed over. Deleting the series also deletes the sequence
@@ -753,7 +790,8 @@ mod tests {
             "the loss of per-address precision is shed, not silent"
         );
         assert_eq!(
-            snapshot.retired_above_floor, 500,
+            snapshot.retired_above_floor,
+            Some(500),
             "the watermark is folded into the floor rather than discarded"
         );
 

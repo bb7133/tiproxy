@@ -25,6 +25,7 @@
     "tiproxy_server_disconnection_total",
     "tiproxy_server_err",
     "tiproxy_server_event",
+    "tiproxy_server_owner",
     "tiproxy_server_reject_connection_total",
     "tiproxy_session_conn_lifetime_seconds",
     "tiproxy_session_handshake_duration_seconds",

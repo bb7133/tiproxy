@@ -127,6 +127,17 @@ func run(input, nativeList string) error {
 	}
 	metrics.HealthCheckCycleGauge.Set(fixedHealthCheckCycleSeconds)
 
+	// Elections this process holds. Go sets 1 on election and deletes the
+	// child on retirement, so an election that was won and then lost leaves
+	// nothing behind -- the fixture exercises that by doing exactly this to
+	// the third entry rather than trusting the absence.
+	for _, job := range fixedOwnedElections {
+		metrics.OwnerGauge.WithLabelValues(job).Set(1)
+	}
+	metrics.OwnerGauge.WithLabelValues(fixedRetiredElection).Set(1)
+	metrics.OwnerGauge.MetricVec.DeletePartialMatch(
+		map[string]string{metrics.LblType: fixedRetiredElection})
+
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
 		return err
@@ -211,6 +222,14 @@ var fixedBackendHealth = []struct {
 
 // One health check cycle's duration.
 const fixedHealthCheckCycleSeconds = 1.5
+
+// Elections held, mirrored exactly by the Rust golden test. The labels are
+// Go's trimmed etcd keys, so "/tiproxy/metric_reader/z1/owner" is
+// "metric_reader/z1".
+var fixedOwnedElections = []string{"metric_reader", "metric_reader/z1"}
+
+// Won and then lost: Go deletes the child, so this must leave no series.
+const fixedRetiredElection = "metric_reader/z2"
 
 type nativeFamilies struct {
 	Families []string `json:"families"`

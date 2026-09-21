@@ -77,6 +77,7 @@ use crate::health_loop::{
 };
 use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher, ObserverError};
 use crate::metric_source::{MetricConfigError, MetricPublication, MetricSourceHandle};
+use crate::owner_metrics::ElectionOwnerHistory;
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
@@ -362,6 +363,7 @@ pub struct TopologyModuleHandle {
     statics: Arc<StaticRegistry>,
     health_history: Arc<BackendHealthHistory>,
     backend_retirement: Arc<BackendRetirement>,
+    owner_history: Arc<ElectionOwnerHistory>,
     #[cfg(test)]
     mode_hook: crate::static_source::PublishHook,
 }
@@ -409,6 +411,13 @@ impl TopologyModuleHandle {
     #[must_use]
     pub fn backend_retirement(&self) -> Arc<BackendRetirement> {
         Arc::clone(&self.backend_retirement)
+    }
+
+    /// The elections this process holds, for the exposition and for the
+    /// metric collector's election workers to report into.
+    #[must_use]
+    pub fn owner_history(&self) -> Arc<ElectionOwnerHistory> {
+        Arc::clone(&self.owner_history)
     }
 
     /// Creates a wake-only observer for consumers that must rebuild a derived
@@ -742,6 +751,10 @@ impl TopologyModule {
         let statics = Arc::new(StaticRegistry::default());
         let health_history = Arc::new(BackendHealthHistory::new());
         let backend_retirement = Arc::new(BackendRetirement::new());
+        // Created here and handed to the handle alone: the module itself
+        // never reads it, the collector's election workers and the
+        // exposition do.
+        let owner_history = Arc::new(ElectionOwnerHistory::new());
         let (metrics, metric_source) = MetricPublication::new(Arc::clone(&source), health);
         Ok((
             Self {
@@ -784,6 +797,7 @@ impl TopologyModule {
                 statics,
                 health_history,
                 backend_retirement,
+                owner_history,
                 #[cfg(test)]
                 mode_hook,
             },

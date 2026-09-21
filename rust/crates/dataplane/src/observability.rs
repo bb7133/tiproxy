@@ -125,7 +125,7 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 29] = [
+pub const METRIC_SPECS: [MetricSpec; 30] = [
     MetricSpec {
         name: "tiproxy_backend_b_status",
         help: "Gauge of backend status.",
@@ -249,6 +249,13 @@ pub const METRIC_SPECS: [MetricSpec; 29] = [
         name: "tiproxy_server_event",
         help: "Counter of TiProxy event.",
         kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_owner",
+        help: "The TiProxy owner of each job type.",
+        kind: MetricKind::Gauge,
         labels: &["type"],
         buckets: &[],
     },
@@ -457,6 +464,23 @@ impl HealthStateSource for control_topology::BackendHealthHistory {
     }
 }
 
+/// Authoritative source for `server_owner`.
+///
+/// Separate again from the health families: the writers are the election
+/// workers, and the state is a set of held elections rather than a map of
+/// values, because Go deletes the child on retirement instead of zeroing it.
+pub trait OwnerStateSource: Send + Sync {
+    /// The elections this process holds right now.
+    fn owner_state(&self) -> control_topology::OwnerSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl OwnerStateSource for control_topology::ElectionOwnerHistory {
+    fn owner_state(&self) -> control_topology::OwnerSnapshot {
+        self.snapshot()
+    }
+}
+
 /// Process-local cumulative store behind the native Prometheus exposition.
 ///
 /// Counters and histograms reset with the process, which is ordinary
@@ -471,6 +495,8 @@ pub struct MetricsRegistry {
     migrations: Mutex<Option<Arc<dyn MigrationStateSource>>>,
     /// The backend health families' source, held for the same reason.
     health: Mutex<Option<Arc<dyn HealthStateSource>>>,
+    /// `server_owner`'s source, held for the same reason.
+    owner: Mutex<Option<Arc<dyn OwnerStateSource>>>,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -515,6 +541,32 @@ impl MetricsRegistry {
         source
             .map(|source| source.health_state())
             .unwrap_or_default()
+    }
+
+    /// Installs the authoritative source for `server_owner`.
+    pub fn set_owner_state_source(&self, source: Arc<dyn OwnerStateSource>) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads election state while holding no registry lock, as for the rest.
+    fn owner_state(&self) -> control_topology::OwnerSnapshot {
+        let source = self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.owner_state())
+            .unwrap_or_default()
+    }
+
+    /// Elections the retained set refused, folded into the same counter.
+    #[must_use]
+    pub fn owner_labels_dropped(&self) -> u64 {
+        self.owner_state().labels_dropped
     }
 
     /// Addresses the health retention refused, folded into the same visible
@@ -617,9 +669,15 @@ impl MetricsRegistry {
         // the settlement path already runs router lock then registry.
         let migrations = self.migration_state();
         let health = self.health_state();
+        let owner = self.owner_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_owner_family(spec, &owner) {
+                // Owned by the election workers, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
             if let Some(rendered) = render_health_family(spec, &health) {
                 // Owned by the topology health path, never accumulated here.
                 out.push_str(&rendered);
@@ -870,6 +928,40 @@ fn render_health_family(
             );
         }
         _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `server_owner`: one sample at `1` per held election, and no series at all
+/// for an election this process does not hold.
+///
+/// Go deletes the child on retirement rather than setting it to zero, so a
+/// rendering that emitted `0` for a lost election would be making a claim Go
+/// deliberately does not make on the dashboard.
+fn render_owner_family(
+    spec: &MetricSpec,
+    state: &control_topology::OwnerSnapshot,
+) -> Option<String> {
+    if spec.name != "tiproxy_server_owner" {
+        return None;
+    }
+    let mut lines = String::new();
+    for job in &state.owned {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[("type", job.clone())],
+            None,
+            1.0,
+        );
     }
     if lines.is_empty() {
         return Some(String::new());
@@ -1703,7 +1795,8 @@ async fn run_exporter(
                         .saturating_add(aggregator.overflow_dropped)
                         .saturating_add(registry.series_dropped())
                         .saturating_add(registry.migration_labels_dropped())
-                        .saturating_add(registry.health_labels_dropped()),
+                        .saturating_add(registry.health_labels_dropped())
+                        .saturating_add(registry.owner_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -2293,6 +2386,25 @@ mod tests {
         );
     }
 
+    /// Mirrors `fixedOwnedElections` and `fixedRetiredElection` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// The Go fixture wins `metric_reader/z2` and then retires it, which
+    /// deletes the child. Nothing here represents it, because a retired
+    /// election has no series -- not a series at zero.
+    struct FixedOwner;
+
+    impl OwnerStateSource for FixedOwner {
+        fn owner_state(&self) -> control_topology::OwnerSnapshot {
+            control_topology::OwnerSnapshot {
+                owned: ["metric_reader".to_owned(), "metric_reader/z1".to_owned()]
+                    .into_iter()
+                    .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
     /// Mirrors `fixedBackendHealth` and `fixedHealthCheckCycleSeconds` in
     /// `tests/dataplane/metrics/gen/main.go`.
     ///
@@ -2737,6 +2849,9 @@ mod tests {
         aggregator
             .registry
             .set_health_state_source(Arc::new(FixedHealth));
+        aggregator
+            .registry
+            .set_owner_state_source(Arc::new(FixedOwner));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");
