@@ -20,6 +20,7 @@
         "2025-11-05"
       ]
     },
+    "key": "ZmFrZS1hY2NvdW50LWtleQ==",
     "method": "HEAD",
     "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz"
   },
@@ -53,6 +54,7 @@
         "2025-11-05"
       ]
     },
+    "key": "ZmFrZS1hY2NvdW50LWtleQ==",
     "method": "PUT",
     "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz"
   },
@@ -83,6 +85,7 @@
         "2025-11-05"
       ]
     },
+    "key": "ZmFrZS1hY2NvdW50LWtleQ==",
     "method": "PUT",
     "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz?blockid=QkJCQkJCQkJCQkJCQkJCQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%3D\u0026comp=block"
   },
@@ -113,6 +116,7 @@
         "2025-11-05"
       ]
     },
+    "key": "ZmFrZS1hY2NvdW50LWtleQ==",
     "method": "PUT",
     "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz?blockid=QkJCQkJCQkJCQkJCQkJCQgAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D%3D\u0026comp=block"
   },
@@ -143,7 +147,58 @@
         "2025-11-05"
       ]
     },
+    "key": "ZmFrZS1hY2NvdW50LWtleQ==",
     "method": "PUT",
     "url": "https://account.blob.core.windows.net/bucket/prefix%20space%2F%25text%2Fkey.json.gz?comp=blocklist"
+  },
+  {
+    "headers": {
+      "Accept": [
+        "application/xml"
+      ],
+      "Authorization": [
+        "SharedKey account:tEWSuuGbeZwg3YYSmjblFoojQPrdwr5lIubGd38C4a8="
+      ],
+      "User-Agent": [
+        "azsdk-go-azblob/v1.6.3 (go1.25.12; darwin)"
+      ],
+      "X-Ms-Client-Request-Id": [
+        "fixed-request-id"
+      ],
+      "x-ms-date": [
+        "Tue, 14 Nov 2023 22:13:20 GMT"
+      ],
+      "x-ms-version": [
+        "2025-11-05"
+      ]
+    },
+    "key": "Zh==",
+    "method": "HEAD",
+    "url": "https://account.blob.core.windows.net/bucket/key.json.gz"
+  },
+  {
+    "headers": {
+      "Accept": [
+        "application/xml"
+      ],
+      "Authorization": [
+        "SharedKey account:2Ul9SDQxxEjyYbiJ7AvYeS8VLBFx5Ih3oWyy7d23BZM="
+      ],
+      "User-Agent": [
+        "azsdk-go-azblob/v1.6.3 (go1.25.12; darwin)"
+      ],
+      "X-Ms-Client-Request-Id": [
+        "fixed-request-id"
+      ],
+      "x-ms-date": [
+        "Tue, 14 Nov 2023 22:13:20 GMT"
+      ],
+      "x-ms-version": [
+        "2025-11-05"
+      ]
+    },
+    "key": "Zm9=",
+    "method": "HEAD",
+    "url": "https://account.blob.core.windows.net/bucket/key.json.gz"
   }
 ]

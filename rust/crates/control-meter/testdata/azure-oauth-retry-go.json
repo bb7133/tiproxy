@@ -1,0 +1,8286 @@
+[
+  {
+    "name": "status200",
+    "responses": [
+      {
+        "status": 200
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status201",
+    "responses": [
+      {
+        "status": 201
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status202",
+    "responses": [
+      {
+        "status": 202
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status204",
+    "responses": [
+      {
+        "status": 204
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status400",
+    "responses": [
+      {
+        "status": 400
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status401",
+    "responses": [
+      {
+        "status": 401
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status403",
+    "responses": [
+      {
+        "status": 403
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status404",
+    "responses": [
+      {
+        "status": 404
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status408",
+    "responses": [
+      {
+        "status": 408
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status409",
+    "responses": [
+      {
+        "status": 409
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status429",
+    "responses": [
+      {
+        "status": 429
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status500",
+    "responses": [
+      {
+        "status": 500
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status501",
+    "responses": [
+      {
+        "status": 501
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status502",
+    "responses": [
+      {
+        "status": 502
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status503",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status504",
+    "responses": [
+      {
+        "status": 504
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status599",
+    "responses": [
+      {
+        "status": 599
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "exhausted-then-recover",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-5"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-then-terminal",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 400
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "send-error",
+    "responses": [
+      {
+        "status": 0,
+        "drop": true
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "cancel_on_retry": true,
+    "name": "cancel-retry-then-recover",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60000"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-milliseconds",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-cap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-zero",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-wrap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "9223372036854775807",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-date",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "mon, 02 jan 2100 15:04:05 GMT"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-negative",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "-1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-invalid",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "invalid"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "secret",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": true,
+        "assertion": "",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status200",
+    "responses": [
+      {
+        "status": 200
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status201",
+    "responses": [
+      {
+        "status": 201
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status202",
+    "responses": [
+      {
+        "status": 202
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status204",
+    "responses": [
+      {
+        "status": 204
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status400",
+    "responses": [
+      {
+        "status": 400
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status401",
+    "responses": [
+      {
+        "status": 401
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status403",
+    "responses": [
+      {
+        "status": 403
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status404",
+    "responses": [
+      {
+        "status": 404
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status408",
+    "responses": [
+      {
+        "status": 408
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status409",
+    "responses": [
+      {
+        "status": 409
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status429",
+    "responses": [
+      {
+        "status": 429
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status500",
+    "responses": [
+      {
+        "status": 500
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status501",
+    "responses": [
+      {
+        "status": 501
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status502",
+    "responses": [
+      {
+        "status": 502
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status503",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status504",
+    "responses": [
+      {
+        "status": 504
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status599",
+    "responses": [
+      {
+        "status": 599
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "exhausted-then-recover",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-5"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-then-terminal",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 400
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "send-error",
+    "responses": [
+      {
+        "status": 0,
+        "drop": true
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "cancel_on_retry": true,
+    "name": "cancel-retry-then-recover",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60000"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-milliseconds",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-cap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-zero",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-wrap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "9223372036854775807",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-date",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "mon, 02 jan 2100 15:04:05 GMT"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-negative",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "-1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-invalid",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "invalid"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "workload",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "workload",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status200",
+    "responses": [
+      {
+        "status": 200
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status201",
+    "responses": [
+      {
+        "status": 201
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status202",
+    "responses": [
+      {
+        "status": 202
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status204",
+    "responses": [
+      {
+        "status": 204
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status400",
+    "responses": [
+      {
+        "status": 400
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status401",
+    "responses": [
+      {
+        "status": 401
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status403",
+    "responses": [
+      {
+        "status": 403
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status404",
+    "responses": [
+      {
+        "status": 404
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status408",
+    "responses": [
+      {
+        "status": 408
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status409",
+    "responses": [
+      {
+        "status": 409
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status429",
+    "responses": [
+      {
+        "status": 429
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status500",
+    "responses": [
+      {
+        "status": 500
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status501",
+    "responses": [
+      {
+        "status": 501
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status502",
+    "responses": [
+      {
+        "status": 502
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status503",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status504",
+    "responses": [
+      {
+        "status": 504
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status599",
+    "responses": [
+      {
+        "status": 599
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "exhausted-then-recover",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-5"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-then-terminal",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 400
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "send-error",
+    "responses": [
+      {
+        "status": 0,
+        "drop": true
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "cancel_on_retry": true,
+    "name": "cancel-retry-then-recover",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60000"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-milliseconds",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-cap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-zero",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-wrap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "9223372036854775807",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-date",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "mon, 02 jan 2100 15:04:05 GMT"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "userrealm"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-negative",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "-1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-invalid",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "invalid"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "password",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      },
+      {
+        "grant": "password",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "",
+        "username": true,
+        "password": true,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "openid",
+      "userrealm",
+      "instance"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status200",
+    "responses": [
+      {
+        "status": 200
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status201",
+    "responses": [
+      {
+        "status": 201
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-1"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status202",
+    "responses": [
+      {
+        "status": 202
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status204",
+    "responses": [
+      {
+        "status": 204
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status400",
+    "responses": [
+      {
+        "status": 400
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status401",
+    "responses": [
+      {
+        "status": 401
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status403",
+    "responses": [
+      {
+        "status": 403
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status404",
+    "responses": [
+      {
+        "status": 404
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status408",
+    "responses": [
+      {
+        "status": 408
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status409",
+    "responses": [
+      {
+        "status": 409
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status429",
+    "responses": [
+      {
+        "status": 429
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status500",
+    "responses": [
+      {
+        "status": 500
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status501",
+    "responses": [
+      {
+        "status": 501
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status502",
+    "responses": [
+      {
+        "status": 502
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status503",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status504",
+    "responses": [
+      {
+        "status": 504
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "status599",
+    "responses": [
+      {
+        "status": 599
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "exhausted-then-recover",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 503
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-5"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-then-terminal",
+    "responses": [
+      {
+        "status": 503
+      },
+      {
+        "status": 400
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "send-error",
+    "responses": [
+      {
+        "status": 0,
+        "drop": true
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "cancel_on_retry": true,
+    "name": "cancel-retry-then-recover",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60000"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-milliseconds",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "61",
+          "retry-after-ms": "1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-cap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-zero",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "0",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-priority-wrap",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after-ms": "9223372036854775807",
+          "x-ms-retry-after-ms": "60001"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-date",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "mon, 02 jan 2100 15:04:05 GMT"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": true,
+        "token": ""
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-negative",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "-1"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  },
+  {
+    "name": "retry-invalid",
+    "responses": [
+      {
+        "status": 503,
+        "headers": {
+          "retry-after": "invalid"
+        }
+      },
+      {
+        "status": 0
+      }
+    ],
+    "source": "certificate",
+    "steps": [
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      },
+      {
+        "scope": "https://storage.azure.com/.default",
+        "claims": "",
+        "error": false,
+        "token": "fake-2"
+      }
+    ],
+    "requests": [
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      },
+      {
+        "grant": "client_credentials",
+        "scope": "https://storage.azure.com/.default openid offline_access profile",
+        "claims": {
+          "access_token": {
+            "xms_cc": {
+              "values": [
+                "CP1"
+              ]
+            }
+          }
+        },
+        "client": true,
+        "secret": false,
+        "assertion": "certificate",
+        "username": false,
+        "password": false,
+        "body_stable": true
+      }
+    ],
+    "discovery": [
+      "instance",
+      "openid"
+    ],
+    "objects": null
+  }
+]

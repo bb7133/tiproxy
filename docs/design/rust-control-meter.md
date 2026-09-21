@@ -505,7 +505,7 @@ metadata date, boolean, integer and base64 decoding errors fail after the retry
 policy, without retrying a successful HTTP response. These checks decode the
 server CRC header; the SDK default does not compare its CRC to the payload.
 
-Ninety-five actual production-provider loopback HTTP cases compare full request
+The original 95 production-provider loopback HTTP cases compare full request
 trajectories, block identity/order, commit XML, payload lengths/hashes, headers,
 SAS preservation and Exists/Upload results. Only the public retry delay option is
 shortened to 1ns; status classification, retry counts and SDK source are unchanged.
@@ -517,10 +517,10 @@ HEAD 503→404 and PUT 503→201. Regenerate with:
 bash rust/crates/control-meter/testdata/azure-object-go.sh
 ```
 
-Five fixed-time Azure SharedKey signatures match actual HEAD, direct PUT,
+Seven fixed-time Azure SharedKey signatures match actual HEAD, direct PUT,
 StageBlock and CommitBlockList requests from the pinned Go azblob SDK. This
 proves signature canonicalization, including the stage/commit query parameters
-and headers. SharedKey takes precedence over SAS; SAS query strings survive
+and headers; two additional HEAD signatures use keys with nonzero base64 pad bits. SharedKey takes precedence over SAS; SAS query strings survive
 container/prefix/key assembly. A metering-specific transport and bounded command
 executor serve the official Azure identity SDK. Environment secret, encrypted
 PEM/PFX certificate, username/password, workload assertion, managed identity, CLI,
@@ -570,11 +570,138 @@ go run rust/crates/control-meter/testdata/azure-managed-go.go
 go run rust/crates/control-meter/testdata/azure-managed-cache-go.go
 ```
 
-Full default-credential/endpoint edge parity remains in progress. Azure bearer
-401 challenge handling and unusual RFC1123 named-zone metadata dates are not
-qualified by the SharedKey/SAS object fixtures. The declared general HTTP date,
-endpoint and platform transport edges remain open. Export failure retains the
-pending window for the next metering attempt.
+Azure storage bearer challenges now preserve the challenged resource scope across
+operations. The pinned parser accepts the same space-delimited resource fields
+and appends `/.default` when absent; its tenant field is unused. Continuous
+Access Evaluation (CAE) claims take priority across all challenge header values.
+Resource challenges may be followed by one CAE replay; a CAE replay does not
+recursively process another challenge. HTTP retry attempts may each enter this
+challenge flow, and each replay preserves the body.
+
+Typed Azure response dates now validate Go RFC1123 acceptance instead of strict
+RFC7231 acceptance. This preserves syntactic (not calendar-matched) weekdays,
+case-insensitive day/month names, repeated spaces, optional fractional seconds,
+valid leap dates and Go's named/signed-hour zone grammar. Only parse success is
+needed for this metadata; no zone offset is inferred. MD5/CRC64 metadata, SharedKey
+configuration and CAE claims share Go-compatible non-strict padded base64 decoding.
+
+The object fixture now has 243 actual production-provider cases: the original 95
+plus 116 date and 32 base64 metadata cases. Its 58 date inputs run through both
+HEAD and PUT, including accepted named zones and rejected date/time ranges. Old
+RFC7231 validation and strict base64 both fail the expanded fixture; corrected
+validation passes. Two extra fixed-time SharedKey signatures cover nonzero pad
+bits, bringing that fixture to seven byte-equal signatures. HTTP Retry-After
+clock interpretation remains separate from metadata acceptance.
+
+Retry-After now shares the RFC1123 grammar and preserves timestamp interpretation
+for Go hosts with `time.Local=UTC`, including unknown abbreviations and Go's
+GMT signed-hour behavior. Fractional seconds truncate to nanoseconds. The native
+parser uses this UTC-host interpretation; Go's lookup of recognized abbreviations
+in a non-UTC host zone remains an explicit platform gap.
+
+Integer retry hints now follow the pinned 64-bit Go behavior: `Atoi` range errors
+still return a saturated positive integer, multiplication into nanosecond durations
+wraps, and a nonpositive wrapped result selects normal backoff without falling
+through to a lower-priority retry header. Positive hints still stop at the same
+60-second cap.
+
+The expanded actual provider fixture contains 519 cases: all previous 243 remain
+unchanged, plus 116 retry dates, 144 integer hints and 16 precedence cases across
+HEAD and PUT. Date rows additionally compare exact parsed epoch seconds and
+nanoseconds. Eight positive wrapped delays are captured from the real SDK's public
+retry logger and checked against the native sleep, allowing only Tokio's 1ms timer
+rounding. Future dates use year2100 so the real SDK rejects delays above its cap
+without waiting; past and malformed values use ordinary shortened backoff. No
+SDK clock or source is patched. This does not qualify non-UTC host zone lookup.
+
+Managed identity caches are keyed by resource. Nonempty CAE claims bypass the
+cached token and replace it on success; claims are not sent to the metadata
+endpoint, matching MSAL. Developer and OAuth credentials cache tokens in the outer bearer
+policy, which expires the cache on 401 even without a usable challenge. Refresh
+uses the five-minute window and 30-second retry backoff; a failed eager refresh
+retains the still-valid token. PowerShell has no inner token cache and accepts
+the challenged resource after validating the SDK's safe scope character set.
+CLI/PowerShell reject claims, while Developer CLI sends base64 `--claims` to azd.
+
+The 241 actual production-provider cases use DefaultAzureCredential, local TLS,
+a synthetic App Service metadata endpoint and fake az/azd/pwsh executables.
+Sixty cases per source compare every metadata or normalized tool scope/claims
+and object authorization/body trajectory, including scope persistence/reversion,
+CAE refresh, malformed challenges and ordinary retries before/after challenges.
+A further CLI case waits 31 seconds to verify eager refresh failure fallback,
+30-second backoff and forced renewal after 401. The native replay advances its
+Tokio timer for this wait. Tool executable templates and platform process
+launchers are not compared byte-for-byte; their scope, claims and call counts are. The public Go x509 fallback-root API
+trusts only the synthetic local certificate in the probe; SDK source is unchanged.
+Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-bearer-go.sh
+```
+
+Environment secret, certificate and workload credentials now wrap fresh maintained
+SDK credential objects for actual OAuth fetches. Their scope-keyed cache reuses
+unchallenged tokens, bypasses cache for nonempty claims, and replaces an entry
+only after success. The username/password adapter follows the same cache and
+changed-resource behavior. OAuth requests append the pinned Go OIDC scopes and
+merge CP1 capabilities into claims. Invalid JSON or conflicting capability fields
+fail before a token request. The outer bearer policy handles the five-minute
+refresh window and 30-second fallback backoff for these sources too; managed
+identity retains its own `refresh_in` timing.
+
+The OAuth fixture uses the exact production Go dependency graph and four real
+DefaultAzureCredential sources: secret, workload file, password and certificate.
+Each performs 13 credential steps plus four real Blob client operations. The
+native replay compares all 52 token results/errors, 28 normalized token POSTs,
+and authorization sequences/body preservation across 16 HEAD/PUT operations.
+Certificate assertions are signature-verified on both sides (Go PS256 and the
+maintained Rust SDK's RS256); randomized JWT bytes and discovery requests are
+not claimed equal. The Go constructor uses only a public custom transport:
+canonical authority requests are redirected to local TLS, and every other host
+is rejected before network access. Instance discovery remains enabled and the
+fixture serves its metadata. No SDK source or token-cache internals are patched.
+Regenerate with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-oauth-go.sh
+```
+
+OAuth token HTTP exchanges use one retry owner with the pinned azcore defaults:
+four total attempts for send failures and 408/429/500/502/503/504, shared
+Retry-After parsing, and a 60-second cap. The maintained SDK retry loop is
+disabled so it cannot multiply attempts. Token responses accept exactly 200
+and 201; the adapter normalizes 201 only for the SDK decoder. Password token
+requests follow the same policy. Request bytes survive retries, cancellation
+interrupts the backoff, and a later call can recover without a cached failure.
+
+The additional HTTP fixture records 112 real Go credential trajectories across
+the four sources, with 224 token steps and 232 normalized token POSTs. It covers
+terminal and retryable statuses, exhaustion followed by recovery, send errors,
+retry-header precedence/caps, stable request bodies, success caching and caller
+cancellation during retry sleep. The public per-call retry option reduces only
+ordinary backoff to 1ns; a public SDK retry-log listener cancels the caller
+context in cancellation cases. No SDK source, clock or cache is patched. The
+native replay uses paused Tokio time. Regenerate this fixture with:
+
+```sh
+bash rust/crates/control-meter/testdata/azure-oauth-go.sh --retry
+```
+
+These fixtures qualify token request fields, scope/claims/cache and object
+challenge behavior for the isolated managed authority. Native SDK instance and
+OpenID discovery, authority alias validation, federated password user realms,
+OAuth semantic error classification and refresh-token reuse are not covered by this
+increment and remain open. The regex and permissive base64 dependencies reuse
+package versions already in Cargo.lock; this OAuth increment adds no dependency.
+
+The remaining default-credential/endpoint boundaries have basic smoke coverage
+for default credential selection, fatal authentication, retry recovery, signed
+object writes and retained exports after failure. This does not establish full
+parity for the discovery/federation/refresh-token cases above, general HTTP dates,
+non-UTC host-zone Retry-After interpretation, or endpoint/platform transport
+edges. These remain declared limitations rather than additional exhaustive
+qualification gates. Export failure retains the pending window for the next
+metering attempt.
 
 This checkpoint rejects endpoint userinfo/fragment, non-Azure endpoint queries,
 and object keys with dot path segments because the HTTP URL implementation would

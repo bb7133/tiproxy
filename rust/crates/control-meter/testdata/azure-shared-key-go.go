@@ -41,10 +41,13 @@ func (fixedHeaders) Do(r *policy.Request) (*http.Response, error) {
 	return r.Next()
 }
 
-type transport struct{ rows []map[string]any }
+type transport struct {
+	rows []map[string]any
+	key  string
+}
 
 func (t *transport) Do(r *http.Request) (*http.Response, error) {
-	t.rows = append(t.rows, map[string]any{"method": r.Method, "url": r.URL.String(), "headers": r.Header})
+	t.rows = append(t.rows, map[string]any{"key": t.key, "method": r.Method, "url": r.URL.String(), "headers": r.Header})
 	status := 200
 	if r.Method == "PUT" {
 		status = 201
@@ -59,7 +62,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	tr := &transport{}
+	tr := &transport{key: key}
 	client, err := azblob.NewClientWithSharedKeyCredential("https://account.blob.core.windows.net", credential, &azblob.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: tr, PerCallPolicies: []policy.Policy{fixedHeaders{}}}})
 	if err != nil {
 		panic(err)
@@ -76,6 +79,21 @@ func main() {
 	_, err = client.ServiceClient().NewContainerClient("bucket").NewBlockBlobClient("prefix space/%text/key.json.gz").UploadStream(context.Background(), bytes.NewReader(bytes.Repeat([]byte{'p'}, 1048577)), nil)
 	if err != nil {
 		panic(err)
+	}
+
+	for _, noncanonical := range []string{"Zh==", "Zm9="} {
+		credential, err := azblob.NewSharedKeyCredential("account", noncanonical)
+		if err != nil {
+			panic(err)
+		}
+		tr.key = noncanonical
+		client, err := azblob.NewClientWithSharedKeyCredential("https://account.blob.core.windows.net", credential, &azblob.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: tr, PerCallPolicies: []policy.Policy{fixedHeaders{}}}})
+		if err != nil {
+			panic(err)
+		}
+		if _, err = client.ServiceClient().NewContainerClient("bucket").NewBlobClient("key.json.gz").GetProperties(context.Background(), nil); err != nil {
+			panic(err)
+		}
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")

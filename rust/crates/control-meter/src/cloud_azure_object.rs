@@ -21,6 +21,8 @@ use reqsign_core::{Context, hash::base64_encode};
 use reqwest::Url;
 use std::time::Duration;
 
+use crate::cloud_azure_date as metadata_date;
+
 const BLOCK_SIZE: usize = 1024 * 1024;
 fn failed() -> Error {
     Error::Export("Azure object request failed")
@@ -78,6 +80,41 @@ impl AzureSigner {
             .await
     }
 
+    async fn send_authorized(
+        &self,
+        context: &Context,
+        mut request: Request<Bytes>,
+    ) -> Result<reqsign_core::Result<Response<Bytes>>, Error> {
+        let mut response = context.http_send(request.clone()).await;
+        if let Self::Bearer(bearer) = self {
+            for round in 0..2 {
+                let Ok(reply) = &response else {
+                    break;
+                };
+                if reply.status() != StatusCode::UNAUTHORIZED {
+                    break;
+                }
+                let Some((token, cae)) = bearer.challenge(reply.headers(), round == 0).await?
+                else {
+                    break;
+                };
+                let mut authorization: http::HeaderValue =
+                    format!("Bearer {token}").parse().map_err(|_| failed())?;
+                authorization.set_sensitive(true);
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, authorization);
+                response = context.http_send(request.clone()).await;
+                // A storage challenge can be followed by one CAE challenge;
+                // a CAE replay is terminal for this pass through the pipeline.
+                if cae {
+                    break;
+                }
+            }
+        }
+        Ok(response)
+    }
+
     async fn send_object(
         &self,
         context: &Context,
@@ -107,7 +144,9 @@ impl AzureSigner {
                 .map_err(|_| failed())?
                 .into_parts();
             self.sign(&mut parts).await?;
-            let response = context.http_send(Request::from_parts(parts, payload)).await;
+            let response = self
+                .send_authorized(context, Request::from_parts(parts, payload))
+                .await?;
             if let Ok(response) = &response {
                 let status = response.status();
                 if !matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) || attempt == 3 {
@@ -210,7 +249,7 @@ fn validate_metadata(headers: &http::HeaderMap, head: bool, stage: bool) -> Resu
         if value.is_empty() {
             continue;
         }
-        if date && azure_core::time::parse_rfc7231(value).is_err() {
+        if date && !metadata_date::valid(value) {
             return Err(failed());
         }
         if boolean
@@ -232,7 +271,7 @@ fn validate_metadata(headers: &http::HeaderMap, head: bool, stage: bool) -> Resu
             return Err(failed());
         }
         if encoded {
-            reqsign_core::hash::base64_decode(value).map_err(|_| failed())?;
+            super::decode_base64(value).map_err(|_| failed())?;
         }
         if integer64 {
             value.parse::<i64>().map_err(|_| failed())?;
@@ -288,6 +327,12 @@ mod tests {
         attempts: Vec<Attempt>,
         error: bool,
         exists: bool,
+        #[serde(default)]
+        date_seconds: Option<i64>,
+        #[serde(default)]
+        date_nanos: u32,
+        #[serde(default)]
+        delay_nanos: Option<u64>,
     }
     #[derive(Default)]
     struct State {
@@ -424,8 +469,23 @@ mod tests {
     async fn retry_stream_blocks_and_results_match_real_go_provider() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../testdata/azure-object-go.json"))
             .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 95);
+        assert_eq!(rows.len(), 519);
         for row in rows {
+            if row.name.starts_with("retry-date-") {
+                let date = metadata_date::parse_utc(&row.responses[0].headers["retry-after"]);
+                assert_eq!(
+                    date.map(azure_core::time::OffsetDateTime::unix_timestamp),
+                    row.date_seconds,
+                    "{}",
+                    row.name
+                );
+                assert_eq!(
+                    date.map_or(0, azure_core::time::OffsetDateTime::nanosecond),
+                    row.date_nanos,
+                    "{}",
+                    row.name
+                );
+            }
             let io = Io::default();
             {
                 let mut state = io.0.lock().unwrap_or_else(|e| unreachable!("{e}"));
@@ -448,10 +508,21 @@ mod tests {
                 url.set_query(Some("sig=fake&sp=rw&sv=2025-11-05"));
             }
             let method: Method = row.method.parse().unwrap_or_else(|e| unreachable!("{e}"));
+            let started = tokio::time::Instant::now();
             let result = signer
                 .request(&context, method.clone(), &url, vec![b'p'; row.size].into())
                 .await;
             let label = format!("{} {}", row.method, row.name);
+            if let Some(nanos) = row.delay_nanos {
+                // Tokio rounds timers to milliseconds; compare its actual
+                // elapsed sleep with the real Go policy's captured delay.
+                let elapsed = started.elapsed();
+                let expected = Duration::from_nanos(nanos);
+                assert!(
+                    elapsed >= expected && elapsed - expected <= Duration::from_millis(1),
+                    "{label}: {elapsed:?} != {expected:?}"
+                );
+            }
             assert_eq!(result.is_err(), row.error, "{label}");
             if method == Method::HEAD {
                 assert_eq!(result.is_ok_and(|s| s.is_success()), row.exists, "{label}");

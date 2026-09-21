@@ -29,7 +29,9 @@ use http::{Method, Request, Response, StatusCode};
 use reqsign_core::Context;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
 const SCOPE: &str = "https://storage.azure.com/.default";
+#[cfg(test)]
 const RESOURCE: &str = "https://storage.azure.com";
 const IMDS: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
 
@@ -77,7 +79,7 @@ pub(crate) struct Managed {
     client_id: Option<String>,
     ml_default_client_id: String,
     probe: AtomicBool,
-    cached: Mutex<Option<Cached>>,
+    cached: Mutex<BTreeMap<String, Cached>>,
 }
 
 impl fmt::Debug for Managed {
@@ -148,11 +150,11 @@ impl Managed {
             client_id,
             ml_default_client_id,
             probe: AtomicBool::new(probe),
-            cached: Mutex::new(None),
+            cached: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn request(&self, arc_key: Option<&str>) -> azure_core::Result<Request<Bytes>> {
+    fn request(&self, resource: &str, arc_key: Option<&str>) -> azure_core::Result<Request<Bytes>> {
         let mut url = reqwest::Url::parse(&self.endpoint).map_err(|_| failure())?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -172,7 +174,9 @@ impl Managed {
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/x-www-form-urlencoded"),
             );
-            body = Bytes::from("resource=https%3A%2F%2Fstorage.azure.com");
+            let mut form = reqwest::Url::parse("http://form.invalid").map_err(|_| failure())?;
+            form.query_pairs_mut().append_pair("resource", resource);
+            body = Bytes::from(form.query().ok_or_else(failure)?.to_owned());
         } else {
             let mut query: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (key, value) in url.query_pairs() {
@@ -190,7 +194,7 @@ impl Managed {
                 Source::CloudShell => return Err(failure()),
             };
             query.insert("api-version".into(), vec![version.into()]);
-            query.insert("resource".into(), vec![RESOURCE.into()]);
+            query.insert("resource".into(), vec![resource.into()]);
             if self.source == Source::MachineLearning {
                 query.insert(
                     "clientid".into(),
@@ -243,7 +247,7 @@ impl Managed {
         Ok(request)
     }
 
-    async fn acquire(&self) -> azure_core::Result<Cached> {
+    async fn acquire(&self, resource: &str) -> azure_core::Result<Cached> {
         if self.probe.load(Ordering::Acquire) {
             // DefaultAzureCredential probes IMDS once without Metadata, with no retry.
             let request = Request::builder()
@@ -256,7 +260,7 @@ impl Managed {
                 .map_err(|_| missing())?;
             self.probe.store(false, Ordering::Release);
         }
-        let mut request = self.request(None)?;
+        let mut request = self.request(resource, None)?;
         if self.source == Source::Arc {
             let challenge = self.send(request).await?;
             if challenge.status() != StatusCode::UNAUTHORIZED {
@@ -268,7 +272,7 @@ impl Managed {
                 None
             };
             let key = arc_secret(&self.context, &challenge, root).await?;
-            request = self.request(Some(&key))?;
+            request = self.request(resource, Some(&key))?;
         }
         let response = self.send(request).await?;
         if !matches!(response.status(), StatusCode::OK | StatusCode::ACCEPTED) {
@@ -291,43 +295,59 @@ impl Managed {
     }
 
     async fn send(&self, request: Request<Bytes>) -> azure_core::Result<Response<Bytes>> {
-        let imds = self.source == Source::Imds;
-        let max_retries = if imds { 6 } else { 3 };
-        for attempt in 0..=max_retries {
-            let result = self.context.http_send(request.clone()).await;
-            if let Ok(response) = &result {
-                let status = response.status().as_u16();
-                let retry = if imds {
-                    matches!(status, 404 | 410 | 429 | 500..=511) && status != 509
-                } else {
-                    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-                };
-                if !retry || attempt == max_retries {
-                    return result.map_err(|_| failure());
-                }
-            } else if attempt == max_retries {
-                return Err(failure());
-            }
-            let maximum = Duration::from_secs(if imds { 25 } else { 60 });
-            let server_delay = result.as_ref().ok().and_then(|r| retry_after(r.headers()));
-            if server_delay.is_some_and(|delay| delay > maximum) {
+        send_with_retry(&self.context, request, self.source == Source::Imds).await
+    }
+}
+
+/// OAuth uses the same azcore defaults as non-IMDS managed identity. Keep one
+/// retry owner so the maintained Rust SDK cannot multiply these attempts.
+pub(crate) async fn send_oauth(
+    context: &Context,
+    request: Request<Bytes>,
+) -> azure_core::Result<Response<Bytes>> {
+    send_with_retry(context, request, false).await
+}
+
+async fn send_with_retry(
+    context: &Context,
+    request: Request<Bytes>,
+    imds: bool,
+) -> azure_core::Result<Response<Bytes>> {
+    let max_retries = if imds { 6 } else { 3 };
+    for attempt in 0..=max_retries {
+        let result = context.http_send(request.clone()).await;
+        if let Ok(response) = &result {
+            let status = response.status().as_u16();
+            let retry = if imds {
+                matches!(status, 404 | 410 | 429 | 500..=511) && status != 509
+            } else {
+                matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+            };
+            if !retry || attempt == max_retries {
                 return result.map_err(|_| failure());
             }
-            // Go uses (2^try - 1) * base with [0.8, 1.3) jitter, then caps it.
-            let mut random = [0; 2];
-            let jitter = if getrandom::getrandom(&mut random).is_ok() {
-                0.8 + f64::from(u16::from_ne_bytes(random)) / 131_072.0
-            } else {
-                1.0
-            };
-            let factor = (1_u32 << (attempt + 1)) - 1;
-            let base = Duration::from_millis(if imds { 2000 } else { 800 });
-            let delay = (base * factor).mul_f64(jitter).min(maximum);
-            // CloudIo and the export operation supply outer request/operation deadlines.
-            tokio::time::sleep(server_delay.unwrap_or(delay)).await;
+        } else if attempt == max_retries {
+            return Err(failure());
         }
-        Err(failure())
+        let maximum = Duration::from_secs(if imds { 25 } else { 60 });
+        let server_delay = result.as_ref().ok().and_then(|r| retry_after(r.headers()));
+        if server_delay.is_some_and(|delay| delay > maximum) {
+            return result.map_err(|_| failure());
+        }
+        // Go uses (2^try - 1) * base with [0.8, 1.3) jitter, then caps it.
+        let mut random = [0; 2];
+        let jitter = if getrandom::getrandom(&mut random).is_ok() {
+            0.8 + f64::from(u16::from_ne_bytes(random)) / 131_072.0
+        } else {
+            1.0
+        };
+        let factor = (1_u32 << (attempt + 1)) - 1;
+        let base = Duration::from_millis(if imds { 2000 } else { 800 });
+        let delay = (base * factor).mul_f64(jitter).min(maximum);
+        // CloudIo and the export operation supply outer request/operation deadlines.
+        tokio::time::sleep(server_delay.unwrap_or(delay)).await;
     }
+    Err(failure())
 }
 
 #[async_trait::async_trait]
@@ -335,32 +355,35 @@ impl TokenCredential for Managed {
     async fn get_token(
         &self,
         scopes: &[&str],
-        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        if scopes != [SCOPE] {
+        let [scope] = scopes else {
             return Err(failure());
-        }
+        };
+        let resource = scope.strip_suffix("/.default").unwrap_or(scope);
+        let claims = crate::cloud_azure_identity::has_claims(options.as_ref());
         let mut cached = self.cached.lock().await;
         let now = OffsetDateTime::now_utc();
-        if let Some(value) = cached.as_ref()
+        if let Some(value) = cached.get(resource)
+            && !claims
             && value.token.expires_on >= now + azure_core::time::Duration::minutes(5)
         {
             if value.refresh_on.is_none_or(|refresh| refresh > now) {
                 return Ok(value.token.clone());
             }
             // MSAL refresh_in failures fall back only while cache validation still succeeds.
-            match self.acquire().await {
+            match self.acquire(resource).await {
                 Ok(value) => {
                     let token = value.token.clone();
-                    *cached = Some(value);
+                    cached.insert(resource.to_owned(), value);
                     return Ok(token);
                 }
                 Err(_) => return Ok(value.token.clone()),
             }
         }
-        let value = self.acquire().await?;
+        let value = self.acquire(resource).await?;
         let token = value.token.clone();
-        *cached = Some(value);
+        cached.insert(resource.to_owned(), value);
         Ok(token)
     }
 }
@@ -374,16 +397,21 @@ pub(crate) fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
         let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
-        if let Ok(number) = value.parse::<u64>()
-            && number > 0
-        {
-            return Some(if milliseconds {
-                Duration::from_millis(number)
+        if let Some(number) = positive_go_integer(value) {
+            // azcore ignores Atoi's error, then multiplies signed int64
+            // durations with wrapping. Even a nonpositive wrapped result
+            // stops header fallback; the caller uses its normal backoff.
+            let nanos = number.wrapping_mul(if milliseconds {
+                1_000_000
             } else {
-                Duration::from_secs(number)
+                1_000_000_000
             });
+            return u64::try_from(nanos)
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Duration::from_nanos);
         }
-        if !milliseconds && let Ok(date) = azure_core::time::parse_rfc7231(value) {
+        if !milliseconds && let Some(date) = crate::cloud_azure_date::parse_utc(value) {
             let delta = date - OffsetDateTime::now_utc();
             if delta.is_positive() {
                 return Duration::try_from(delta).ok();
@@ -391,6 +419,30 @@ pub(crate) fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
         }
     }
     None
+}
+
+/// The positive result of Go Atoi on our 64-bit targets, including `ErrRange`'s
+/// saturated value. Scan as uint64 first: syntax after signed overflow still
+/// fails, but syntax after unsigned overflow is never reached by Go `ParseUint`.
+fn positive_go_integer(value: &str) -> Option<i64> {
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() {
+        return None;
+    }
+    let mut number = 0_u64;
+    for digit in digits.bytes() {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        let Some(next) = number
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(digit - b'0')))
+        else {
+            return Some(i64::MAX);
+        };
+        number = next;
+    }
+    (number > 0).then(|| i64::try_from(number).unwrap_or(i64::MAX))
 }
 
 fn sensitive(value: &str) -> azure_core::Result<http::HeaderValue> {
@@ -632,8 +684,13 @@ mod tests {
             first.token.secret()
         );
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
-        managed.cached.lock().await.as_mut().unwrap().refresh_on =
-            Some(OffsetDateTime::now_utc() - azure_core::time::Duration::seconds(1));
+        managed
+            .cached
+            .lock()
+            .await
+            .get_mut(RESOURCE)
+            .unwrap()
+            .refresh_on = Some(OffsetDateTime::now_utc() - azure_core::time::Duration::seconds(1));
         transport
             .replies
             .lock()
@@ -652,7 +709,7 @@ mod tests {
             .cached
             .lock()
             .await
-            .as_mut()
+            .get_mut(RESOURCE)
             .unwrap()
             .token
             .expires_on = OffsetDateTime::now_utc() + azure_core::time::Duration::minutes(1);
@@ -754,7 +811,7 @@ mod tests {
         assert!(arc_secret(&ctx, &valid, None).await.is_err());
         let secret = arc_secret(&ctx, &valid, root).await.unwrap();
         let managed = Managed::new(ctx.clone()).await.unwrap();
-        let request = managed.request(Some(&secret)).unwrap();
+        let request = managed.request(RESOURCE, Some(&secret)).unwrap();
         assert_eq!(request.headers()["authorization"], "Basic fake-arc-key");
         assert!(request.headers()["authorization"].is_sensitive());
         let too_big = ctx.with_file_read(KeyFile {

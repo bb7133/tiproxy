@@ -31,7 +31,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/log"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/pingcap/metering_sdk/storage/provider"
 )
@@ -67,6 +69,9 @@ type row struct {
 	Attempts    []attempt `json:"attempts"`
 	Error       bool      `json:"error"`
 	Exists      bool      `json:"exists"`
+	DateSeconds *int64    `json:"date_seconds,omitempty"`
+	DateNanos   int       `json:"date_nanos,omitempty"`
+	DelayNanos  *int64    `json:"delay_nanos,omitempty"`
 }
 
 func main() {
@@ -100,6 +105,54 @@ func main() {
 		for _, h := range []string{"Date", "Last-Modified", "Content-MD5", "x-ms-content-crc64", "x-ms-request-server-encrypted", "x-ms-server-encrypted", "x-ms-blob-committed-block-count"} {
 			add("invalid-"+h, reply{Headers: map[string]string{h: "invalid"}})
 		}
+
+		dates := []string{
+			"Mon, 02 Jan 2006 15:04:05 GMT", "Tue, 02 Jan 2006 15:04:05 GMT",
+			"mon, 02 jan 2006 15:04:05 GMT", "Mon,  02  Jan  2006  15:04:05  GMT",
+			"Mon, 2 Jan 2006 15:04:05 GMT", "Mon, 02 Jan 06 15:04:05 GMT",
+			"Mon, 02 Jan 2006 5:04:05 GMT", "Mon, 02 Jan 2006 15:4:05 GMT",
+			"Mon, 02 Jan 2006 15:04:5 GMT", "Mon, 02 Jan 2006 15:04:05.123456789123 GMT",
+			"Mon, 02 Jan 2006 15:04:05,1 GMT", "Mon, 02 Jan 2006 15:04:05. GMT",
+			"Mon, 29 Feb 2000 15:04:05 GMT", "Mon, 29 Feb 1900 15:04:05 GMT",
+			"Mon, 29 Feb 0000 15:04:05 GMT", "Mon, 31 Apr 2006 15:04:05 GMT",
+			"Mon, 00 Jan 2006 15:04:05 GMT", "Mon, 02 Jan 2006 24:04:05 GMT",
+			"Mon, 02 Jan 2006 15:60:05 GMT", "Mon, 02 Jan 2006 15:04:60 GMT",
+			"Monday, 02 Jan 2006 15:04:05 GMT", "Mon, 02 January 2006 15:04:05 GMT",
+			"Sun Nov  6 08:49:37 1994", "Sunday, 06-Nov-94 08:49:37 GMT",
+			"Mon,02 Jan 2006 15:04:05 GMT", "Mon, 02Jan 2006 15:04:05 GMT",
+		}
+		for _, zone := range []string{"UTC", "PST", "CST", "FOO", "WITA", "ChST", "MeST", "CEST", "ABCET", "ABCD", "ABCDE", "ABCDEF", "UT", "Z", "gmt", "GMT+1", "GMT-23", "GMT+24", "GMT+0", "GMT+00001", "+01", "-00", "+1", "-24", "+0000", "+000000000000000000000001", "+999999999999999999999999999", "GMT+01:00", "GMTT", "GMTET", "UTCT", "UTCET"} {
+			dates = append(dates, "Mon, 02 Jan 2006 15:04:05 "+zone)
+		}
+		for i, date := range dates {
+			add(fmt.Sprintf("metadata-date-%d", i), reply{Headers: map[string]string{"Last-Modified": date}})
+		}
+		// Future dates exercise the real policy's >60s terminal cap without
+		// patching its clock or waiting. Preserve past/invalid calendar rows.
+		for i, date := range dates {
+			date = strings.ReplaceAll(date, "2006", "2100")
+			add(fmt.Sprintf("retry-date-%d", i), reply{Status: 503, Headers: map[string]string{"retry-after": date}}, reply{})
+			if parsed, err := time.Parse(time.RFC1123, date); err == nil {
+				seconds := parsed.Unix()
+				cases[len(cases)-1].DateSeconds = &seconds
+				cases[len(cases)-1].DateNanos = parsed.Nanosecond()
+			}
+		}
+		integers := []string{"0", "-1", "+0", "+60001", "60001", "1_000", "0x100", "1.0", "1x", "--1", "9223372036854775807", "9223372036854775808", "18446744073709551615", "18446744073709551616", "999999999999999999999999999", "-999999999999999999999999999", "9223372036854775808x", "18446744073709551616x", "9223372036855", "18446744073709", "18446744073710", "9223372037", "288230376151711744", "36028797018963968"}
+		for _, header := range []string{"retry-after-ms", "x-ms-retry-after-ms", "retry-after"} {
+			for i, value := range integers {
+				add(fmt.Sprintf("retry-integer-%s-%d", header, i), reply{Status: 503, Headers: map[string]string{header: value}}, reply{})
+			}
+		}
+		for i, value := range []string{"0", "-1", "invalid", "9223372036854775807", "9223372036854775808", "18446744073709551616x", "288230376151711744", "36028797018963968"} {
+			add(fmt.Sprintf("retry-precedence-%d", i), reply{Status: 503, Headers: map[string]string{"retry-after-ms": value, "x-ms-retry-after-ms": "60001", "retry-after": "61"}}, reply{})
+		}
+
+		for _, header := range []string{"Content-MD5", "x-ms-content-crc64"} {
+			for i, value := range []string{"Zg==", "Zh==", "Zm8=", "Zm9=", "Zg", "Zg=", "Z===", ""} {
+				add(fmt.Sprintf("metadata-base64-%s-%d", header, i), reply{Headers: map[string]string{header: value}})
+			}
+		}
 		add("sas-retry", reply{Status: 503}, reply{})
 		cases[len(cases)-1].SAS = true
 	}
@@ -115,8 +168,24 @@ func main() {
 			cases = append(cases, r)
 		}
 	}
+
+	// Observe the real policy's positive, sub-cap server delay using only its
+	// public logger. Retry logging contains no request headers or credentials.
+	var observedDelay *int64
+	log.SetEvents(log.EventRetryPolicy)
+	log.SetListener(func(event log.Event, message string) {
+		if event == log.EventRetryPolicy && strings.HasPrefix(message, "End Try #1, Delay=") {
+			delay, err := time.ParseDuration(strings.TrimPrefix(message, "End Try #1, Delay="))
+			if err != nil {
+				panic(err)
+			}
+			nanos := delay.Nanoseconds()
+			observedDelay = &nanos
+		}
+	})
 	for i := range cases {
 		r := &cases[i]
+		observedDelay = nil
 		requests := map[string]int{}
 		attemptIndex := 0
 		var blockPrefix []byte
@@ -222,6 +291,22 @@ func main() {
 			e = p.Upload(ctx, "key.json.gz", bytes.NewReader(bytes.Repeat([]byte("p"), r.Size)))
 		}
 		r.Error = e != nil
+		if strings.HasPrefix(r.Name, "retry-integer-") {
+			for header, value := range r.Responses[0].Headers {
+				number, _ := strconv.Atoi(value)
+				unit := time.Millisecond
+				if header == "retry-after" {
+					unit = time.Second
+				}
+				delay := time.Duration(number) * unit
+				if number > 0 && delay > 0 && delay <= time.Minute {
+					if observedDelay == nil {
+						panic("missing positive server-delay log")
+					}
+					r.DelayNanos = observedDelay
+				}
+			}
+		}
 		srv.Close()
 	}
 	enc := json.NewEncoder(os.Stdout)

@@ -17,22 +17,33 @@
 use crate::{Error, cloud_azure_identity::AzureDefault};
 use control_config::MeteringConfig;
 use http::{HeaderValue, Method, request::Parts};
-use reqsign_core::{
-    Context,
-    hash::{base64_decode, base64_hmac_sha256},
-    time::Timestamp,
-};
+use reqsign_core::{Context, hash::base64_hmac_sha256, time::Timestamp};
 use reqwest::{Client, Url};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+#[path = "cloud_azure_bearer.rs"]
+pub(crate) mod bearer;
 #[path = "cloud_azure_object.rs"]
 mod object;
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::{
+        Engine as _,
+        engine::{GeneralPurpose, GeneralPurposeConfig},
+    };
+    // Go StdEncoding is non-Strict and ignores CR/LF, including nonzero pad bits.
+    GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
+    )
+    .decode(value.replace(['\r', '\n'], ""))
+}
 
 pub(crate) enum AzureSigner {
     SharedKey { account: String, key: Vec<u8> },
     Sas,
-    Bearer(AzureDefault),
+    Bearer(bearer::Bearer),
 }
 
 pub(crate) async fn build(
@@ -68,7 +79,7 @@ pub(crate) async fn build(
                 "Azure account name is required for SharedKey",
             ));
         }
-        let key = base64_decode(&cfg.account_key)
+        let key = decode_base64(&cfg.account_key)
             .map_err(|_| Error::Invalid("invalid Azure account key"))?;
         AzureSigner::SharedKey {
             account: cfg.account_name,
@@ -88,7 +99,9 @@ pub(crate) async fn build(
         if url.scheme() != "https" {
             return Err(Error::Invalid("Azure bearer authentication requires HTTPS"));
         }
-        AzureSigner::Bearer(AzureDefault::new(client, context).await?)
+        AzureSigner::Bearer(bearer::Bearer::new(
+            AzureDefault::new(client, context).await?,
+        ))
     };
     Ok((url, signer))
 }
@@ -236,7 +249,7 @@ mod tests {
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("../testdata/azure-shared-key-go.json"))
                 .unwrap_or_else(|e| unreachable!("{e}"));
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 7);
         for row in rows {
             let mut request = http::Request::builder()
                 .method(row["method"].as_str().unwrap_or_default())
@@ -257,7 +270,8 @@ mod tests {
                 .0;
             AzureSigner::SharedKey {
                 account: "account".into(),
-                key: b"fake-account-key".to_vec(),
+                key: decode_base64(row["key"].as_str().unwrap_or_default())
+                    .unwrap_or_else(|e| unreachable!("{e}")),
             }
             .sign(&mut parts)
             .await

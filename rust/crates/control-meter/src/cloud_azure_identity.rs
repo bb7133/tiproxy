@@ -14,19 +14,47 @@
 
 //! Azure identity SDK composition with bounded application-owned transport.
 
-use crate::{Error, cloud_context::CloudIo};
+use crate::Error;
 use azure_core::credentials::{AccessToken, TokenCredential};
 use azure_core::http::{ClientOptions, Transport};
-use azure_identity::{
-    AzureCliCredential, AzureDeveloperCliCredential, ClientSecretCredential,
-    ClientSecretCredentialOptions,
-};
-use reqsign_core::{Context, HttpSend};
+use azure_identity::AzureCliCredential;
+use reqsign_core::Context;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SCOPE: &str = "https://storage.azure.com/.default";
-type CredentialSlot = (Arc<dyn TokenCredential>, bool);
+#[path = "cloud_azure_oauth.rs"]
+mod oauth;
+
+pub(crate) const SCOPE: &str = "https://storage.azure.com/.default";
+struct CredentialSlot {
+    credential: Arc<dyn TokenCredential>,
+    fatal: bool,
+    cache_in_bearer: bool,
+}
+impl CredentialSlot {
+    fn configured(credential: Arc<dyn TokenCredential>) -> Self {
+        Self {
+            credential,
+            fatal: true,
+            cache_in_bearer: true,
+        }
+    }
+    fn developer(credential: Arc<dyn TokenCredential>) -> Self {
+        Self {
+            credential,
+            fatal: false,
+            cache_in_bearer: true,
+        }
+    }
+    fn managed(credential: Arc<dyn TokenCredential>) -> Self {
+        // Managed identity owns refresh_in timing in its resource cache.
+        Self {
+            credential,
+            fatal: true,
+            cache_in_bearer: false,
+        }
+    }
+}
 
 pub(crate) struct AzureDefault {
     credentials: Vec<CredentialSlot>,
@@ -34,11 +62,15 @@ pub(crate) struct AzureDefault {
 }
 
 impl AzureDefault {
-    pub(crate) async fn new(client: reqwest::Client, ctx: Context) -> Result<Self, Error> {
-        let io = CloudIo(client);
+    pub(crate) async fn new(_client: reqwest::Client, ctx: Context) -> Result<Self, Error> {
         let executor = Arc::new(AzureExecutor(ctx.clone()));
-        let transport = Arc::new(AzureHttp(io));
+        let transport = Arc::new(AzureHttp(ctx.clone()));
+        let mut cloud = azure_core::cloud::CustomConfiguration::default();
+        cloud.authority_host = ctx
+            .env_var("AZURE_AUTHORITY_HOST")
+            .unwrap_or_else(|| "https://login.microsoftonline.com".into());
         let options = ClientOptions {
+            cloud: Some(Arc::new(cloud.into())),
             transport: Some(Transport::new(transport)),
             ..Default::default()
         };
@@ -54,7 +86,7 @@ impl AzureDefault {
         if selected("EnvironmentCredential", false)
             && let Some(credential) = environment(&ctx, options.clone()).await
         {
-            credentials.push((credential, true));
+            credentials.push(CredentialSlot::configured(credential));
         }
         if selected("WorkloadIdentityCredential", false)
             && let (Some(tenant), Some(client), Some(path)) = (
@@ -63,25 +95,22 @@ impl AzureDefault {
                 ctx.env_var("AZURE_FEDERATED_TOKEN_FILE"),
             )
             && !path.is_empty()
-            && let Ok(credential) = azure_identity::ClientAssertionCredential::new(
-                tenant,
-                client,
-                WorkloadAssertion {
+            && let Ok(credential) = oauth::Credential::new(
+                oauth::Source::Workload {
+                    tenant,
+                    client,
                     context: ctx.clone(),
                     path,
                 },
-                Some(azure_identity::ClientAssertionCredentialOptions {
-                    client_options: options.clone(),
-                    ..Default::default()
-                }),
+                options.clone(),
             )
         {
-            credentials.push((credential, true));
+            credentials.push(CredentialSlot::configured(credential));
         }
         if selected("ManagedIdentityCredential", false)
             && let Ok(credential) = crate::cloud_azure_managed::Managed::new(ctx.clone()).await
         {
-            credentials.push((Arc::new(credential), true));
+            credentials.push(CredentialSlot::managed(Arc::new(credential)));
         }
         if selected("AzureCLICredential", true)
             && let Ok(credential) =
@@ -90,27 +119,23 @@ impl AzureDefault {
                     ..Default::default()
                 }))
         {
-            credentials.push((credential, false));
+            credentials.push(CredentialSlot::developer(Arc::new(CliClaimsGuard(
+                credential,
+            ))));
         }
-        if selected("AzureDeveloperCLICredential", true)
-            && let Ok(credential) = AzureDeveloperCliCredential::new(Some(
-                azure_identity::AzureDeveloperCliCredentialOptions {
-                    executor: Some(executor),
-                    ..Default::default()
-                },
-            ))
-        {
-            credentials.push((credential, false));
+        if selected("AzureDeveloperCLICredential", true) {
+            credentials.push(CredentialSlot::developer(Arc::new(AuxiliaryCredential {
+                context: ctx.clone(),
+                source: AuxiliarySource::DeveloperCli,
+                cached: Mutex::new(std::collections::BTreeMap::new()),
+            })));
         }
         if selected("AzurePowerShellCredential", true) {
-            credentials.push((
-                Arc::new(AuxiliaryCredential {
-                    context: ctx,
-                    source: AuxiliarySource::PowerShell,
-                    cached: Mutex::new(None),
-                }),
-                false,
-            ));
+            credentials.push(CredentialSlot::developer(Arc::new(AuxiliaryCredential {
+                context: ctx,
+                source: AuxiliarySource::PowerShell,
+                cached: Mutex::new(std::collections::BTreeMap::new()),
+            })));
         }
         Ok(Self {
             credentials,
@@ -118,19 +143,50 @@ impl AzureDefault {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn token(&self) -> Result<String, Error> {
+        self.token_for(SCOPE, Vec::new()).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn token_for(&self, scope: &str, claims: Vec<u8>) -> Result<String, Error> {
+        self.access_token_for(scope, claims)
+            .await
+            .map(|(v, _)| v.token.secret().to_owned())
+    }
+
+    pub(crate) async fn access_token_for(
+        &self,
+        scope: &str,
+        claims: Vec<u8>,
+    ) -> Result<(AccessToken, bool), Error> {
+        let options = azure_core::credentials::TokenRequestOptions {
+            method_options: azure_core::http::ClientMethodOptions {
+                context: azure_core::http::Context::default().with_value(ChallengeClaims(claims)),
+            },
+        };
         let mut selected = self.selected.lock().await;
         if let Some(index) = *selected {
-            return token(self.credentials[index].0.get_token(&[SCOPE], None).await);
+            return checked_token(
+                self.credentials[index]
+                    .credential
+                    .get_token(&[scope], Some(options))
+                    .await,
+            )
+            .map(|v| (v, self.credentials[index].cache_in_bearer));
         }
-        for (index, (credential, fatal)) in self.credentials.iter().enumerate() {
-            match credential.get_token(&[SCOPE], None).await {
+        for (index, slot) in self.credentials.iter().enumerate() {
+            match slot
+                .credential
+                .get_token(&[scope], Some(options.clone()))
+                .await
+            {
                 Ok(value) => {
-                    let token = token(Ok(value))?;
+                    let token = checked_token(Ok(value))?;
                     *selected = Some(index);
-                    return Ok(token);
+                    return Ok((token, slot.cache_in_bearer));
                 }
-                Err(error) if *fatal && !crate::cloud_azure_managed::unavailable(&error) => {
+                Err(error) if slot.fatal && !crate::cloud_azure_managed::unavailable(&error) => {
                     return Err(Error::Export(
                         "Azure configured identity authentication failed",
                     ));
@@ -139,6 +195,34 @@ impl AzureDefault {
             }
         }
         Err(Error::Export("Azure default identity unavailable"))
+    }
+}
+
+#[derive(Clone)]
+struct ChallengeClaims(Vec<u8>);
+
+pub(crate) fn has_claims(
+    options: Option<&azure_core::credentials::TokenRequestOptions<'_>>,
+) -> bool {
+    options
+        .and_then(|o| o.method_options.context.value::<ChallengeClaims>())
+        .is_some_and(|v| !v.0.is_empty())
+}
+
+// The pinned Go CLI credential rejects claims because az cannot accept them.
+#[derive(Debug)]
+struct CliClaimsGuard(Arc<dyn TokenCredential>);
+#[async_trait::async_trait]
+impl TokenCredential for CliClaimsGuard {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        if has_claims(options.as_ref()) {
+            return Err(identity_error());
+        }
+        self.0.get_token(scopes, options).await
     }
 }
 
@@ -166,13 +250,13 @@ async fn environment(ctx: &Context, options: ClientOptions) -> Option<Arc<dyn To
     let tenant = ctx.env_var("AZURE_TENANT_ID")?;
     let client = ctx.env_var("AZURE_CLIENT_ID")?;
     if let Some(secret) = ctx.env_var("AZURE_CLIENT_SECRET").filter(|v| !v.is_empty()) {
-        return ClientSecretCredential::new(
-            &tenant,
-            client,
-            secret.into(),
-            Some(ClientSecretCredentialOptions {
-                client_options: options,
-            }),
+        return oauth::Credential::new(
+            oauth::Source::Secret {
+                tenant,
+                client,
+                secret,
+            },
+            options,
         )
         .ok()
         .map(|v| v as Arc<dyn TokenCredential>);
@@ -190,18 +274,22 @@ async fn environment(ctx: &Context, options: ClientOptions) -> Option<Arc<dyn To
         .map(|v| Arc::new(v) as Arc<dyn TokenCredential>)
 }
 
-fn token(result: azure_core::Result<AccessToken>) -> Result<String, Error> {
+fn checked_token(result: azure_core::Result<AccessToken>) -> Result<AccessToken, Error> {
     let value = result.map_err(|_| Error::Export("Azure identity authentication failed"))?;
     if value.expires_on <= azure_core::time::OffsetDateTime::now_utc()
         || value.token.secret().is_empty()
     {
         return Err(Error::Export("Azure identity token expired or empty"));
     }
-    Ok(value.token.secret().to_owned())
+    Ok(value)
 }
 
-#[derive(Debug)]
-struct AzureHttp(CloudIo);
+struct AzureHttp(Context);
+impl std::fmt::Debug for AzureHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AzureHttp")
+    }
+}
 
 #[async_trait::async_trait]
 impl azure_core::http::HttpClient for AzureHttp {
@@ -224,11 +312,12 @@ impl azure_core::http::HttpClient for AzureHttp {
         let azure_core::http::Body::Bytes(body) = request.body() else {
             return Err(error());
         };
-        let response = self
-            .0
-            .http_send(req.body(body.clone()).map_err(|_| error())?)
-            .await
-            .map_err(|_| error())?;
+        let response = crate::cloud_azure_managed::send_oauth(
+            &self.0,
+            req.body(body.clone()).map_err(|_| error())?,
+        )
+        .await
+        .map_err(|_| error())?;
         let (parts, body) = response.into_parts();
         let mut headers = azure_core::http::headers::Headers::new();
         for (name, value) in &parts.headers {
@@ -236,10 +325,28 @@ impl azure_core::http::HttpClient for AzureHttp {
                 headers.insert(name.as_str().to_owned(), value.to_owned());
             }
         }
+        if request.url().path().ends_with("/token")
+            && parts.status.is_success()
+            && !matches!(
+                parts.status,
+                http::StatusCode::OK | http::StatusCode::CREATED
+            )
+        {
+            // The certificate SDK accepts arbitrary 2xx; Go MSAL doesn't.
+            return Err(identity_error());
+        }
+        // Go MSAL accepts both 200 and 201 token responses. The maintained
+        // Rust secret/assertion decoders require 200; normalize this accepted
+        // status at the credential adapter without changing the HTTP exchange.
+        let status = if parts.status == http::StatusCode::CREATED
+            && request.url().path().ends_with("/token")
+        {
+            azure_core::http::StatusCode::Ok
+        } else {
+            parts.status.as_u16().into()
+        };
         Ok(azure_core::http::BufResponse::from_bytes(
-            parts.status.as_u16().into(),
-            headers,
-            body,
+            status, headers, body,
         ))
     }
 }
@@ -320,7 +427,6 @@ async fn certificate(
     path: &str,
     options: ClientOptions,
 ) -> azure_core::Result<Arc<dyn TokenCredential>> {
-    use azure_identity::{ClientCertificateCredential, ClientCertificateCredentialOptions};
     let bytes = ctx.file_read(path).await.map_err(|_| identity_error())?;
     let password = ctx
         .env_var("AZURE_CLIENT_CERTIFICATE_PASSWORD")
@@ -371,15 +477,15 @@ async fn certificate(
     let send = ctx
         .env_var("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN")
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    ClientCertificateCredential::new(
-        tenant.to_owned(),
-        client,
-        reqsign_core::hash::base64_encode(&der),
-        password,
-        Some(ClientCertificateCredentialOptions {
-            client_options: options,
-            send_certificate_chain: send,
-        }),
+    oauth::Credential::new(
+        oauth::Source::Certificate {
+            tenant: tenant.to_owned(),
+            client,
+            der: reqsign_core::hash::base64_encode(&der),
+            password,
+            send_chain: send,
+        },
+        options,
     )
     .map(|credential| credential as Arc<dyn TokenCredential>)
 }
@@ -392,11 +498,12 @@ enum AuxiliarySource {
         password: String,
     },
     PowerShell,
+    DeveloperCli,
 }
 struct AuxiliaryCredential {
     context: Context,
     source: AuxiliarySource,
-    cached: Mutex<Option<AccessToken>>,
+    cached: Mutex<std::collections::BTreeMap<String, AccessToken>>,
 }
 impl std::fmt::Debug for AuxiliaryCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -438,12 +545,12 @@ impl AuxiliaryCredential {
                 username,
                 password,
             },
-            cached: Mutex::new(None),
+            cached: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
-    async fn acquire(&self) -> azure_core::Result<AccessToken> {
+    async fn acquire(&self, scope: &str, claims: &[u8]) -> azure_core::Result<AccessToken> {
         let now = azure_core::time::OffsetDateTime::now_utc();
-        let (body, powershell) = match &self.source {
+        let body = match &self.source {
             AuxiliarySource::Password {
                 endpoint,
                 client,
@@ -452,30 +559,39 @@ impl AuxiliaryCredential {
             } => {
                 let mut form =
                     reqwest::Url::parse("https://form.invalid").map_err(|_| identity_error())?;
+                let scope = oauth::scope_with_oidc(scope);
+                let claims = oauth::claims_json(claims)?;
                 form.query_pairs_mut().extend_pairs([
                     ("grant_type", "password"),
                     ("client_id", client),
                     ("username", username),
                     ("password", password),
-                    ("scope", SCOPE),
+                    ("scope", scope.as_str()),
+                    ("claims", claims.as_str()),
                 ]);
                 let body = bytes::Bytes::from(form.query().ok_or_else(identity_error)?.to_owned());
                 let request = http::Request::post(endpoint.as_str())
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(body)
                     .map_err(|_| identity_error())?;
-                let response = self
-                    .context
-                    .http_send(request)
+                let response = crate::cloud_azure_managed::send_oauth(&self.context, request)
                     .await
                     .map_err(|_| identity_error())?;
-                if !response.status().is_success() {
+                if !matches!(
+                    response.status(),
+                    http::StatusCode::OK | http::StatusCode::CREATED
+                ) {
                     return Err(identity_error());
                 }
-                (response.into_body().to_vec(), false)
+                response.into_body().to_vec()
             }
             AuxiliarySource::PowerShell => {
+                if !claims.is_empty() || !valid_developer_scope(scope) {
+                    return Err(identity_error());
+                }
+                let resource = scope.strip_suffix("/.default").unwrap_or(scope);
                 let script = "$ErrorActionPreference='Stop'; Import-Module Az.Accounts; $t=Get-AzAccessToken -ResourceUrl 'https://storage.azure.com'; if ($t.Token -is [System.Security.SecureString]) { $p=[System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($t.Token); try { $v=[System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) } finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) } } else { $v=$t.Token }; @{Token=$v;ExpiresOn=$t.ExpiresOn.ToUnixTimeSeconds()} | ConvertTo-Json";
+                let script = script.replace("https://storage.azure.com", resource);
                 let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
                 let encoded = reqsign_core::hash::base64_encode(&utf16);
                 let output = self
@@ -496,52 +612,106 @@ impl AuxiliaryCredential {
                 if !output.success() {
                     return Err(identity_error());
                 }
-                (output.stdout, true)
+                output.stdout
+            }
+            AuxiliarySource::DeveloperCli => {
+                if !valid_developer_scope(scope) {
+                    return Err(identity_error());
+                }
+                let mut args = vec![
+                    "auth",
+                    "token",
+                    "-o",
+                    "json",
+                    "--no-prompt",
+                    "--scope",
+                    scope,
+                ];
+                let encoded = reqsign_core::hash::base64_encode(claims);
+                if !claims.is_empty() {
+                    args.extend(["--claims", &encoded]);
+                }
+                let output = self
+                    .context
+                    .command_execute("azd", &args)
+                    .await
+                    .map_err(|_| identity_error())?;
+                if !output.success() {
+                    return Err(identity_error());
+                }
+                output.stdout
             }
         };
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| identity_error())?;
-        let token = value[if powershell { "Token" } else { "access_token" }]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(identity_error)?;
-        let expires = if powershell {
-            azure_core::time::OffsetDateTime::from_unix_timestamp(
-                value["ExpiresOn"].as_i64().ok_or_else(identity_error)?,
-            )
-            .map_err(|_| identity_error())?
-        } else {
-            now.checked_add(azure_core::time::Duration::seconds(
-                value["expires_in"].as_i64().ok_or_else(identity_error)?,
-            ))
-            .ok_or_else(identity_error)?
-        };
-        if expires <= now {
-            return Err(identity_error());
-        }
-        Ok(AccessToken::new(token.to_owned(), expires))
+        parse_auxiliary_token(&body, &self.source, now)
     }
 }
+fn parse_auxiliary_token(
+    body: &[u8],
+    source: &AuxiliarySource,
+    now: azure_core::time::OffsetDateTime,
+) -> azure_core::Result<AccessToken> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| identity_error())?;
+    let token = value[match source {
+        AuxiliarySource::PowerShell => "Token",
+        AuxiliarySource::DeveloperCli => "token",
+        AuxiliarySource::Password { .. } => "access_token",
+    }]
+    .as_str()
+    .filter(|value| !value.is_empty())
+    .ok_or_else(identity_error)?;
+    let expires = if matches!(source, AuxiliarySource::DeveloperCli) {
+        azure_core::time::parse_rfc3339(value["expiresOn"].as_str().ok_or_else(identity_error)?)?
+    } else if matches!(source, AuxiliarySource::PowerShell) {
+        azure_core::time::OffsetDateTime::from_unix_timestamp(
+            value["ExpiresOn"].as_i64().ok_or_else(identity_error)?,
+        )
+        .map_err(|_| identity_error())?
+    } else {
+        now.checked_add(azure_core::time::Duration::seconds(
+            value["expires_in"].as_i64().ok_or_else(identity_error)?,
+        ))
+        .ok_or_else(identity_error)?
+    };
+    if expires <= now {
+        return Err(identity_error());
+    }
+    Ok(AccessToken::new(token.to_owned(), expires))
+}
+
+fn valid_developer_scope(scope: &str) -> bool {
+    scope
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':'))
+}
+
 #[async_trait::async_trait]
 impl TokenCredential for AuxiliaryCredential {
     async fn get_token(
         &self,
         scopes: &[&str],
-        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<AccessToken> {
-        if scopes != [SCOPE] {
+        let [scope] = scopes else {
             return Err(identity_error());
+        };
+        let claims = options
+            .as_ref()
+            .and_then(|o| o.method_options.context.value::<ChallengeClaims>())
+            .map_or(&[][..], |v| v.0.as_slice());
+        if !matches!(self.source, AuxiliarySource::Password { .. }) {
+            return self.acquire(scope, claims).await;
         }
         let mut cached = self.cached.lock().await;
         let refresh =
             azure_core::time::OffsetDateTime::now_utc() + azure_core::time::Duration::seconds(300);
-        if let Some(token) = cached.as_ref()
-            && token.expires_on > refresh
+        if let Some(token) = cached.get(*scope)
+            && claims.is_empty()
+            && token.expires_on >= refresh
         {
             return Ok(token.clone());
         }
-        let token = self.acquire().await?;
-        *cached = Some(token.clone());
+        let token = self.acquire(scope, claims).await?;
+        cached.insert((*scope).to_owned(), token.clone());
         Ok(token)
     }
 }
@@ -549,6 +719,7 @@ impl TokenCredential for AuxiliaryCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqsign_core::HttpSend;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -587,9 +758,9 @@ mod tests {
         let later = credential(false);
         let chain = AzureDefault {
             credentials: vec![
-                (unavailable.clone(), false),
-                (first.clone(), false),
-                (later.clone(), false),
+                CredentialSlot::developer(unavailable.clone()),
+                CredentialSlot::developer(first.clone()),
+                CredentialSlot::developer(later.clone()),
             ],
             selected: Mutex::new(None),
         };
@@ -602,7 +773,10 @@ mod tests {
         assert_eq!(unavailable.calls.load(Ordering::SeqCst), 1);
         assert_eq!(later.calls.load(Ordering::SeqCst), 0);
         let chain = AzureDefault {
-            credentials: vec![(unavailable.clone(), true), (later.clone(), false)],
+            credentials: vec![
+                CredentialSlot::configured(unavailable.clone()),
+                CredentialSlot::developer(later.clone()),
+            ],
             selected: Mutex::new(None),
         };
         assert!(chain.token().await.is_err());
@@ -654,7 +828,10 @@ mod tests {
                 .unwrap_or_else(|e| unreachable!("{e}"));
             let later = credential(false);
             let chain = AzureDefault {
-                credentials: vec![(Arc::new(managed), true), (later.clone(), false)],
+                credentials: vec![
+                    CredentialSlot::managed(Arc::new(managed)),
+                    CredentialSlot::developer(later.clone()),
+                ],
                 selected: Mutex::new(None),
             };
             assert_eq!(chain.token().await.is_ok(), fallback);
@@ -681,7 +858,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn powershell_mode_uses_bounded_executor_and_caches() {
+    async fn powershell_mode_uses_bounded_executor_and_outer_bearer_cache() {
         let shell = Shell(Arc::new(AtomicUsize::new(0)));
         let ctx = Context::new()
             .with_env(reqsign_core::StaticEnv {
@@ -695,9 +872,10 @@ mod tests {
         let chain = AzureDefault::new(reqwest::Client::new(), ctx)
             .await
             .unwrap_or_else(|e| unreachable!("{e}"));
+        let bearer = crate::cloud_azure::bearer::Bearer::new(chain);
         for _ in 0..2 {
             assert_eq!(
-                chain.token().await.unwrap_or_else(|e| unreachable!("{e}")),
+                bearer.token().await.unwrap_or_else(|e| unreachable!("{e}")),
                 "powershell-test-token"
             );
         }
@@ -710,8 +888,10 @@ mod tests {
             Ok(self.0.clone())
         }
     }
-    #[tokio::test]
-    async fn certificate_environment_accepts_pem_and_pfx_and_rejects_wrong_password() {
+    pub(super) fn key_cert() -> (
+        openssl::pkey::PKey<openssl::pkey::Private>,
+        openssl::x509::X509,
+    ) {
         let key = openssl::pkey::PKey::from_rsa(
             openssl::rsa::Rsa::generate(2048).unwrap_or_else(|e| unreachable!("{e}")),
         )
@@ -739,6 +919,11 @@ mod tests {
         cert.sign(&key, openssl::hash::MessageDigest::sha256())
             .unwrap_or_else(|e| unreachable!("{e}"));
         let cert = cert.build();
+        (key, cert)
+    }
+    #[tokio::test]
+    async fn certificate_environment_accepts_pem_and_pfx_and_rejects_wrong_password() {
+        let (key, cert) = key_cert();
         let password = "fixture-password";
         let mut pem = b" \n".to_vec();
         pem.extend(cert.to_pem().unwrap_or_else(|e| unreachable!("{e}")));

@@ -1139,3 +1139,96 @@ async fn multi_await_classifier_survives_select_noise() {
     assert_eq!(summary.end, SessionEnd::ServerShutdown);
     assert_eq!(summary.rejected_events, 0, "no torn or duplicated events");
 }
+
+/// A client may send its next query as soon as COMMIT's response is visible,
+/// before the engine has consumed the following redirect effect. The runtime
+/// must retain that command until the redirect resolves, as Go's process lock
+/// does, instead of submitting an illegal event and losing its forwarding ACK.
+#[tokio::test(start_paused = true)]
+async fn next_command_waits_for_redirect_after_commit() {
+    for command in [SessionEvent::ClientCommand, SessionEvent::ClientCommandQuit] {
+        for terminal in [
+            SessionEvent::RedirectBackendReady,
+            SessionEvent::RedirectBackendFailed,
+            SessionEvent::ControlCloseImmediate,
+        ] {
+            let (event_tx, source) = ChannelSource::new();
+            let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+            let handler = Recorder::default();
+            let effects = handler.effects();
+            let run = tokio::spawn(
+                SessionLoop::new(
+                    source,
+                    handler,
+                    control_rx,
+                    shutdown_rx,
+                    SessionLoopConfig::default(),
+                )
+                .run(),
+            );
+            for event in HANDSHAKE.into_iter().chain([
+                SessionEvent::ClientCommand,
+                SessionEvent::BackendResponseTxnOpen,
+            ]) {
+                let _ = event_tx.send(event).await;
+            }
+            quiesce().await;
+            let _ = control_tx.send(SessionControl::Redirect).await;
+            quiesce().await;
+            for event in [
+                SessionEvent::ClientCommand,
+                SessionEvent::BackendResponseTxnDone,
+            ] {
+                let _ = event_tx.send(event).await;
+            }
+            quiesce().await;
+            assert_eq!(
+                count(&locked(&effects), SessionEffect::StartRedirectHandshake),
+                1
+            );
+            let _ = event_tx.send(command).await;
+            quiesce().await;
+            assert_eq!(
+                count(&locked(&effects), SessionEffect::ForwardCommandToBackend),
+                2,
+                "query must not run during migration"
+            );
+            let _ = event_tx.send(terminal).await;
+            quiesce().await;
+            if terminal == SessionEvent::ControlCloseImmediate
+                || command == SessionEvent::ClientCommandQuit
+            {
+                assert_eq!(
+                    count(&locked(&effects), SessionEffect::ForwardCommandToBackend),
+                    2,
+                    "close or quit must never forward the queued command"
+                );
+                let summary = run.await.unwrap_or_else(|e| unreachable!("{e}"));
+                assert_eq!(summary.rejected_events, 0);
+                assert_eq!(summary.final_state, SessionState::Closed);
+                continue;
+            }
+            assert_eq!(
+                count(&locked(&effects), SessionEffect::ForwardCommandToBackend),
+                3,
+                "queued query must receive exactly one forwarding ACK after {terminal:?}"
+            );
+            let recorded = locked(&effects);
+            let last_forward = recorded
+                .iter()
+                .rposition(|e| *e == SessionEffect::ForwardCommandToBackend)
+                .unwrap_or_default();
+            let resolved = if terminal == SessionEvent::RedirectBackendReady {
+                SessionEffect::SwapBackend
+            } else {
+                SessionEffect::NotifyRedirectFailed
+            };
+            assert!(recorded[..last_forward].contains(&resolved));
+            let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+            let _ = event_tx.send(SessionEvent::ClientCommandQuit).await;
+            let summary = run.await.unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(summary.rejected_events, 0);
+            assert_eq!(summary.final_state, SessionState::Closed);
+        }
+    }
+}
