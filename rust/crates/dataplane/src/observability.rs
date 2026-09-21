@@ -446,6 +446,15 @@ impl MetricsRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
     }
 
+    /// Label sets the migration retention refused, for the same visible
+    /// dropped-observation counter every other shed signal reports through.
+    /// A silent overflow would be worse here than before, since this path
+    /// replaced one that was already counted.
+    #[must_use]
+    pub fn migration_labels_dropped(&self) -> u64 {
+        self.migration_state().history.labels_dropped
+    }
+
     /// Reads migration state while holding no registry lock: the source is
     /// cloned out and its guard dropped before the provider runs.
     fn migration_state(&self) -> control_router::MigrationSnapshot {
@@ -1522,14 +1531,16 @@ async fn run_exporter(
             _ = ticker.tick() => {
                 let server = serving.metrics().await;
                 // Every shed observation is one external signal: the SQL-path
-                // queue, the per-batch series bound, and the registry's
-                // cumulative series bound all count as dropped observations.
+                // queue, the per-batch series bound, the registry's cumulative
+                // series bound, and the migration retention ceiling all count
+                // as dropped observations.
                 let (current, active_connections) = ExportTotals::sample(
                     server,
                     dropped
                         .load(Ordering::Relaxed)
                         .saturating_add(aggregator.overflow_dropped)
-                        .saturating_add(registry.series_dropped()),
+                        .saturating_add(registry.series_dropped())
+                        .saturating_add(registry.migration_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -2029,6 +2040,38 @@ mod tests {
             rendered.contains("tiproxy_balance_migrate_total{") && rendered.contains("} 1"),
             "and the terminal must still be counted:\n{rendered}"
         );
+    }
+
+    /// A refused label set must reach the same visible counter as every other
+    /// shed signal. It replaced a path that was already counted, so leaving it
+    /// only in the snapshot would make overflow quieter than before.
+    #[test]
+    fn refused_label_sets_reach_the_visible_dropped_counter() {
+        struct Flood;
+        impl MigrationStateSource for Flood {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let history = control_router::MigrationHistory::default();
+                for index in 0..(control_router::MAX_RETAINED_LABEL_SETS + 5) {
+                    history.remember(
+                        &format!("10.0.0.1:{index}"),
+                        "10.0.0.2:4000",
+                        control_router::RedirectReason::Test,
+                    );
+                }
+                control_router::MigrationSnapshot {
+                    pending: BTreeMap::new(),
+                    history: history.snapshot(),
+                }
+            }
+        }
+        let registry = MetricsRegistry::new();
+        assert_eq!(
+            registry.migration_labels_dropped(),
+            0,
+            "nothing refused before a source is installed"
+        );
+        registry.set_migration_state_source(Arc::new(Flood));
+        assert_eq!(registry.migration_labels_dropped(), 5);
     }
 
     /// `CodexM5`'s capacity regression, restated: the bound has to hold on the
