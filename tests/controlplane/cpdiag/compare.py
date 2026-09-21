@@ -22,11 +22,12 @@ import re
 import sys
 
 F2 = re.compile(r"^(-?\d+\.\d\d|NaN|[+-]Inf)$")
+MHZ = re.compile(r"^\d+\.\d\dMHz$")
 DEC = re.compile(r"^\d+$")
 EXACT = "exact"
 
 
-def classify(tp: str, name: str, keys):
+def classify(tp: str, name: str, keys, goos: str = ""):
     """Value class per key for one sysutil item, from its type and key set."""
     first = keys[0] if keys else ""
     if tp == "cpu" and first == "load1":
@@ -34,6 +35,13 @@ def classify(tp: str, name: str, keys):
     if tp == "cpu" and first == "user":
         return {k: F2 for k in keys}
     if tp == "cpu" and first == "cpu-arch":
+        # Linux reports the live clock from /proc/cpuinfo, which moves with
+        # frequency scaling between the Go capture and the Rust replay. Compare
+        # its Go format and keep the cross-side ratio bounded (below) so a unit
+        # or source mistake still fails; every other key stays byte-exact.
+        # macOS keeps EXACT: Rust cannot read it there, which is a declared gap.
+        if goos == "linux":
+            return {k: (MHZ if k == "cpu-frequency" else EXACT) for k in keys}
         return {k: EXACT for k in keys}
     if tp == "memory" and name in ("virtual", "swap"):
         return {"total": EXACT, "used": DEC, "free": DEC, "used-percent": F2, "free-percent": F2}
@@ -74,7 +82,7 @@ class Declared:
         return [entry for entry, used in zip(self.entries, self.used) if not used]
 
 
-def compare_server_info(label, name, go_entry, rust_entry, declared, volatile, failures, notes):
+def compare_server_info(label, name, go_entry, rust_entry, declared, volatile, failures, notes, goos=""):
     identical = 0
     if go_entry["code"] != rust_entry["code"]:
         failures.append(f"{label}/{name}: code go={go_entry['code']} rust={rust_entry['code']}")
@@ -109,7 +117,7 @@ def compare_server_info(label, name, go_entry, rust_entry, declared, volatile, f
         if len(go_items[key]) != len(rust_items[key]):
             failures.append(f"{label}/{name}: {item} appears go={len(go_items[key])} rust={len(rust_items[key])} times")
             continue
-        classes = classify(tp, item_name, list(keys))
+        classes = classify(tp, item_name, list(keys), goos)
         if classes is None:
             failures.append(f"{label}/{name}: {item} with keys {list(keys)} is not a known sysutil item")
             continue
@@ -157,6 +165,13 @@ def compare_server_info(label, name, go_entry, rust_entry, declared, volatile, f
                     for side_name, value in (("go", gv), ("rust", rv)):
                         if not cls.match(value):
                             failures.append(f"{label}/{name}: {item} {k} {side_name}={value!r} does not carry the Go format")
+                            item_ok = False
+                    if cls is MHZ and MHZ.match(gv) and MHZ.match(rv):
+                        # Scaling moves this between captures; a unit or source
+                        # mistake does not stay inside this band.
+                        g_mhz, r_mhz = float(gv[:-3]), float(rv[:-3])
+                        if not g_mhz or not 0.5 <= r_mhz / g_mhz <= 2.0:
+                            failures.append(f"{label}/{name}: {item} {k} go={gv!r} rust={rv!r} are not the same clock")
                             item_ok = False
             if item_ok:
                 identical += 1
@@ -214,7 +229,8 @@ def main() -> int:
                 failures.append(f"{side}/server_info/{name}: missing on one side")
                 continue
             compared += compare_server_info(f"{side}/server_info", name, go_side["server_info"][name],
-                                            rust_side["server_info"][name], declared, volatile, failures, notes)
+                                            rust_side["server_info"][name], declared, volatile, failures, notes,
+                                            goos)
     for entry in declared.stale():
         failures.append(f"declared divergence {entry['owner']!r} ({goos}) no longer occurs; remove the declaration")
     for line in notes:
