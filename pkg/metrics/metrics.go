@@ -84,13 +84,22 @@ func (mm *MetricsManager) setupMonitor(ctx context.Context) {
 	}, nil, mm.logger)
 }
 
-// registerProxyMetrics registers metrics.
-func (mm *MetricsManager) registerProxyMetrics() {
+// RegisterProxyMetrics registers every proxy collector without starting any
+// background producer. Init registers and then starts the system time
+// monitor; an offline oracle needs the registration alone, because that
+// monitor writes the keepalive and time-jump counters on a real wall clock
+// and would make a generated fixture depend on how long generation took.
+func RegisterProxyMetrics() {
 	prometheus.DefaultRegisterer.Unregister(collectors.NewGoCollector())
 	prometheus.MustRegister(collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsGC, collectors.MetricsMemory, collectors.MetricsScheduler)))
 	for _, c := range colls {
 		prometheus.MustRegister(collectorWithRustMetrics(c))
 	}
+}
+
+// registerProxyMetrics registers metrics.
+func (mm *MetricsManager) registerProxyMetrics() {
+	RegisterProxyMetrics()
 }
 
 var colls []prometheus.Collector

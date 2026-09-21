@@ -1425,6 +1425,7 @@ fn json_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn queue_full_is_non_blocking_and_counted() {
@@ -1636,6 +1637,11 @@ mod tests {
         assert!(text.contains("tiproxy_server_create_connection_total 0\n"));
         assert!(!text.contains("tiproxy_session_query_total{"));
     }
+
+    /// Fixed observations for natively served families with no recorded
+    /// batch. Must equal the generator's constants.
+    const FIXED_KEEP_ALIVES: u32 = 3;
+    const FIXED_TIME_JUMPS: u32 = 2;
 
     /// Go's monitor counts a jump only when the clock reads earlier after the
     /// wait than before it, calls back every tenth tick, and the keepalive
@@ -1900,9 +1906,49 @@ mod tests {
     fn native_exposition_matches_go_golden() {
         let mut aggregator = Aggregator::default();
         let batches = parity_script(&mut aggregator);
+        // Families that never crossed the bridge have no recorded batch, so
+        // the fixture drives them with the same fixed observations the Go
+        // oracle applies. Non-zero on both sides, so an empty shell cannot
+        // pass; the production rule is covered by the clock unit test.
+        for _ in 0..FIXED_KEEP_ALIVES {
+            aggregator.registry.add_counter(
+                &MetricKey::new("tiproxy_monitor_keep_alive_total", Vec::new()),
+                1,
+            );
+        }
+        for _ in 0..FIXED_TIME_JUMPS {
+            aggregator.registry.add_counter(
+                &MetricKey::new("tiproxy_monitor_time_jump_back_total", Vec::new()),
+                1,
+            );
+        }
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");
+
+        // The oracle selects families by this list, so a family missing from
+        // either side must fail rather than quietly drop out of the compare.
+        let Ok(list) = std::fs::read_to_string(root.join("native-families.json")) else {
+            unreachable!("missing tests/dataplane/metrics/native-families.json")
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&list) else {
+            unreachable!("native-families.json is not valid JSON")
+        };
+        let Some(entries) = doc["families"].as_array() else {
+            unreachable!("native-families.json has no families array")
+        };
+        let listed: BTreeSet<&str> = entries.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            listed.len(),
+            entries.len(),
+            "native-families.json lists a name twice"
+        );
+        let catalogued: BTreeSet<&str> = METRIC_SPECS.iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            listed, catalogued,
+            "native-families.json and METRIC_SPECS disagree; the Go oracle selects by the \
+             list, so a family in only one of them would never be compared"
+        );
         if std::env::var_os("TIPROXY_UPDATE_METRICS_PARITY").is_some() {
             assert!(
                 std::fs::write(root.join("parity-batches.json"), batches_json(&batches)).is_ok()

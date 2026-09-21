@@ -1,0 +1,33 @@
+{
+  "comment": [
+    "Metric families the Rust process serves natively on /metrics.",
+    "The Go oracle in gen/ selects exactly these from its own collectors,",
+    "and the Rust parity test asserts this set equals METRIC_SPECS.",
+    "This is NOT the retired MetricsBatch wire catalogue (RustMetricNames).",
+    "Add a family here only when Rust actually serves it."
+  ],
+  "families": [
+    "tiproxy_backend_dial_backend_fail",
+    "tiproxy_backend_get_backend",
+    "tiproxy_backend_get_backend_duration_seconds",
+    "tiproxy_backend_keepalive_update_total",
+    "tiproxy_monitor_keep_alive_total",
+    "tiproxy_monitor_time_jump_back_total",
+    "tiproxy_server_connections",
+    "tiproxy_server_create_connection_total",
+    "tiproxy_server_disconnection_total",
+    "tiproxy_server_err",
+    "tiproxy_server_event",
+    "tiproxy_server_reject_connection_total",
+    "tiproxy_session_conn_lifetime_seconds",
+    "tiproxy_session_handshake_duration_seconds",
+    "tiproxy_session_query_duration_seconds",
+    "tiproxy_session_query_time_since_conn_creation_seconds",
+    "tiproxy_session_query_total",
+    "tiproxy_traffic_cross_location_bytes",
+    "tiproxy_traffic_inbound_bytes",
+    "tiproxy_traffic_inbound_packets",
+    "tiproxy_traffic_outbound_bytes",
+    "tiproxy_traffic_outbound_packets"
+  ]
+}

@@ -753,6 +753,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "session-core",
  "thiserror",
  "tokio",
