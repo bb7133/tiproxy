@@ -515,6 +515,8 @@ pub struct RoutePlane {
     score_history: Arc<crate::ScoreHistory>,
     /// Retained raw backend observations, likewise shared.
     backend_metrics: Arc<crate::BackendMetricHistory>,
+    /// The configuration generation whose adoption last cleared `b_score`.
+    applied_score_generation: Option<u64>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -575,6 +577,7 @@ impl RoutePlane {
                 migration_history: Arc::clone(&migration_history),
                 score_history: Arc::clone(&score_history),
                 backend_metrics: Arc::clone(&backend_metrics),
+                applied_score_generation: None,
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
@@ -597,6 +600,20 @@ impl RoutePlane {
         snapshot: &Arc<ConfigNamespaceSnapshot>,
         context: &ModuleContext,
     ) -> Result<(), RouteError> {
+        // Go `FactorBasedBalance.SetConfig` → `setFactors` →
+        // `BackendScoreGauge.Reset()`: the family is cleared when the
+        // configuration is applied, not when something next scores. A
+        // proxy that adopts a new generation and then sits idle must not
+        // keep showing scores computed under the old one.
+        //
+        // Owned here rather than by the routers because this is the config
+        // boundary, and because a router that also reset would wipe the
+        // scores written between this reconcile and its own first sight of
+        // the generation.
+        if self.applied_score_generation != Some(snapshot.generation()) {
+            self.applied_score_generation = Some(snapshot.generation());
+            self.score_history.reset();
+        }
         let configured_max_sessions = snapshot
             .effective()
             .serving()
