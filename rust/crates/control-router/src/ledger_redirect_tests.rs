@@ -89,9 +89,16 @@ fn a_settled_migration_reports_the_reason_frozen_at_issue_and_its_elapsed_time()
         RedirectReason::Balance(Factor::Memory),
     ));
     ledger.admit_redirect(op.clone(), true, issued);
-    assert!(
-        ledger.drain_migrations().is_empty(),
-        "issue publishes nothing"
+    // Go increments the pending gauge at acceptance, so the issue is its own
+    // observation rather than something reconstructed at settlement.
+    assert_eq!(
+        ledger.drain_migrations(),
+        vec![MigrationObservation {
+            from: "10.0.0.1:4000".to_owned(),
+            to: "10.0.0.2:4000".to_owned(),
+            reason: RedirectReason::Balance(Factor::Memory),
+            outcome: MigrationOutcome::Issued,
+        }]
     );
 
     // ...and is read back at settlement, not recomputed from current scores.
@@ -108,8 +115,10 @@ fn a_settled_migration_reports_the_reason_frozen_at_issue_and_its_elapsed_time()
             from: "10.0.0.1:4000".to_owned(),
             to: "10.0.0.2:4000".to_owned(),
             reason: RedirectReason::Balance(Factor::Memory),
-            success: true,
-            elapsed: Duration::from_millis(250),
+            outcome: MigrationOutcome::Settled {
+                success: true,
+                elapsed: Duration::from_millis(250),
+            },
         }]
     );
     assert_eq!(observed[0].reason.metric_name(), "memory");
@@ -140,9 +149,17 @@ fn a_failed_migration_is_still_observed_and_a_self_redirect_reports_test() {
         Settlement::Applied
     );
     let observed = ledger.drain_migrations();
-    assert_eq!(observed.len(), 1);
-    assert!(!observed[0].success, "a failure is counted, not dropped");
-    assert_eq!(observed[0].reason.metric_name(), "status");
+    assert_eq!(observed.len(), 2, "one issue and one settlement");
+    assert_eq!(observed[0].outcome, MigrationOutcome::Issued);
+    assert_eq!(
+        observed[1].outcome,
+        MigrationOutcome::Settled {
+            success: false,
+            elapsed: Duration::from_millis(10),
+        },
+        "a failure is observed with its elapsed time, not dropped"
+    );
+    assert_eq!(observed[1].reason.metric_name(), "status");
 
     // Go's RedirectConnections labels every migration `test`, whatever the score.
     let back = must(ledger.prepare_self_redirect(&session, issued));

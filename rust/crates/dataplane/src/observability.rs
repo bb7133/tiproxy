@@ -67,6 +67,8 @@ const HANDSHAKE_BUCKETS: [f64; 29] = QUERY_BUCKETS;
 const QUERY_AGE_BUCKETS: [f64; 21] = exponential_buckets(1.0, 2.0);
 const CONN_LIFETIME_BUCKETS: [f64; 25] = exponential_buckets(0.1, 2.0);
 const GET_BACKEND_BUCKETS: [f64; 26] = exponential_buckets(0.000_001, 2.0);
+/// Go `MigrateDurationHistogram`: ExponentialBuckets(0.0001, 2, 26), 0.1ms ~ 1h.
+const MIGRATE_BUCKETS: [f64; 26] = exponential_buckets(0.000_1, 2.0);
 
 const fn exponential_buckets<const N: usize>(start: f64, factor: f64) -> [f64; N] {
     let mut buckets = [0.0; N];
@@ -123,7 +125,7 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 22] = [
+pub const METRIC_SPECS: [MetricSpec; 25] = [
     MetricSpec {
         name: "tiproxy_backend_dial_backend_fail",
         help: "Counter of failing to dial backends.",
@@ -150,6 +152,27 @@ pub const METRIC_SPECS: [MetricSpec; 22] = [
         help: "Counter of health-driven backend keepalive policy updates.",
         kind: MetricKind::Counter,
         labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_migrate_duration_seconds",
+        help: "Bucketed histogram of migrating time (s) of sessions.",
+        kind: MetricKind::Histogram,
+        labels: &["from", "migrate_res", "to"],
+        buckets: &MIGRATE_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_balance_migrate_total",
+        help: "Number and result of session migration.",
+        kind: MetricKind::Counter,
+        labels: &["from", "migrate_res", "reason", "to"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_pending_migrate",
+        help: "Number of pending session migration.",
+        kind: MetricKind::Gauge,
+        labels: &["from", "reason", "to"],
         buckets: &[],
     },
     MetricSpec {
@@ -636,6 +659,30 @@ pub enum Observation {
         /// Whether the backend is in the proxy's local location.
         local: bool,
     },
+    /// A session migration was accepted and is now in flight. Go increments
+    /// `pending_migrate` at this point, only for an accepted offer.
+    MigrationIssued {
+        /// Source backend address.
+        from: String,
+        /// Destination backend address.
+        to: String,
+        /// Reason label frozen when the redirect was issued.
+        reason: &'static str,
+    },
+    /// A session migration reached its terminal state. Go decrements
+    /// `pending_migrate`, counts the result, and observes the elapsed time.
+    MigrationSettled {
+        /// Source backend address.
+        from: String,
+        /// Destination backend address.
+        to: String,
+        /// The same frozen reason the issue carried.
+        reason: &'static str,
+        /// Whether the migration succeeded.
+        succeeded: bool,
+        /// Issue-to-settlement elapsed time.
+        elapsed: Duration,
+    },
     /// One admitted session closed.
     SessionClosed {
         /// Exact Go-compatible quit source.
@@ -654,6 +701,10 @@ impl Observation {
             | Self::BackendKeepaliveUpdated { backend, .. }
             | Self::HandshakeCompleted { backend, .. }
             | Self::CommandCompleted { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
+            // Both endpoints are label values, so both are bounded.
+            Self::MigrationIssued { from, to, .. } | Self::MigrationSettled { from, to, .. } => {
+                from.len() <= MAX_LABEL_BYTES && to.len() <= MAX_LABEL_BYTES
+            }
             Self::GetBackend { .. } | Self::SessionClosed { .. } => true,
         }
     }
@@ -738,6 +789,10 @@ enum PendingMetric {
 
 struct Aggregator {
     pending: BTreeMap<MetricKey, PendingMetric>,
+    /// Running count per `pending_migrate` label set. The registry stores an
+    /// absolute gauge value, so the +1/-1 that Go applies to its gauge is
+    /// tracked here and written out as the resulting total.
+    migrations_in_flight: BTreeMap<MetricKey, i64>,
     overflow_dropped: u64,
     /// Cumulative twin of `pending`: every accepted delta is also folded into
     /// the process-local registry that backs the native `/metrics` exposition.
@@ -754,9 +809,90 @@ impl Aggregator {
     fn with_registry(registry: Arc<MetricsRegistry>) -> Self {
         Self {
             pending: BTreeMap::new(),
+            migrations_in_flight: BTreeMap::new(),
             overflow_dropped: 0,
             registry,
         }
+    }
+
+    /// Applies Go's +1 on an accepted offer / -1 on settlement to the
+    /// `pending_migrate` gauge. The count is clamped at zero so an unmatched
+    /// settlement can never publish a negative number of pending migrations.
+    fn migration_in_flight(&mut self, from: &str, to: &str, reason: &'static str, delta: i64) {
+        let key = MetricKey::new(
+            "tiproxy_balance_pending_migrate",
+            vec![
+                ("from", from.to_owned()),
+                ("reason", reason.to_owned()),
+                ("to", to.to_owned()),
+            ],
+        );
+        if !self.ensure_series(&key) {
+            return;
+        }
+        let count = self.migrations_in_flight.entry(key.clone()).or_insert(0);
+        *count = count.saturating_add(delta).max(0);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a pending-migration count never approaches 2^53"
+        )]
+        let value = *count as f64;
+        self.registry.set_labeled_gauge(&key, value);
+    }
+
+    fn get_backend(&mut self, duration: Duration, succeeded: bool) {
+        self.histogram(
+            MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
+            duration.as_secs_f64(),
+            &GET_BACKEND_BUCKETS,
+        );
+        self.counter(
+            MetricKey::new(
+                "tiproxy_backend_get_backend",
+                vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
+            ),
+            1,
+        );
+    }
+
+    /// Go `addMigrateMetrics`: decrement the pending gauge, count the result,
+    /// and observe the elapsed time. The duration series is labelled without
+    /// the reason, exactly as Go labels it.
+    fn migration_settled(
+        &mut self,
+        from: String,
+        to: String,
+        reason: &'static str,
+        succeeded: bool,
+        elapsed: Duration,
+    ) {
+        self.migration_in_flight(&from, &to, reason, -1);
+        // Go's `succeedToLabel`.
+        let result = if succeeded { "succeed" } else { "fail" };
+        self.counter(
+            MetricKey::new(
+                "tiproxy_balance_migrate_total",
+                vec![
+                    ("from", from.clone()),
+                    ("migrate_res", result.to_owned()),
+                    ("reason", reason.to_owned()),
+                    ("to", to.clone()),
+                ],
+            ),
+            1,
+        );
+        self.histogram(
+            MetricKey::new(
+                "tiproxy_balance_migrate_duration_seconds",
+                vec![
+                    ("from", from),
+                    ("migrate_res", result.to_owned()),
+                    ("to", to),
+                ],
+            ),
+            elapsed.as_secs_f64(),
+            &MIGRATE_BUCKETS,
+        );
     }
 
     fn counter(&mut self, key: MetricKey, delta: u64) {
@@ -821,20 +957,17 @@ impl Aggregator {
             Observation::GetBackend {
                 duration,
                 succeeded,
-            } => {
-                self.histogram(
-                    MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
-                    duration.as_secs_f64(),
-                    &GET_BACKEND_BUCKETS,
-                );
-                self.counter(
-                    MetricKey::new(
-                        "tiproxy_backend_get_backend",
-                        vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
-                    ),
-                    1,
-                );
+            } => self.get_backend(duration, succeeded),
+            Observation::MigrationIssued { from, to, reason } => {
+                self.migration_in_flight(&from, &to, reason, 1);
             }
+            Observation::MigrationSettled {
+                from,
+                to,
+                reason,
+                succeeded,
+                elapsed,
+            } => self.migration_settled(from, to, reason, succeeded, elapsed),
             Observation::DialBackendFailed { backend } => self.counter(
                 MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
@@ -1664,6 +1797,21 @@ mod tests {
     /// batch. Must equal the generator's constants.
     const FIXED_KEEP_ALIVES: u32 = 3;
     const FIXED_TIME_JUMPS: u32 = 2;
+    /// (from, to, reason, succeeded, seconds, settled) — mirrors
+    /// `fixedMigrations` in `tests/dataplane/metrics/gen/main.go`. Two pairs
+    /// settle back to a zero pending gauge; the third stays in flight.
+    const FIXED_MIGRATIONS: &[(&str, &str, &str, bool, f64, bool)] = &[
+        ("10.0.0.1:4000", "10.0.0.2:4000", "conn", true, 0.25, true),
+        ("10.0.0.1:4000", "10.0.0.2:4000", "conn", false, 0.5, true),
+        (
+            "10.0.0.1:4000",
+            "10.0.0.3:4000",
+            "status",
+            false,
+            0.0,
+            false,
+        ),
+    ];
 
     /// Go's monitor counts a jump only when the clock reads earlier after the
     /// wait than before it, calls back every tenth tick, and the keepalive
@@ -1992,6 +2140,25 @@ mod tests {
                 &MetricKey::new("tiproxy_monitor_time_jump_back_total", Vec::new()),
                 1,
             );
+        }
+        // The same migration fixture the Go oracle applies, driven through the
+        // real observation path rather than written straight to the registry.
+        for (from, to, reason, succeeded, seconds, settled) in FIXED_MIGRATIONS {
+            aggregator.observe(Observation::MigrationIssued {
+                from: (*from).to_owned(),
+                to: (*to).to_owned(),
+                reason,
+            });
+            if !settled {
+                continue;
+            }
+            aggregator.observe(Observation::MigrationSettled {
+                from: (*from).to_owned(),
+                to: (*to).to_owned(),
+                reason,
+                succeeded: *succeeded,
+                elapsed: Duration::from_secs_f64(*seconds),
+            });
         }
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

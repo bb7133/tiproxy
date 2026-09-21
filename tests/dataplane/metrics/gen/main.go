@@ -87,6 +87,20 @@ func run(input, nativeList string) error {
 	for range fixedTimeJumps {
 		metrics.TimeJumpBackCounter.Inc()
 	}
+	// Session migration: the reason label is frozen when the redirect is
+	// issued, so the pending gauge is incremented with that same reason and
+	// decremented again when the migration settles. One succeeded and one
+	// failed pair settle back to zero; a third stays in flight so the gauge
+	// carries a non-zero series too.
+	for _, m := range fixedMigrations {
+		metrics.PendingMigrateGuage.WithLabelValues(m.from, m.to, m.reason).Inc()
+		if !m.settled {
+			continue
+		}
+		metrics.MigrateCounter.WithLabelValues(m.from, m.to, m.reason, m.result).Inc()
+		metrics.PendingMigrateGuage.WithLabelValues(m.from, m.to, m.reason).Dec()
+		metrics.MigrateDurationHistogram.WithLabelValues(m.from, m.to, m.result).Observe(m.seconds)
+	}
 
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
@@ -128,6 +142,20 @@ const (
 	fixedKeepAlives = 3
 	fixedTimeJumps  = 2
 )
+
+// The migration fixture, mirrored exactly by the Rust golden test.
+var fixedMigrations = []struct {
+	from    string
+	to      string
+	reason  string
+	result  string
+	seconds float64
+	settled bool
+}{
+	{from: "10.0.0.1:4000", to: "10.0.0.2:4000", reason: "conn", result: "succeed", seconds: 0.25, settled: true},
+	{from: "10.0.0.1:4000", to: "10.0.0.2:4000", reason: "conn", result: "fail", seconds: 0.5, settled: true},
+	{from: "10.0.0.1:4000", to: "10.0.0.3:4000", reason: "status", settled: false},
+}
 
 type nativeFamilies struct {
 	Families []string `json:"families"`

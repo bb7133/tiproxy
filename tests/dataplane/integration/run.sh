@@ -191,6 +191,11 @@ finalize() {
 	"$script_dir/collect-diagnostics.sh" "$run_dir" "$tag"
 	"$script_dir/cleanup.sh" "$run_dir" "$tag"
 	cleanup_status=$?
+	# cleanup.log does not exist, and tiup-playground.log still ends at
+	# "Cluster is started", when the pass above runs. Re-collect just the
+	# teardown evidence now that cleanup has finished, so a stuck playground
+	# parent leaves a trace instead of being closable only by a re-run.
+	"$script_dir/collect-teardown-diagnostics.sh" "$run_dir" || true
 	# The producer WAL lives beside its external socket, outside run_dir.
 	# Preserve it after owned cleanup, so a tap ACK can be checked against
 	# durable producer state without copying a file still being updated.

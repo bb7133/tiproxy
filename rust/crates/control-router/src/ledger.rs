@@ -306,10 +306,24 @@ pub struct MigrationObservation {
     pub to: String,
     /// The frozen reason label.
     pub reason: RedirectReason,
-    /// Whether the migration succeeded.
-    pub success: bool,
-    /// Issue-to-settlement elapsed time, Go's `time.Since(lastRedirect)`.
-    pub elapsed: Duration,
+    /// Which end of the migration this record reports.
+    pub outcome: MigrationOutcome,
+}
+
+/// The two points at which Go touches the migration metrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MigrationOutcome {
+    /// The offer was accepted and the migration is in flight. Go increments
+    /// `pending_migrate` here, and only for an accepted offer.
+    Issued,
+    /// The migration reached its terminal state. Go decrements
+    /// `pending_migrate`, counts the result, and observes the elapsed time.
+    Settled {
+        /// Whether the migration succeeded.
+        success: bool,
+        /// Issue-to-settlement elapsed time, Go's `time.Since(lastRedirect)`.
+        elapsed: Duration,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,6 +741,13 @@ impl Ledger {
             unreachable!("prepared active session")
         };
         if admitted {
+            // Go increments the pending gauge only once the offer is accepted.
+            self.migrations.push(MigrationObservation {
+                from: redirect.from.backend_address.clone(),
+                to: redirect.to.backend_address.clone(),
+                reason: redirect.reason,
+                outcome: MigrationOutcome::Issued,
+            });
             active.redirect = Some(redirect);
         } else {
             active.failed_at = Some(now);
@@ -784,10 +805,12 @@ impl Ledger {
             from: redirect.from.backend_address.clone(),
             to: redirect.to.backend_address.clone(),
             reason: redirect.reason,
-            success,
-            // Saturating: a settlement can never predate its own issuance, and
-            // a non-monotonic reading must not panic a routing settlement.
-            elapsed: now.saturating_duration_since(redirect.issued_at),
+            outcome: MigrationOutcome::Settled {
+                success,
+                // Saturating: a settlement can never predate its own issuance,
+                // and a non-monotonic reading must not panic a settlement.
+                elapsed: now.saturating_duration_since(redirect.issued_at),
+            },
         });
         Settlement::Applied
     }
