@@ -628,3 +628,113 @@ fn single_time_entry_matches_ordered_windows_and_next_history() {
         }
     }
 }
+
+/// `backend_metric` is published from inside the factors, on the values
+/// they accept, so this drives the real `evaluate` rather than inspecting a
+/// finished report.
+///
+/// Two backends, because `evaluate_window` only runs the health, memory and
+/// cpu factors under a resource policy with more than one input
+/// (`factors.rs:370`). A single-input fixture still produces a scored row,
+/// which is exactly why a row is not evidence that anything was published.
+///
+/// Each input's opaque routing id, Prometheus instance label and dial
+/// address are all different, so a label taken from the wrong one shows.
+/// The two cpu samples also differ from their average, so publishing the
+/// latest sample instead of `calcAvgUsage`'s average shows too.
+#[test]
+fn backend_metric_publishes_accepted_values_labelled_by_address() {
+    use crate::{BackendMetric, BackendMetricHistory};
+
+    let metrics = Arc::new(BackendMetricHistory::new());
+    let mut state = State::default();
+    state.set_backend_metrics(Some(Arc::clone(&metrics)));
+
+    let mut ledger = Ledger::new(2);
+    let backends = [
+        ("10.0.0.8:4000", "10.0.0.8:10080"),
+        ("10.0.0.9:4000", "10.0.0.9:10080"),
+    ];
+    let inputs: Vec<Input> = backends
+        .iter()
+        .map(|(address, instance)| Input {
+            address: (*address).into(),
+            instance: (*instance).into(),
+            id: Arc::from(format!("cluster-a/{address}").as_str()),
+            owner: must(ledger.add_account()),
+            cluster: String::new(),
+            counts: Accounting::for_balance_test(1, 0, 0, 0),
+            healthy: true,
+            local: true,
+            label_matches: true,
+        })
+        .collect();
+
+    // Samples whose average is neither of them, per backend.
+    let series: Vec<Series> = backends
+        .iter()
+        .zip([0.0_f64, 0.1])
+        .map(|((_, instance), offset)| Series {
+            labels: BTreeMap::from([
+                ("instance".into(), (*instance).into()),
+                (
+                    "tiproxy_cluster".into(),
+                    control_topology::metrics::cluster_label(""),
+                ),
+            ]),
+            samples: vec![
+                Sample {
+                    timestamp_ms: 1_000,
+                    value: 0.2 + offset,
+                },
+                Sample {
+                    timestamp_ms: 2_000,
+                    value: 0.6 + offset,
+                },
+            ],
+        })
+        .collect();
+    let mut queries = Queries::new();
+    queries.insert(
+        QueryId::Cpu,
+        QueryResult {
+            updated_nanos: Some(1),
+            kind: ValueKind::Matrix,
+            series,
+        },
+    );
+
+    let mut config = must(EffectiveConfig::default().routing());
+    // Connection is the one policy that skips the resource factors entirely.
+    config.balance_policy = RoutingBalancePolicy::Resource;
+    let _ = state.evaluate(&inputs, &config, &queries, 3_000_000_000);
+
+    let published = metrics.snapshot().values;
+    for (address, instance) in backends {
+        assert!(
+            published.contains_key(&(address.to_owned(), BackendMetric::Cpu)),
+            "{address} must publish a cpu observation; got {:?}",
+            published.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !published.contains_key(&(instance.to_owned(), BackendMetric::Cpu)),
+            "the Prometheus instance label must not be used as the backend label"
+        );
+    }
+    assert!(
+        !published.keys().any(|(label, _)| label.contains('/')),
+        "the opaque routing id must never reach a metric label: {:?}",
+        published.keys().collect::<Vec<_>>()
+    );
+    let first = published[&("10.0.0.8:4000".to_owned(), BackendMetric::Cpu)];
+    assert!(
+        (first - 0.6).abs() > 1e-9,
+        "cpu must be calcAvgUsage's average, not the latest sample ({first})"
+    );
+    // And the two backends are not conflated onto one value.
+    let second = published[&("10.0.0.9:4000".to_owned(), BackendMetric::Cpu)];
+    assert!(
+        (first - second).abs() > 1e-9,
+        "each backend publishes its own samples ({first} vs {second})"
+    );
+}
