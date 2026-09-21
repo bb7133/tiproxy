@@ -1779,3 +1779,163 @@ async fn label_fail_list_and_retry_preserve_exact_attempts_and_current_policy() 
     assert_eq!(harness.router.finish(&next, true), Settlement::Ignored);
     Ok(())
 }
+
+/// Pending migrations summed over every incarnation the plane still holds.
+fn pending_total(handle: &crate::RoutePlaneHandle) -> u64 {
+    handle
+        .migration_snapshot()
+        .totals
+        .values()
+        .map(|totals| totals.pending)
+        .sum()
+}
+
+/// Replaces the `default` namespace so the current incarnation is retired,
+/// while any live admission lease keeps the old one alive.
+fn retire_namespace(harness: &Harness, file_revision: u64) -> TestResult {
+    let current = harness.source.store.current();
+    let mut replacement = NamespaceConfig {
+        namespace: "default".to_owned(),
+        ..NamespaceConfig::default()
+    };
+    replacement.frontend.user = "replacement".to_owned();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        vec![replacement],
+        SourceRevision {
+            file_revision,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+    Ok(())
+}
+
+/// Two incarnations migrating between the same backends for the same reason
+/// share one `(from, to, reason)` label set. The exposition has to add them
+/// up; a per-router write would have one silently replace the other.
+///
+/// The first incarnation is retired by configuration while its migration is
+/// still in flight, and is kept alive only by its admission lease. That is the
+/// case enumerating the plane's current routing table would miss, and it is
+/// also why the migration has to be started before the retirement: a retired
+/// incarnation no longer runs balance rounds, so it can hold an unsettled
+/// migration but cannot begin a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_snapshot_sums_shared_labels_across_a_retired_incarnation() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut first = must(handle.admit(""));
+    let reservation = must(first.selector_mut().next(ClientInfo::default(), ""));
+    let old_address = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        first.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (first_registration, mut first_commands) = must(first.register_commands(13101, 2));
+
+    let failed = format!(
+        "[proxy]\nfail-backend-list=[\"{old_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+    );
+    harness.patch(&failed, 3);
+    harness.source.deliver();
+    let first_command = tokio::time::timeout(Duration::from_secs(5), first_commands.recv())
+        .await?
+        .ok_or("first incarnation issued no redirect")?;
+    assert!(matches!(
+        first_command.command(),
+        crate::MigrationCommand::Redirect(_)
+    ));
+    // Deliberately unsettled: this migration must still be counted after its
+    // router stops being the routed one.
+    assert_eq!(pending_total(&handle), 1);
+
+    // Fail the OTHER backend instead, so the next incarnation is forced to
+    // start on the same one the first did and therefore shares its label set.
+    // Which backend a reservation lands on is not fixed by the fixture, so the
+    // pairing has to be forced rather than assumed.
+    let other_address = if old_address == "127.0.0.1:4000" {
+        "127.0.0.1:4001"
+    } else {
+        "127.0.0.1:4000"
+    };
+    let other_failed = format!(
+        "[proxy]\nfail-backend-list=[\"{other_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+    );
+    harness.patch(&other_failed, 4);
+    harness.source.deliver();
+
+    // Retire the first incarnation; its admission lease keeps it alive.
+    retire_namespace(&harness, 5)?;
+    let mut second = must(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.admit_within("replacement", Duration::from_secs(5)),
+        )
+        .await?,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    assert_eq!(
+        pending_total(&handle),
+        1,
+        "a retired incarnation still holding an unsettled migration must keep counting"
+    );
+
+    let reservation = must(second.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(
+        reservation.assignment().backend_address,
+        old_address,
+        "the replacement must start on the same backend to share the label set"
+    );
+    assert_eq!(
+        second.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (second_registration, mut second_commands) = must(second.register_commands(13102, 2));
+
+    harness.patch(&failed, 6);
+    harness.source.deliver();
+    let second_command = tokio::time::timeout(Duration::from_secs(5), second_commands.recv())
+        .await?
+        .ok_or("replacement incarnation issued no redirect")?;
+    assert!(matches!(
+        second_command.command(),
+        crate::MigrationCommand::Redirect(_)
+    ));
+
+    let snapshot = handle.migration_snapshot();
+    assert_eq!(
+        snapshot.totals.len(),
+        1,
+        "one shared label set, not one series per router"
+    );
+    assert_eq!(
+        snapshot.totals.values().map(|t| t.pending).sum::<u64>(),
+        2,
+        "both incarnations are in flight; a per-router write would report 1"
+    );
+
+    drop(first_command);
+    drop(second_command);
+    drop(first_registration);
+    drop(second_registration);
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
