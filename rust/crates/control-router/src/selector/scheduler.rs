@@ -31,7 +31,12 @@ pub(crate) fn stopped(stop: &watch::Receiver<bool>) -> bool {
 }
 impl Router {
     pub(crate) fn observe_close(&self, close: &crate::ForceClose) -> crate::Settlement {
-        self.lock().ledger.observe_close(close)
+        // A force-close terminal settles any redirect still pending on that
+        // session, so it has to publish like every other terminal path.
+        let mut state = self.lock();
+        let settlement = state.ledger.observe_close(close);
+        self.publish_migrations(state.ledger.drain_migrations());
+        settlement
     }
     pub(crate) fn migration_updates(
         &self,
@@ -124,7 +129,7 @@ impl Router {
         let mut rejected = Vec::new();
         let result = {
             let mut state = self.lock();
-            (|| {
+            let outcome = (|| {
                 self.sources.validate(candidate)?;
                 state.refresh(candidate)?;
                 self.sources.validate(candidate)?;
@@ -202,16 +207,16 @@ impl Router {
                         )?;
                     }
                 }
-                let closed =
-                    self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected);
-                // The scheduler reaches the ledger through `offer_redirect_locked`
-                // and `close_timed_out`, both of which bypass the public router
-                // entry points that publish. Without this the automatic path's
-                // acceptances would sit buffered until some unrelated call
-                // happened to drain them, arriving after their own settlement.
-                self.publish_migrations(state.ledger.drain_migrations());
-                closed
-            })()
+                self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected)
+            })();
+            // The scheduler reaches the ledger through `offer_redirect_locked`
+            // and `close_timed_out`, both of which bypass the public router
+            // entry points that publish. This sits outside the closure on
+            // purpose: the closure has `?` and early `return Err` paths that
+            // can abort a round which already admitted some redirects, and a
+            // drain on its last line would be skipped for exactly those.
+            self.publish_migrations(state.ledger.drain_migrations());
+            outcome
         };
         // Rejected envelopes were disarmed while the router still serialized
         // cooldown state, but their values leave the router lock before drop.
