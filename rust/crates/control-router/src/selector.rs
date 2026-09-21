@@ -183,8 +183,9 @@ const fn score_write_decision(
 const SCORE_METRIC_INTERVAL_NANOS: i64 = 10_000_000_000;
 /// The two must not drift apart; the literal exists only because the cast
 /// from `Duration::as_nanos`'s `u128` is not const-checkable.
-const _: () = assert!(SCORE_METRIC_INTERVAL_NANOS.unsigned_abs() as u128
-    == crate::SCORE_METRIC_INTERVAL.as_nanos());
+const _: () = assert!(
+    SCORE_METRIC_INTERVAL_NANOS.unsigned_abs() as u128 == crate::SCORE_METRIC_INTERVAL.as_nanos()
+);
 
 #[cfg(test)]
 type MetricUseBarrier = (
