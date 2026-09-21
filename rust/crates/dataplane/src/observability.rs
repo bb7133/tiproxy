@@ -1249,13 +1249,17 @@ pub struct SystemTimeMonitor {
 }
 
 impl SystemTimeMonitor {
-    /// Stops the monitor and waits for its task.
+    /// Signals the monitor to stop; [`Self::join`] waits for it.
+    pub fn stop(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    /// Waits for the stopped monitor's task.
     ///
     /// # Errors
     ///
     /// Returns the task's join error if it panicked.
-    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        self.shutdown.send_replace(true);
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         self.task.await
     }
 }
@@ -1700,10 +1704,8 @@ mod tests {
             Some(&1),
             "a backward reading across one 100ms wait is one jump"
         );
-        monitor
-            .shutdown()
-            .await
-            .unwrap_or_else(|e| unreachable!("{e}"));
+        monitor.stop();
+        monitor.join().await.unwrap_or_else(|e| unreachable!("{e}"));
     }
 
     #[test]
