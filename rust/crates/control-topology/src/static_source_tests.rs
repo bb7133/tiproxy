@@ -997,6 +997,7 @@ impl ModeHandleFixture {
                         healthy: true,
                         server_version: None,
                         local: true,
+                        sql_dial: None,
                     },
                 )
             })

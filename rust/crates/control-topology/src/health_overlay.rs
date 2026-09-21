@@ -125,6 +125,7 @@ impl HealthSnapshot {
                 healthy: false,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             })
     }
 }
@@ -547,6 +548,7 @@ mod tests {
                         healthy: true,
                         server_version: Some("v8".to_owned()),
                         local: false,
+                        sql_dial: None,
                     },
                 )
             })

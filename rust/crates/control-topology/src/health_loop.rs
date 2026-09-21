@@ -259,6 +259,7 @@ pub(crate) async fn probe_backend_in_generation(
             healthy: false,
             server_version: None,
             local: false,
+            sql_dial: None,
         };
     }
     if backend.backend.ip.is_empty() {
@@ -266,12 +267,14 @@ pub(crate) async fn probe_backend_in_generation(
             healthy: true,
             server_version: None,
             local: false,
+            sql_dial: None,
         };
     }
     BackendHealth {
         healthy: false,
         server_version: None,
         local: false,
+        sql_dial: None,
     }
 }
 
@@ -342,6 +345,7 @@ where
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     },
                 )
             })
@@ -971,6 +975,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }
             }
@@ -1057,6 +1062,7 @@ mod tests {
                         healthy: false,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }
             }
@@ -1178,6 +1184,7 @@ mod tests {
                 server_version: None,
                 // Go `setLocal`: an empty proxy zone marks every enabled-round backend local.
                 local: true,
+                sql_dial: None,
             },
             "a static backend with a missing network is healthy with no version"
         );
@@ -1215,6 +1222,7 @@ mod tests {
                 healthy: false,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             }
         };
         let config = HealthRoundConfig {
@@ -1248,6 +1256,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     },
                 )
             })
@@ -1500,6 +1509,7 @@ mod tests {
                     healthy: true,
                     server_version: Some(format!("epoch-{epoch}")),
                     local: false,
+                    sql_dial: None,
                 }
             })
         }
@@ -1660,6 +1670,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as std::pin::Pin<Box<dyn Future<Output = BackendHealth> + Send>>
             }
@@ -1749,6 +1760,7 @@ mod tests {
                         healthy: true,
                         server_version: Some("v8".to_owned()),
                         local: false,
+                        sql_dial: None,
                     }
                 }) as std::pin::Pin<Box<dyn Future<Output = BackendHealth> + Send>>
             }
@@ -1929,6 +1941,7 @@ mod tests {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             };
             if index < n {
                 Box::pin(async move { healthy }) as BoxedProbe
@@ -2107,6 +2120,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as BoxedProbe
             }
@@ -2216,6 +2230,7 @@ mod tests {
                     healthy: true,
                     server_version: None,
                     local: false,
+                    sql_dial: None,
                 }
             }) as BoxedProbe
         };
@@ -2287,6 +2302,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as BoxedProbe
             }
@@ -2357,6 +2373,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as BoxedProbe
             }
@@ -2434,6 +2451,7 @@ mod tests {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             }
         })
     }
@@ -2584,6 +2602,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as BoxedProbe
             }
@@ -2686,6 +2705,7 @@ mod tests {
                         healthy: true,
                         server_version: None,
                         local: false,
+                        sql_dial: None,
                     }
                 }) as BoxedProbe
             }

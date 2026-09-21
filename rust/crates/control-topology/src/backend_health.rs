@@ -59,6 +59,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use control_external::{
     ClusterHttpClient, ClusterHttpConfigError, EtcdClientConfig, HttpProbePolicy,
@@ -86,7 +87,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Only `server_version` (Go `ServerVersion`) is carried here; `connections` and
 /// `git_hash` are parsed for Go typed-decode parity but do not participate in the
 /// health decision and are not surfaced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendHealth {
     /// Whether the backend passed the `/status` probe this stage.
     pub healthy: bool,
@@ -98,6 +99,14 @@ pub struct BackendHealth {
     /// round uses Go's `setLocal` rule (no proxy zone → `true`; equal `zone`
     /// labels → `true`; otherwise `false`), a disabled round leaves it `false`.
     pub local: bool,
+    /// Duration of the last SQL-port dial attempt: Go's
+    /// `ping_duration_seconds`.
+    ///
+    /// Go times only `DialContext`, inside its retry loop, and sets the gauge
+    /// on every attempt including failures. The value is therefore the last
+    /// attempt alone -- not the whole health check, and not the retries plus
+    /// their backoff. `None` when this stage dialled the SQL port not at all.
+    pub sql_dial: Option<Duration>,
 }
 
 impl BackendHealth {
@@ -107,6 +116,7 @@ impl BackendHealth {
             healthy: false,
             server_version: None,
             local: false,
+            sql_dial: None,
         }
     }
 }
@@ -333,16 +343,17 @@ impl ClusterHealthNetwork {
         if !status.healthy {
             return status;
         }
-        if self
+        let (reachable, sql_dial) = self
             .probe_sql_port(handle, source, backend, max_retries, retry_interval)
-            .await
-        {
-            status
+            .await;
+        if reachable {
+            BackendHealth { sql_dial, ..status }
         } else {
             BackendHealth {
                 healthy: false,
                 server_version: status.server_version,
                 local: false,
+                sql_dial,
             }
         }
     }
@@ -398,6 +409,7 @@ impl ClusterHealthNetwork {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             };
         }
         // Guard the u64 -> u16 port narrowing rather than silently truncating.
@@ -428,6 +440,7 @@ impl ClusterHealthNetwork {
                         healthy: true,
                         server_version: Some(version),
                         local: false,
+                        sql_dial: None,
                     };
                 }
                 Err(error) => {
@@ -475,42 +488,48 @@ impl ClusterHealthNetwork {
         backend: &MergedBackend,
         max_retries: u32,
         retry_interval: Duration,
-    ) -> bool {
+    ) -> (bool, Option<Duration>) {
         if !handle.still_current(source) {
-            return false;
+            return (false, None);
         }
         if source.client_epoch != self.client_epoch
             || backend.cluster_name.as_ref() != self.cluster_name.as_ref()
         {
-            return false;
+            return (false, None);
         }
         let Some((host, port)) = split_host_port(&backend.backend.addr) else {
-            return false;
+            return (false, None);
         };
 
         let mut retries_remaining = max_retries;
+        // Go sets the gauge on every attempt, so the value it exposes is the
+        // last dial -- failures included -- not the sum of the retries.
+        let mut last_dial = None;
         loop {
             if !handle.still_current(source) {
-                return false;
+                return (false, last_dial);
             }
-            match self.sql.check_once(host, port, source.source_gate()).await {
+            let started = Instant::now();
+            let attempt = self.sql.check_once(host, port, source.source_gate()).await;
+            last_dial = Some(started.elapsed());
+            match attempt {
                 // Never accept a live result from a superseded source.
-                Ok(()) => return handle.still_current(source),
+                Ok(()) => return (handle.still_current(source), last_dial),
                 Err(error) => {
                     // Fence-first: a stale source is terminal and wins over the
                     // failure class, so a retired source is never retried.
                     if !handle.still_current(source) {
-                        return false;
+                        return (false, last_dial);
                     }
                     if error.is_retryable() && retries_remaining > 0 {
                         retries_remaining -= 1;
                         tokio::time::sleep(retry_interval).await;
                         if !handle.still_current(source) {
-                            return false;
+                            return (false, last_dial);
                         }
                         continue;
                     }
-                    return false;
+                    return (false, last_dial);
                 }
             }
         }
@@ -775,11 +794,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             },
             "a static backend (empty ip) skips the status stage (no version) and is \
              healthy through its SQL greeting"
@@ -840,11 +863,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             }
         );
         assert_eq!(
@@ -973,11 +1000,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: Some("v9".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "the probe recovers on the third attempt"
         );
@@ -1352,6 +1383,8 @@ mod tests {
         source: &Arc<RoutingSnapshot>,
         addr: &str,
     ) -> bool {
+        // The fixtures assert reachability; the dial duration is covered by
+        // its own test.
         network
             .probe_sql_port(
                 handle,
@@ -1361,6 +1394,7 @@ mod tests {
                 SQL_RETRY_INTERVAL,
             )
             .await
+            .0
     }
 
     #[tokio::test]
@@ -1374,6 +1408,56 @@ mod tests {
             "a V10 first byte is a live SQL layer"
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "one attempt, no retry");
+    }
+
+    /// Go times `DialContext` alone and sets the gauge on every attempt,
+    /// failures included, so the value it exposes is the last dial rather
+    /// than the whole stage. Timing the stage instead would add the retry
+    /// backoff, which is orders of magnitude larger than the dial.
+    #[tokio::test]
+    async fn the_sql_stage_records_its_last_dial_not_the_retry_budget() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+
+        // A live greeting: one attempt, and its duration is recorded.
+        let (port, _accepted, _first) = bind_greeter(Greeting::V10).await;
+        let (live, dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                MAX_RETRIES,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        assert!(live);
+        let dial = dial.unwrap_or_else(|| unreachable!("a dial happened"));
+
+        // An ERR greeting retried across the whole budget: Go still reports
+        // the last attempt, so the recorded value must stay in the range of a
+        // single loopback dial rather than growing with the retries.
+        let (err_port, accepted, _first) = bind_greeter(Greeting::Err).await;
+        let (err_live, err_dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{err_port}")),
+                MAX_RETRIES,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        assert!(!err_live);
+        let err_dial = err_dial.unwrap_or_else(|| unreachable!("a failed dial is still timed"));
+        assert!(
+            accepted.load(Ordering::SeqCst) > 1,
+            "the fixture must actually retry for this to mean anything"
+        );
+        assert!(
+            err_dial < SQL_RETRY_INTERVAL,
+            "the recorded dial is one attempt ({err_dial:?}), not the retries plus backoff"
+        );
+        let _ = dial;
     }
 
     #[tokio::test]
@@ -1417,7 +1501,7 @@ mod tests {
             )
             .await;
         let elapsed = started.elapsed();
-        assert!(!live, "a refused SQL dial is unhealthy");
+        assert!(!live.0, "a refused SQL dial is unhealthy");
         assert!(
             elapsed < Duration::from_millis(900),
             "connection-refused is terminal, so no 1s backoff ran (took {elapsed:?})"
@@ -1553,7 +1637,7 @@ mod tests {
         let live = task
             .await
             .unwrap_or_else(|error| unreachable!("probe task: {error}"));
-        assert!(!live, "a source superseded mid-probe is never live");
+        assert!(!live.0, "a source superseded mid-probe is never live");
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             1,
@@ -1628,11 +1712,15 @@ mod tests {
             .probe_backend(&handle, &source, &backend, MAX_RETRIES, SQL_RETRY_INTERVAL)
             .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: false,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "an ERR greeting fails the backend but the status stage's version is retained (Go)"
         );
@@ -1698,11 +1786,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: false,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "a refused SQL port fails the backend, version retained"
         );
