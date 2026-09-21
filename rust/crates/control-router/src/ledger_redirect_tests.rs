@@ -971,3 +971,40 @@ fn a_migration_target_is_registered_when_it_lands() {
         "a successful settlement registers the target"
     );
 }
+
+/// A refused address must not reach the exposition. Recording the drop and
+/// then publishing the series anyway would make the ceiling advisory: the
+/// diagnostic would say one was dropped while the 4097th was still exposed.
+#[test]
+fn a_refused_backend_address_is_not_exposed() {
+    let history = Arc::new(MigrationHistory::default());
+    // Fill the retained set with addresses that hold no connections.
+    for index in 0..MAX_RETAINED_LABEL_SETS {
+        assert!(history.remember_backend(&format!("10.9.0.1:{index}")));
+    }
+    let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+    let a = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.250:4000")));
+
+    // The connection succeeds -- a full metric table must never refuse it.
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+
+    let snapshot = history.snapshot();
+    assert!(
+        !snapshot.known_backends.contains("10.0.0.250:4000"),
+        "the retained set is full, so this address is refused"
+    );
+    assert_eq!(snapshot.labels_dropped, 1, "and the refusal is counted");
+    assert!(
+        !ledger
+            .physical_connections()
+            .contains_key("10.0.0.250:4000"),
+        "a refused address must not be published, or the ceiling means nothing"
+    );
+    assert_eq!(
+        snapshot.known_backends.len(),
+        MAX_RETAINED_LABEL_SETS,
+        "the retained set stays at its ceiling"
+    );
+}

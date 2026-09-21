@@ -157,6 +157,17 @@ impl MigrationHistory {
         true
     }
 
+    /// Whether this address was admitted to the retained set.
+    ///
+    /// The read path consults this rather than admitting on its own: one
+    /// decision was already made when the connection landed, and a refused
+    /// address must stay out of the exposition instead of being reinserted by
+    /// a later aggregation.
+    #[must_use]
+    pub fn knows_backend(&self, address: &str) -> bool {
+        self.lock().known_backends.contains(address)
+    }
+
     /// Records one settled migration. Called exactly once per `Applied`
     /// terminal; a duplicate or late settlement is `Ignored` upstream and
     /// never reaches here.

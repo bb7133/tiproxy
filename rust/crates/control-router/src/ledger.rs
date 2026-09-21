@@ -456,6 +456,13 @@ impl Ledger {
                 if address.is_empty() {
                     continue;
                 }
+                // A refused address is not exposed. Admission happened when
+                // the connection landed; counting it here anyway would let
+                // the aggregation reinsert a series past the ceiling, so the
+                // drop would be recorded and the series published regardless.
+                if !self.history.knows_backend(address) {
+                    continue;
+                }
                 *counts.entry(address.clone()).or_default() += 1;
             }
         }
