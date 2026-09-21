@@ -11,6 +11,7 @@
     "tiproxy_backend_get_backend",
     "tiproxy_backend_get_backend_duration_seconds",
     "tiproxy_backend_keepalive_update_total",
+    "tiproxy_balance_b_conn",
     "tiproxy_balance_migrate_duration_seconds",
     "tiproxy_balance_migrate_total",
     "tiproxy_balance_pending_migrate",

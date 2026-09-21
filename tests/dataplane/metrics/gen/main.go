@@ -102,6 +102,13 @@ func run(input, nativeList string) error {
 		metrics.MigrateDurationHistogram.WithLabelValues(m.from, m.to, m.result).Observe(m.seconds)
 	}
 
+	// Backend connection counts. Go sets this per namespace router, so the
+	// fixture uses distinct addresses; the overlapping-address difference is
+	// pinned by the comparator case, not here.
+	for _, b := range fixedBackendConns {
+		metrics.BackendConnGauge.WithLabelValues(b.addr).Set(float64(b.conns))
+	}
+
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
 		return err
@@ -142,6 +149,15 @@ const (
 	fixedKeepAlives = 3
 	fixedTimeJumps  = 2
 )
+
+// Backend connection counts, mirrored by the Rust golden test.
+var fixedBackendConns = []struct {
+	addr  string
+	conns int
+}{
+	{addr: "10.0.0.1:4000", conns: 2},
+	{addr: "10.0.0.2:4000", conns: 1},
+}
 
 // The migration fixture, mirrored exactly by the Rust golden test.
 var fixedMigrations = []struct {

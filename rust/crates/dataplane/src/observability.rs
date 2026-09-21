@@ -125,7 +125,7 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 25] = [
+pub const METRIC_SPECS: [MetricSpec; 26] = [
     MetricSpec {
         name: "tiproxy_backend_dial_backend_fail",
         help: "Counter of failing to dial backends.",
@@ -152,6 +152,13 @@ pub const METRIC_SPECS: [MetricSpec; 25] = [
         help: "Counter of health-driven backend keepalive policy updates.",
         kind: MetricKind::Counter,
         labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_b_conn",
+        help: "Number of backend connections.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
         buckets: &[],
     },
     MetricSpec {
@@ -639,6 +646,7 @@ fn render_migration_family(
 ) -> Option<String> {
     let mut lines = String::new();
     match spec.name {
+        "tiproxy_balance_b_conn" => render_backend_connections(spec, state, &mut lines),
         "tiproxy_balance_pending_migrate" => {
             // Every label set ever seen is emitted, so a series that has
             // returned to zero keeps reporting instead of disappearing.
@@ -744,6 +752,24 @@ fn render_migration_family(
 )]
 const fn counter_as_f64(value: u64) -> f64 {
     value as f64
+}
+
+/// Connections per backend address, summed across incarnations.
+fn render_backend_connections(
+    spec: &MetricSpec,
+    state: &control_router::MigrationSnapshot,
+    lines: &mut String,
+) {
+    for (address, active) in &state.backend_connections {
+        push_sample(
+            lines,
+            spec.name,
+            "",
+            &[("backend", address.clone())],
+            None,
+            counter_as_f64(*active),
+        );
+    }
 }
 
 /// Go `succeedToLabel`.
@@ -2060,6 +2086,7 @@ mod tests {
                 }
                 control_router::MigrationSnapshot {
                     pending: BTreeMap::new(),
+                    backend_connections: BTreeMap::new(),
                     history: history.snapshot(),
                 }
             }
@@ -2091,6 +2118,7 @@ mod tests {
                 }
                 control_router::MigrationSnapshot {
                     pending: BTreeMap::new(),
+                    backend_connections: BTreeMap::new(),
                     history: history.snapshot(),
                 }
             }
@@ -2142,6 +2170,13 @@ mod tests {
                 control_router::RedirectReason::Balance(control_router::Factor::Status);
             let flight_to = "10.0.0.3:4000".to_owned();
             let mut snapshot = control_router::MigrationSnapshot::default();
+            // Mirrors `fixedBackendConns` in the Go oracle.
+            snapshot
+                .backend_connections
+                .insert("10.0.0.1:4000".to_owned(), 2);
+            snapshot
+                .backend_connections
+                .insert("10.0.0.2:4000".to_owned(), 1);
             snapshot.pending.insert(
                 control_router::MigrationLabels {
                     from: from.clone(),

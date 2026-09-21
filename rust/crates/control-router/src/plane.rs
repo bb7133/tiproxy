@@ -174,6 +174,7 @@ impl RouteLedgerDiagnostics {
             // incarnation is alive.
             history: self.history.snapshot(),
             pending: BTreeMap::new(),
+            backend_connections: BTreeMap::new(),
         };
         for router in routers {
             // No ceiling of its own on purpose. Every ledger only tracks
@@ -184,6 +185,23 @@ impl RouteLedgerDiagnostics {
             for (labels, pending) in router.pending_migrations() {
                 let entry = snapshot.pending.entry(labels).or_default();
                 *entry = entry.saturating_add(pending);
+            }
+            // Go writes this gauge with Set from one namespace's router, so
+            // two namespaces sharing a backend address overwrite each other
+            // and the last writer decides. Summing instead makes the address
+            // label mean what it says: how many connections this process
+            // holds to that backend. The difference is declared in the parity
+            // manifest rather than hidden.
+            for (address, active) in router.physical_connections() {
+                if !snapshot.backend_connections.contains_key(&address)
+                    && snapshot.backend_connections.len() >= crate::MAX_RETAINED_LABEL_SETS
+                {
+                    snapshot.history.labels_dropped =
+                        snapshot.history.labels_dropped.saturating_add(1);
+                    continue;
+                }
+                let entry = snapshot.backend_connections.entry(address).or_default();
+                *entry = entry.saturating_add(active);
             }
         }
         snapshot
@@ -197,6 +215,9 @@ impl RouteLedgerDiagnostics {
 pub struct MigrationSnapshot {
     /// In-flight migrations per label set, summed across incarnations.
     pub pending: BTreeMap<crate::MigrationLabels, u64>,
+    /// Physically owned connections per backend address, summed across
+    /// incarnations including retired ones that still hold sessions.
+    pub backend_connections: BTreeMap<String, u64>,
     /// Cumulative terminals and durations, plus every label set ever seen.
     pub history: crate::MigrationHistorySnapshot,
 }

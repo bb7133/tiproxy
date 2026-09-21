@@ -43,6 +43,15 @@ impl Router {
         self.lock().ledger.pending_migrations().clone()
     }
 
+    /// Physically owned connections per backend address on this router.
+    ///
+    /// Same lock rule as the other snapshot readers: no registry lock may be
+    /// held, since the settlement path runs router lock then registry.
+    #[must_use]
+    pub fn physical_connections(&self) -> BTreeMap<String, u64> {
+        self.lock().ledger.physical_connections()
+    }
+
     /// The process-level cumulative history this router writes to.
     #[must_use]
     pub fn migration_history(&self) -> Arc<crate::MigrationHistory> {

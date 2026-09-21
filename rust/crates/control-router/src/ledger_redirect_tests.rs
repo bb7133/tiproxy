@@ -816,3 +816,77 @@ fn review_retained_label_remains_counted_after_unretained_churn() {
         "unretained churn must not suppress a real pending migration for a globally retained label"
     );
 }
+
+/// Go counts a backend's `connList`, and that list only moves when a
+/// migration succeeds. Each clause here is a way the count could drift from
+/// Go if the wrong state were read.
+#[test]
+fn physical_connections_follow_gos_conn_list_exactly() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+
+    // A reservation is not yet a connection.
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert!(
+        ledger.physical_connections().is_empty(),
+        "an incomplete reservation is not a physical connection"
+    );
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    assert_eq!(
+        ledger.physical_connections().get("10.0.0.1:4000").copied(),
+        Some(1)
+    );
+
+    // An accepted migration keeps counting against its source: Go moves the
+    // connection between lists only once it has actually landed.
+    let now = Instant::now();
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        now,
+        RedirectReason::Test,
+    ));
+    ledger.admit_redirect(op.clone(), true, now);
+    let counts = ledger.physical_connections();
+    assert_eq!(counts.get("10.0.0.1:4000").copied(), Some(1));
+    assert_eq!(
+        counts.get("10.0.0.2:4000"),
+        None,
+        "an incoming redirect is not a connection until it settles"
+    );
+
+    // A failed migration leaves it on the source.
+    assert_eq!(ledger.finish_redirect(&op, false, now), Settlement::Applied);
+    assert_eq!(
+        ledger.physical_connections().get("10.0.0.1:4000").copied(),
+        Some(1)
+    );
+
+    // A successful one moves it, and never counts it twice.
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        now + Duration::from_secs(4),
+        RedirectReason::Test,
+    ));
+    ledger.admit_redirect(op.clone(), true, now + Duration::from_secs(4));
+    assert_eq!(
+        ledger.finish_redirect(&op, true, now + Duration::from_secs(4)),
+        Settlement::Applied
+    );
+    let counts = ledger.physical_connections();
+    assert_eq!(counts.get("10.0.0.1:4000"), None);
+    assert_eq!(counts.get("10.0.0.2:4000").copied(), Some(1));
+    assert_eq!(counts.values().sum::<u64>(), 1, "counted once, not twice");
+
+    // Closing decrements exactly once.
+    assert_eq!(
+        ledger.close(&session, now + Duration::from_secs(5)),
+        Settlement::Applied
+    );
+    assert!(ledger.physical_connections().is_empty());
+}

@@ -40,6 +40,10 @@ tiproxy_backend_get_backend_duration_seconds_count 2
 # TYPE tiproxy_backend_keepalive_update_total counter
 tiproxy_backend_keepalive_update_total{backend="10.0.0.1:4000",health="unhealthy",result="succeed"} 1
 tiproxy_backend_keepalive_update_total{backend="10.0.0.2:4000",health="healthy",result="fail"} 1
+# HELP tiproxy_balance_b_conn Number of backend connections.
+# TYPE tiproxy_balance_b_conn gauge
+tiproxy_balance_b_conn{backend="10.0.0.1:4000"} 2
+tiproxy_balance_b_conn{backend="10.0.0.2:4000"} 1
 # HELP tiproxy_balance_migrate_duration_seconds Bucketed histogram of migrating time (s) of sessions.
 # TYPE tiproxy_balance_migrate_duration_seconds histogram
 tiproxy_balance_migrate_duration_seconds_bucket{from="10.0.0.1:4000",migrate_res="fail",to="10.0.0.2:4000",le="0.0001"} 0

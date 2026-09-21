@@ -437,6 +437,31 @@ impl Ledger {
         }
     }
 
+    /// Physically owned connections per backend address, Go's `b_conn`.
+    ///
+    /// Go sets this from the backend's `connList` length, and that list only
+    /// moves when a migration succeeds. The active assignment behaves the same
+    /// way here -- it is rewritten on a successful settlement and left alone
+    /// on a failed one -- so an accepted migration keeps counting against its
+    /// source until it actually lands.
+    ///
+    /// Only established sessions count: a reservation that has not completed
+    /// is not a physical connection, and neither is an incoming redirect that
+    /// has not settled. Each session contributes exactly once.
+    pub(crate) fn physical_connections(&self) -> BTreeMap<String, u64> {
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for stage in self.sessions.values() {
+            if let Stage::Active(active) = stage {
+                let address = &active.assignment.backend_address;
+                if address.is_empty() {
+                    continue;
+                }
+                *counts.entry(address.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     /// Migrations in flight on this router, per label set.
     pub(crate) const fn pending_migrations(&self) -> &BTreeMap<MigrationLabels, u64> {
         &self.pending_migrations

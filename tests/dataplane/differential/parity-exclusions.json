@@ -172,6 +172,10 @@
     {
       "parity_id": "TOPO-003",
       "reason": "Named backend-cluster isolation and legacy PD fallback are configuration/topology behavior before packet forwarding."
+    },
+    {
+      "parity_id": "MTR-007",
+      "reason": "Backend connection counts are process state, not client wire traffic: an immutable MySQL byte trace can neither produce nor observe how many sessions a router incarnation physically owns. Verification is the ledger test that the count follows Go's connList exactly (reservation excluded, source kept until a migration succeeds, closed once), the Go promhttp oracle over native-families.json, and the comparator case pinning the one declared deviation for backend addresses shared between namespaces."
     }
   ]
 }
