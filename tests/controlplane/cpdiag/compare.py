@@ -168,11 +168,15 @@ def compare_server_info(label, name, go_entry, rust_entry, declared, volatile, f
                             item_ok = False
                     if cls is MHZ and MHZ.match(gv) and MHZ.match(rv):
                         # Scaling moves this between captures; a unit or source
-                        # mistake does not stay inside this band.
+                        # mistake does not stay inside this band. Go's gopsutil
+                        # keeps 0 when the source is absent (arm64 containers),
+                        # so both sides reporting 0 agree; only one side at 0
+                        # means one of them lost the source.
                         g_mhz, r_mhz = float(gv[:-3]), float(rv[:-3])
-                        if not g_mhz or not 0.5 <= r_mhz / g_mhz <= 2.0:
-                            failures.append(f"{label}/{name}: {item} {k} go={gv!r} rust={rv!r} are not the same clock")
-                            item_ok = False
+                        if g_mhz or r_mhz:
+                            if not g_mhz or not r_mhz or not 0.5 <= r_mhz / g_mhz <= 2.0:
+                                failures.append(f"{label}/{name}: {item} {k} go={gv!r} rust={rv!r} are not the same clock")
+                                item_ok = False
             if item_ok:
                 identical += 1
     return identical
