@@ -153,8 +153,16 @@ pub struct Router {
 /// metric registry, and the dataplane cannot be depended on from here, so the
 /// composition owner installs the sink.
 pub trait MigrationSink: Send + Sync {
-    /// Publishes one settled or issued migration. Called with no router lock
-    /// held, so an implementation may do bounded work.
+    /// Publishes one issued or settled migration.
+    ///
+    /// Called with the router state lock HELD, so an implementation must not
+    /// block and must not re-enter the router. That is deliberate: the
+    /// pending-migration gauge is a running +1/-1, so the sink has to observe
+    /// issues and settlements in ledger order. Publishing after releasing the
+    /// lock lets a settlement on one thread overtake the issue it belongs to,
+    /// which drives the gauge to -1 (clamped to 0) and then +1, leaving it
+    /// stuck at one phantom pending migration forever. The production sink is
+    /// a non-blocking channel send that drops on a full queue.
     fn record(&self, observation: MigrationObservation);
 }
 
@@ -167,9 +175,10 @@ impl Router {
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
 
-    /// Publishes everything the ledger buffered, with the state lock already
-    /// released. Every ledger mutation path funnels through here, including
-    /// the terminal guard's drop, so no settlement can escape publication.
+    /// Publishes everything the ledger buffered, called with the state lock
+    /// still held so publication order is ledger order. Every ledger mutation
+    /// path funnels through here, including the terminal guard's drop, so no
+    /// settlement can escape publication.
     fn publish_migrations(&self, drained: Vec<MigrationObservation>) {
         if drained.is_empty() {
             return;
@@ -722,14 +731,14 @@ impl Router {
         now: Instant,
     ) -> Result<bool, RouteError> {
         let mut rejected = Vec::new();
-        let (result, drained) = {
+        let result = {
             let mut state = self.lock();
             let result =
                 self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected);
-            (result, state.ledger.drain_migrations())
+            self.publish_migrations(state.ledger.drain_migrations());
+            result
         };
         drop(rejected);
-        self.publish_migrations(drained);
         result
     }
 
@@ -833,7 +842,6 @@ impl Router {
     ) -> crate::RedirectAllSummary {
         let mut summary = crate::RedirectAllSummary::default();
         let mut rejected = Vec::new();
-        let drained;
         {
             let mut state = self.lock();
             summary.active = state.ledger.evidence().active;
@@ -853,10 +861,9 @@ impl Router {
                 state.ledger.admit_redirect(redirect, accepted, now);
                 summary.accepted += u64::from(accepted);
             }
-            drained = state.ledger.drain_migrations();
+            self.publish_migrations(state.ledger.drain_migrations());
         }
         drop(rejected);
-        self.publish_migrations(drained);
         summary
     }
 
@@ -866,12 +873,9 @@ impl Router {
         success: bool,
         now: Instant,
     ) -> Settlement {
-        let (settlement, drained) = {
-            let mut state = self.lock();
-            let settlement = state.ledger.finish_redirect(redirect, success, now);
-            (settlement, state.ledger.drain_migrations())
-        };
-        self.publish_migrations(drained);
+        let mut state = self.lock();
+        let settlement = state.ledger.finish_redirect(redirect, success, now);
+        self.publish_migrations(state.ledger.drain_migrations());
         settlement
     }
 
@@ -884,12 +888,9 @@ impl Router {
     /// Closes the exact session incarnation and returns any remaining accounting.
     /// Closing twice or closing a foreign session has no effect.
     pub fn close(&self, session: &Session) -> Settlement {
-        let (settlement, drained) = {
-            let mut state = self.lock();
-            let settlement = state.ledger.close(session);
-            (settlement, state.ledger.drain_migrations())
-        };
-        self.publish_migrations(drained);
+        let mut state = self.lock();
+        let settlement = state.ledger.close(session);
+        self.publish_migrations(state.ledger.drain_migrations());
         settlement
     }
 
