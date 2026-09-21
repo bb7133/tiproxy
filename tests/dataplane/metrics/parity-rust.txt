@@ -1,3 +1,7 @@
+# HELP tiproxy_backend_b_status Gauge of backend status.
+# TYPE tiproxy_backend_b_status gauge
+tiproxy_backend_b_status{backend="10.0.0.1:4000"} 1
+tiproxy_backend_b_status{backend="10.0.0.2:4000"} 0
 # HELP tiproxy_backend_dial_backend_fail Counter of failing to dial backends.
 # TYPE tiproxy_backend_dial_backend_fail counter
 tiproxy_backend_dial_backend_fail{backend="10.0.0.1:4000"} 1
@@ -36,10 +40,18 @@ tiproxy_backend_get_backend_duration_seconds_bucket{le="33.554432"} 2
 tiproxy_backend_get_backend_duration_seconds_bucket{le="+Inf"} 2
 tiproxy_backend_get_backend_duration_seconds_sum 0.250001
 tiproxy_backend_get_backend_duration_seconds_count 2
+# HELP tiproxy_backend_health_check_seconds Time (s) of each health check cycle.
+# TYPE tiproxy_backend_health_check_seconds gauge
+tiproxy_backend_health_check_seconds 1.5
 # HELP tiproxy_backend_keepalive_update_total Counter of health-driven backend keepalive policy updates.
 # TYPE tiproxy_backend_keepalive_update_total counter
 tiproxy_backend_keepalive_update_total{backend="10.0.0.1:4000",health="unhealthy",result="succeed"} 1
 tiproxy_backend_keepalive_update_total{backend="10.0.0.2:4000",health="healthy",result="fail"} 1
+# HELP tiproxy_backend_ping_duration_seconds Time (s) of pinging the SQL port of each backend.
+# TYPE tiproxy_backend_ping_duration_seconds gauge
+tiproxy_backend_ping_duration_seconds{backend="10.0.0.1:4000"} 0.004
+tiproxy_backend_ping_duration_seconds{backend="10.0.0.2:4000"} 0.012
+tiproxy_backend_ping_duration_seconds{backend="10.0.0.3:4000"} 0.25
 # HELP tiproxy_balance_b_conn Number of backend connections.
 # TYPE tiproxy_balance_b_conn gauge
 tiproxy_balance_b_conn{backend="10.0.0.1:4000"} 2

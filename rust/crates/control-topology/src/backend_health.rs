@@ -68,6 +68,7 @@ use control_plane::OwnerToken;
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 
+use crate::health_history::BackendHealthHistory;
 use crate::merge::MergedBackend;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 
@@ -211,6 +212,11 @@ pub struct ClusterHealthNetwork {
     client_epoch: u64,
     /// The backend cluster this network's DNS/TLS material belongs to.
     cluster_name: Arc<str>,
+    /// Where a completed SQL dial publishes `ping_duration_seconds`, or
+    /// `None` for a network whose dials are not exposed (tests, and any
+    /// wiring that has not opted in). A missing history suppresses the
+    /// metric; it never changes the probe verdict.
+    health_history: Option<Arc<BackendHealthHistory>>,
 }
 
 /// A cluster health network whose fallible transport is already built but whose
@@ -289,6 +295,7 @@ impl PreparedClusterHealthNetwork {
             sql: self.sql,
             client_epoch,
             cluster_name: self.cluster_name,
+            health_history: None,
         }
     }
 }
@@ -319,6 +326,19 @@ impl ClusterHealthNetwork {
             PreparedClusterHealthNetwork::build(config, owner, policy, cluster_name)?
                 .bind(client_epoch),
         )
+    }
+
+    /// Publishes every SQL dial this network makes into the process-level
+    /// backend health gauges.
+    ///
+    /// Opt-in so that a probe built for a test exposes nothing by default. The
+    /// history is shared, not owned: all of a process's clusters write the one
+    /// `ping_duration_seconds` family, as Go's package-level `GaugeVec` is
+    /// shared by all of its observers.
+    #[must_use]
+    pub fn with_health_history(mut self, history: Arc<BackendHealthHistory>) -> Self {
+        self.health_history = Some(history);
+        self
     }
 
     /// Probes one backend and returns its combined health verdict, mirroring Go
@@ -508,6 +528,25 @@ impl ClusterHealthNetwork {
         // Go sets the gauge on every attempt, so the value it exposes is the
         // last dial -- failures included -- not the sum of the retries.
         let mut last_dial = None;
+        // Publishing from `last_dial` after the call would be a greeting too
+        // late: `check_once_timed` freezes the observation at the connect but
+        // only returns once the greeting read finishes. This hook runs at the
+        // freeze point instead, which is where Go calls
+        // `setPingBackendMetrics`.
+        //
+        // Fence before publishing, never after: a stale source may no longer
+        // map this address to this cluster, and a dial's sequence orders
+        // observations without authorising them, so a later dial from a
+        // retired source must not overwrite a live one.
+        let publish_dial = |dial: &SqlDialObservation| {
+            let Some(history) = self.health_history.as_ref() else {
+                return;
+            };
+            if !handle.still_current(source) {
+                return;
+            }
+            history.observe_dial(&backend.backend.addr, dial);
+        };
         loop {
             if !handle.still_current(source) {
                 return (false, last_dial);
@@ -517,7 +556,7 @@ impl ClusterHealthNetwork {
             // greeting, so a slow greeting must not land in this value.
             let (dial, attempt) = self
                 .sql
-                .check_once_timed(host, port, source.source_gate())
+                .check_once_timed(host, port, source.source_gate(), &publish_dial)
                 .await;
             last_dial = Some(dial);
             match attempt {
@@ -612,6 +651,7 @@ mod tests {
         BackendHealth, ClusterHealthNetwork, MAX_RETRIES, RETRY_INTERVAL, decode_status_version,
     };
     use crate::discovery_publish::EpochResult;
+    use crate::health_history::BackendHealthHistory;
     use crate::merge::{MergedBackend, MergedTopology};
     use crate::model::BackendInfo;
     use crate::routing_snapshot::{
@@ -1596,6 +1636,77 @@ mod tests {
             recorded.duration < dial_budget / 4,
             "the recorded dial is the connect alone ({recorded:?}), not the greeting read \
              that took {whole_check:?}"
+        );
+    }
+
+    /// The dial is exposed when it completes, not when the probe returns.
+    ///
+    /// `check_once_timed` freezes the observation at the connect but only
+    /// returns once the greeting read has finished, so publishing from its
+    /// return value would hide every dial for the length of that read -- for
+    /// this backend, the entire budget. Go has already called
+    /// `setPingBackendMetrics` by then, so a late publication is a real
+    /// divergence and not merely a scrape sampling an older value.
+    #[tokio::test]
+    async fn a_dial_is_exposed_before_the_greeting_is_read() {
+        let (_registry, lease) = owner_lease();
+        let dial_budget = Duration::from_millis(200);
+        let history = Arc::new(BackendHealthHistory::new());
+        let network = ClusterHealthNetwork::from_cluster_material(
+            &plaintext_config(),
+            lease.token(),
+            HttpProbePolicy {
+                attempt_timeout: dial_budget,
+                max_response_bytes: 64 * 1024,
+            },
+            NETWORK_EPOCH,
+            Arc::from(CLUSTER),
+        )
+        .unwrap_or_else(|error| unreachable!("network: {error}"))
+        .with_health_history(Arc::clone(&history));
+        let (_publisher, handle, source) = published_source();
+        // Accepts at once, then never writes a greeting: the connect is
+        // immediate and the probe then stalls for the whole read budget.
+        let (port, _accepted, _first) = bind_greeter(Greeting::Hang).await;
+        let address = format!("127.0.0.1:{port}");
+        let backend = merged_backend_at(CLUSTER, &address);
+
+        let started = Instant::now();
+        // Give up looking well before the probe can possibly return, so a
+        // sighting proves the publication beat the greeting rather than
+        // merely racing it.
+        let watch_until = dial_budget / 2;
+        let probe = network.probe_sql_port(&handle, &source, &backend, 0, SQL_RETRY_INTERVAL);
+        let watch = async {
+            let deadline = Instant::now() + watch_until;
+            loop {
+                if let Some(sample) = history.snapshot().ping.get(&address) {
+                    return Some(*sample);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let ((live, recorded), seen_early) = tokio::join!(probe, watch);
+        let whole_check = started.elapsed();
+
+        assert!(!live, "a hung greeting is unhealthy");
+        assert!(recorded.is_some(), "the connect happened");
+        // Premise: the probe really was still running when the gauge was read.
+        assert!(
+            whole_check >= dial_budget,
+            "the fixture must spend the whole read budget ({whole_check:?}), otherwise the              probe could have returned before the gauge was sampled"
+        );
+        let seen_early = seen_early.unwrap_or_else(|| {
+            unreachable!(
+                "the dial was not exposed within {watch_until:?}, while the probe ran for                  {whole_check:?}: it was published from the probe's return instead of from                  the connect"
+            )
+        });
+        assert!(
+            seen_early.seconds < dial_budget.as_secs_f64() / 4.0,
+            "the exposed value is the connect alone ({seen_early:?}), not the greeting read"
         );
     }
 

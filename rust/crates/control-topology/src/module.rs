@@ -71,6 +71,7 @@ use crate::discovery_publish::{
 };
 use crate::health_config::{HealthConfigError, HealthRuntime};
 use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
+use crate::health_history::{BackendHealthHistory, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
@@ -263,6 +264,12 @@ pub struct TopologyModule {
     mode: ModePublisher,
     /// The readers' registry of live static producers, by namespace.
     statics: Arc<StaticRegistry>,
+    /// The process-level values behind `b_status`, `ping_duration_seconds`
+    /// and `health_check_seconds`. Shared with the health child (which owns
+    /// the per-observer edges) and with the exposition through
+    /// [`TopologyModuleHandle::health_history`], so both see one set of
+    /// series the way Go's package-level collectors are one set.
+    health_history: Arc<BackendHealthHistory>,
     #[cfg(test)]
     refresh_override: Option<RefreshFactory>,
     #[cfg(test)]
@@ -349,6 +356,7 @@ pub struct TopologyModuleHandle {
     source: Arc<dyn ConfigNamespaceSource>,
     mode: watch::Receiver<Arc<ModeEpoch>>,
     statics: Arc<StaticRegistry>,
+    health_history: Arc<BackendHealthHistory>,
     #[cfg(test)]
     mode_hook: crate::static_source::PublishHook,
 }
@@ -381,6 +389,16 @@ impl TopologyUpdateObserver {
 }
 
 impl TopologyModuleHandle {
+    /// The process-level backend health gauge values, for the exposition.
+    ///
+    /// Read-only in practice: the writers are the health child and the SQL
+    /// probes. A reader takes a snapshot per scrape rather than holding the
+    /// lock, so a slow exposition never delays a health round.
+    #[must_use]
+    pub fn health_history(&self) -> Arc<BackendHealthHistory> {
+        Arc::clone(&self.health_history)
+    }
+
     /// Creates a wake-only observer for consumers that must rebuild a derived
     /// serving view after routing or health publication.
     #[must_use]
@@ -710,6 +728,7 @@ impl TopologyModule {
         #[cfg(test)]
         let mode_hook = mode.publish_hook();
         let statics = Arc::new(StaticRegistry::default());
+        let health_history = Arc::new(BackendHealthHistory::new());
         let (metrics, metric_source) = MetricPublication::new(Arc::clone(&source), health);
         Ok((
             Self {
@@ -733,6 +752,7 @@ impl TopologyModule {
                 mode,
                 metrics,
                 statics: Arc::clone(&statics),
+                health_history: Arc::clone(&health_history),
                 #[cfg(test)]
                 refresh_override: None,
                 #[cfg(test)]
@@ -748,6 +768,7 @@ impl TopologyModule {
                 source,
                 mode: mode_reader,
                 statics,
+                health_history,
                 #[cfg(test)]
                 mode_hook,
             },
@@ -973,6 +994,7 @@ impl TopologyModule {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             Arc::clone(&self.source),
+            Some(ObserverHealthMetrics::new(Arc::clone(&self.health_history))),
         ))
     }
 
@@ -1124,7 +1146,14 @@ impl TopologyModule {
                         Arc::new(
                             networks
                                 .into_iter()
-                                .map(|(name, prepared)| (name, prepared.bind(client_epoch)))
+                                .map(|(name, prepared)| {
+                                    (
+                                        name,
+                                        prepared
+                                            .bind(client_epoch)
+                                            .with_health_history(Arc::clone(&self.health_history)),
+                                    )
+                                })
                                 .collect(),
                         )
                     }),
@@ -1260,6 +1289,7 @@ impl TopologyModule {
                 &self.health_runtime,
                 &self.source,
                 self.mode.applied(),
+                &self.health_history,
             )
             .await;
         let outcome = self

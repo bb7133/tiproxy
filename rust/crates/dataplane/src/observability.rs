@@ -125,7 +125,14 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 26] = [
+pub const METRIC_SPECS: [MetricSpec; 29] = [
+    MetricSpec {
+        name: "tiproxy_backend_b_status",
+        help: "Gauge of backend status.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
+        buckets: &[],
+    },
     MetricSpec {
         name: "tiproxy_backend_dial_backend_fail",
         help: "Counter of failing to dial backends.",
@@ -148,10 +155,24 @@ pub const METRIC_SPECS: [MetricSpec; 26] = [
         buckets: &GET_BACKEND_BUCKETS,
     },
     MetricSpec {
+        name: "tiproxy_backend_health_check_seconds",
+        help: "Time (s) of each health check cycle.",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
         name: "tiproxy_backend_keepalive_update_total",
         help: "Counter of health-driven backend keepalive policy updates.",
         kind: MetricKind::Counter,
         labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_ping_duration_seconds",
+        help: "Time (s) of pinging the SQL port of each backend.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
         buckets: &[],
     },
     MetricSpec {
@@ -415,6 +436,27 @@ pub trait MigrationStateSource: Send + Sync {
     fn migration_state(&self) -> control_router::MigrationSnapshot;
 }
 
+/// Authoritative source for the three backend health families.
+///
+/// Separate from [`MigrationStateSource`] because the state has a different
+/// owner: these values are written by the topology health child and by the
+/// SQL probes, not by any router. Like the migration source it is read
+/// without the registry lock, and for the same reason -- the provider takes
+/// the history's own lock, and a scrape must never be able to hold a health
+/// round up behind the exposition.
+pub trait HealthStateSource: Send + Sync {
+    /// The current value of every backend health series.
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot;
+}
+
+/// The history itself is the source: it already holds exactly the values the
+/// three families expose, so an adapter would only forward `snapshot`.
+impl HealthStateSource for control_topology::BackendHealthHistory {
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+        self.snapshot()
+    }
+}
+
 /// Process-local cumulative store behind the native Prometheus exposition.
 ///
 /// Counters and histograms reset with the process, which is ordinary
@@ -427,6 +469,8 @@ pub struct MetricsRegistry {
     /// Deliberately not inside `state`: reading it must not need the lock
     /// that rendering takes, so the snapshot can be fetched before it.
     migrations: Mutex<Option<Arc<dyn MigrationStateSource>>>,
+    /// The backend health families' source, held for the same reason.
+    health: Mutex<Option<Arc<dyn HealthStateSource>>>,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -451,6 +495,33 @@ impl MetricsRegistry {
             .migrations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Installs the authoritative source for the backend health families.
+    pub fn set_health_state_source(&self, source: Arc<dyn HealthStateSource>) {
+        *self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads health state while holding no registry lock, as for migrations.
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+        let source = self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.health_state())
+            .unwrap_or_default()
+    }
+
+    /// Addresses the health retention refused, folded into the same visible
+    /// dropped-observation counter as every other shed signal.
+    #[must_use]
+    pub fn health_labels_dropped(&self) -> u64 {
+        self.health_state().labels_dropped
     }
 
     /// Label sets the migration retention refused, for the same visible
@@ -545,9 +616,15 @@ impl MetricsRegistry {
         // Fetched first, holding nothing: the provider takes router locks and
         // the settlement path already runs router lock then registry.
         let migrations = self.migration_state();
+        let health = self.health_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_health_family(spec, &health) {
+                // Owned by the topology health path, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
             if let Some(rendered) = render_migration_family(spec, &migrations) {
                 // Served from authoritative state, never from anything this
                 // registry accumulated.
@@ -732,6 +809,65 @@ fn render_migration_family(
                     counter_as_f64(series.count),
                 );
             }
+        }
+        _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// The three families whose values the topology health path owns.
+///
+/// `b_status` and `ping_duration_seconds` are `GaugeVec`s in Go, so they have
+/// no children until something sets one and are absent from the exposition
+/// until then. `health_check_seconds` is a plain `Gauge`, registered at
+/// startup, so it reports `0` before the first cycle completes rather than
+/// being absent.
+fn render_health_family(
+    spec: &MetricSpec,
+    state: &control_topology::HealthMetricsSnapshot,
+) -> Option<String> {
+    let mut lines = String::new();
+    match spec.name {
+        "tiproxy_backend_b_status" => {
+            for (address, healthy) in &state.status {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[("backend", address.clone())],
+                    None,
+                    if *healthy { 1.0 } else { 0.0 },
+                );
+            }
+        }
+        "tiproxy_backend_ping_duration_seconds" => {
+            for (address, sample) in &state.ping {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[("backend", address.clone())],
+                    None,
+                    sample.seconds,
+                );
+            }
+        }
+        "tiproxy_backend_health_check_seconds" => {
+            push_sample(
+                &mut lines,
+                spec.name,
+                "",
+                &[],
+                None,
+                state.cycle_seconds.unwrap_or(0.0),
+            );
         }
         _ => return None,
     }
@@ -1566,7 +1702,8 @@ async fn run_exporter(
                         .load(Ordering::Relaxed)
                         .saturating_add(aggregator.overflow_dropped)
                         .saturating_add(registry.series_dropped())
-                        .saturating_add(registry.migration_labels_dropped()),
+                        .saturating_add(registry.migration_labels_dropped())
+                        .saturating_add(registry.health_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -2156,6 +2293,37 @@ mod tests {
         );
     }
 
+    /// Mirrors `fixedBackendHealth` and `fixedHealthCheckCycleSeconds` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// `10.0.0.3:4000` reports a ping and no status: it has been dialled but
+    /// never been healthy, so Go never created its `b_status` child. A
+    /// rendering that emitted it at zero would look harmless and be wrong.
+    struct FixedHealth;
+
+    impl HealthStateSource for FixedHealth {
+        fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+            let mut snapshot = control_topology::HealthMetricsSnapshot::default();
+            snapshot.status.insert("10.0.0.1:4000".to_owned(), true);
+            snapshot.status.insert("10.0.0.2:4000".to_owned(), false);
+            for (address, seconds) in [
+                ("10.0.0.1:4000", 0.004),
+                ("10.0.0.2:4000", 0.012),
+                ("10.0.0.3:4000", 0.25),
+            ] {
+                snapshot.ping.insert(
+                    address.to_owned(),
+                    control_topology::PingSample {
+                        seconds,
+                        sequence: 0,
+                    },
+                );
+            }
+            snapshot.cycle_seconds = Some(1.5);
+            snapshot
+        }
+    }
+
     /// Mirrors `fixedMigrations` in `tests/dataplane/metrics/gen/main.go`:
     /// one succeeded and one failed migration whose pending series return to
     /// zero, and a third still in flight.
@@ -2564,6 +2732,11 @@ mod tests {
         aggregator
             .registry
             .set_migration_state_source(Arc::new(FixedMigrations));
+        // Likewise for the backend health families, which the topology path
+        // owns rather than this registry.
+        aggregator
+            .registry
+            .set_health_state_source(Arc::new(FixedHealth));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");

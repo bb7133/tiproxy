@@ -50,6 +50,7 @@ use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::EpochResult;
 use crate::health_config::HealthRuntime;
 use crate::health_feed::HealthGenerationFeeder;
+use crate::health_history::{BackendHealthHistory, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
@@ -389,6 +390,7 @@ impl StaticBackendProducer {
     /// # Errors
     ///
     /// Returns the default network's build failure (an invalid probe timeout).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         instances: &[String],
         incarnation: NamespaceIncarnation,
@@ -397,11 +399,13 @@ impl StaticBackendProducer {
         zone: Arc<dyn ConfigNamespaceSource>,
         updates: watch::Sender<u64>,
         activate: bool,
+        health_history: &Arc<BackendHealthHistory>,
     ) -> Result<Self, ClusterHttpConfigError> {
         let networks = match runtime.probe_policy() {
             Some(policy) => {
                 let network = PreparedClusterHealthNetwork::system_default(owner.clone(), policy)?
-                    .bind(STATIC_CLIENT_EPOCH);
+                    .bind(STATIC_CLIENT_EPOCH)
+                    .with_health_history(Arc::clone(health_history));
                 let mut map = HashMap::with_capacity(1);
                 map.insert(Arc::<str>::from(STATIC_CLUSTER_NAME), network);
                 Some(Arc::new(map))
@@ -432,6 +436,7 @@ impl StaticBackendProducer {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             zone,
+            Some(ObserverHealthMetrics::new(Arc::clone(health_history))),
         ));
         let mut producer = Self {
             incarnation,
@@ -536,6 +541,7 @@ impl StaticProducers {
         runtime: &HealthRuntime,
         zone: &Arc<dyn ConfigNamespaceSource>,
         mode: Option<BackendSourceMode>,
+        health_history: &Arc<BackendHealthHistory>,
     ) {
         self.retire_unused().await;
         let activate = mode == Some(BackendSourceMode::Static);
@@ -568,6 +574,7 @@ impl StaticProducers {
                 Arc::clone(zone),
                 self.registry.updates.clone(),
                 activate,
+                health_history,
             ) {
                 self.registry.insert(name.to_owned(), producer.registered());
                 self.producers.insert(name.to_owned(), producer);

@@ -776,6 +776,9 @@ async fn run(options: Options) -> Result<(), String> {
     metrics_registry.set_migration_state_source(Arc::new(PlaneMigrationState::new(
         route_plane_handle.clone(),
     )));
+    // The three backend health families are served the same way, from the
+    // history the topology health child and the SQL probes write into.
+    metrics_registry.set_health_state_source(topology_handle.health_history());
     // CP-ADMIN's debug redirect sweeps every current router.
     let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {

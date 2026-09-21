@@ -7,10 +7,13 @@
     "Add a family here only when Rust actually serves it."
   ],
   "families": [
+    "tiproxy_backend_b_status",
     "tiproxy_backend_dial_backend_fail",
     "tiproxy_backend_get_backend",
     "tiproxy_backend_get_backend_duration_seconds",
+    "tiproxy_backend_health_check_seconds",
     "tiproxy_backend_keepalive_update_total",
+    "tiproxy_backend_ping_duration_seconds",
     "tiproxy_balance_b_conn",
     "tiproxy_balance_migrate_duration_seconds",
     "tiproxy_balance_migrate_total",

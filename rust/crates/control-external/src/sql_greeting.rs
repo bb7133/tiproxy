@@ -139,9 +139,23 @@ pub struct SqlDialObservation {
     /// How long the connect took: Go's `ping_duration_seconds`.
     pub duration: Duration,
     /// When the connect returned, frozen at the same point as `duration`.
+    ///
+    /// Diagnostic only. It is *not* the ordering key: it is read in its own
+    /// statement, so two concurrent dials can take their instants and their
+    /// sequences in opposite orders. Comparing these to decide which
+    /// observation is newer would disagree with `sequence` under exactly the
+    /// concurrency that makes the question worth asking.
     pub completed_at: Instant,
-    /// Monotonic within this process, assigned at the same point, so two
-    /// dials sharing an instant still have a deterministic order.
+    /// The publication order of this dial, and the only ordering key.
+    ///
+    /// One atomic increment, so it is a total order over every dial in the
+    /// process -- which `completed_at` is not. A consumer deciding whether an
+    /// observation supersedes the one it holds compares this alone.
+    ///
+    /// It orders observations; it does not authorise them. A larger sequence
+    /// from a retired source or a stale address mapping is still refused --
+    /// the caller's fence runs first, and only an admitted observation is
+    /// ordered against the stored one.
     pub sequence: u64,
 }
 
@@ -230,7 +244,9 @@ impl SqlGreetingProbe {
         port: u16,
         source_gate: &GenerationGate,
     ) -> Result<(), SqlGreetingError> {
-        self.check_once_timed(host, port, source_gate).await.1
+        self.check_once_timed(host, port, source_gate, &|_| {})
+            .await
+            .1
     }
 
     /// As [`Self::check_once`], also reporting how long the **connect** took.
@@ -240,11 +256,20 @@ impl SqlGreetingProbe {
     /// greeting read. Timing the whole check instead would fold a slow
     /// greeting into what Go reports as a dial. The duration is returned on
     /// failure and on timeout as well, because Go sets the gauge there too.
+    ///
+    /// `on_dial` runs at that same point, before the greeting is awaited.
+    /// Returning the observation is not enough to match Go: the return only
+    /// happens once the greeting read finishes, so a caller publishing from
+    /// the return value would expose every successful dial one greeting late
+    /// -- on a hung backend, a whole `dial_timeout` late. Go's `Set` has
+    /// already happened by then. The hook is synchronous and must stay cheap;
+    /// it runs before the stream is even matched.
     pub async fn check_once_timed(
         &self,
         host: &str,
         port: u16,
         source_gate: &GenerationGate,
+        on_dial: &(dyn Fn(&SqlDialObservation) + Sync),
     ) -> (SqlDialObservation, Result<(), SqlGreetingError>) {
         let started = Instant::now();
         let dialed = tokio::time::timeout(
@@ -261,6 +286,9 @@ impl SqlGreetingProbe {
             completed_at: Instant::now(),
             sequence: DIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         };
+        // Published here, not at the return: this is Go's `setPingBackendMetrics`
+        // position, inside the retry loop and ahead of the greeting read.
+        on_dial(&dial);
         let mut stream = match dialed {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => return (dial, Err(error.into())),

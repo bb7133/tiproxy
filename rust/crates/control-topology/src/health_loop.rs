@@ -45,6 +45,7 @@ use tokio::time::Instant;
 
 use crate::backend_health::{BackendHealth, ClusterHealthNetwork};
 use crate::health_feed::HealthGenerationFeed;
+use crate::health_history::ObserverHealthMetrics;
 use crate::health_overlay::{HealthOverlayPublisher, HealthPublishOutcome};
 use crate::merge::MergedBackend;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
@@ -449,6 +450,18 @@ enum CadenceOutcome {
 /// Waits for the feed to change (or go terminal), polling the owner every
 /// [`OWNER_POLL_INTERVAL`] so an owner retirement is observed within one interval
 /// even when no feed change ever arrives.
+/// Narrows a round's verdict to what the `b_status` edges are decided from.
+///
+/// The gauge carries only the healthy bit, and the address is the label, so
+/// the rest of [`BackendHealth`] is deliberately dropped here rather than
+/// held by the observer between rounds.
+fn healthy_by_address(health: &HashMap<Arc<str>, BackendHealth>) -> BTreeMap<String, bool> {
+    health
+        .iter()
+        .map(|(address, health)| (address.to_string(), health.healthy))
+        .collect()
+}
+
 async fn wait_change_or_owner(
     feed: &HealthGenerationFeed,
     seen_revision: u64,
@@ -520,6 +533,7 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
     concurrency: usize,
     probe: Probe,
     locality: impl ProxyZoneSource,
+    mut gauges: Option<ObserverHealthMetrics>,
 ) where
     Probe: Fn(
         Arc<HealthGeneration>,
@@ -636,6 +650,13 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                     // stale map — it either loses the lock race (publish rejected) or
                     // wins it after the publish (and synchronously revokes the feed
                     // gate, so the just-published overlay is immediately non-current).
+                    if let Some(gauges) = gauges.as_mut() {
+                        // Go `updateHealthResult`, which runs only when the
+                        // backend list was fetched: a round with no verdict
+                        // leaves every `b_status` child at its last value
+                        // rather than zeroing it.
+                        gauges.apply_round(&healthy_by_address(&map), Instant::now());
+                    }
                     feed.publish_current(&generation, |feed_gate| {
                         if round_authoritative(&routing, &source, &owner) {
                             guard.publisher.publish_observation(
@@ -648,6 +669,14 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                             );
                         }
                     });
+                }
+                if let Some(gauges) = gauges.as_mut() {
+                    // Go runs both of these at the bottom of every iteration,
+                    // outside the `updateHealthResult` early return, so they
+                    // are deliberately not inside the verdict branch above.
+                    // Purge first, then the cycle gauge, as Go orders them.
+                    let _retired = gauges.purge(Instant::now());
+                    gauges.observe_cycle(round_started.elapsed());
                 }
                 // Cadence: next round anchored `interval` after this round started;
                 // an over-run makes the sleep already-elapsed so it fires at once.
@@ -1544,6 +1573,7 @@ mod tests {
             4,
             probe,
             TestZone::none(),
+            None,
         ));
         // Park on a real (virtual) wait so the paused clock auto-advances the loop.
         let _ = tokio::time::timeout(
@@ -1691,6 +1721,7 @@ mod tests {
             4,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // Advance to t1, rotate the routing source to r2, and hand the loop the new
@@ -1776,6 +1807,7 @@ mod tests {
             1,
             probe,
             TestZone::none(),
+            None,
         ));
 
         wait_until("the first successful health round publishes", || {
@@ -2010,6 +2042,7 @@ mod tests {
             N,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // Round 0 publishes H1 for r1.
@@ -2137,6 +2170,7 @@ mod tests {
             N,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // Every probe of the first round is in flight, holding a guard.
@@ -2243,6 +2277,7 @@ mod tests {
             4,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // Let the loop reach the park, then confirm one owner poll with a LIVE owner
@@ -2316,6 +2351,7 @@ mod tests {
             4,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // Wait until the probe is in flight (blocked), so the round never completes.
@@ -2387,6 +2423,7 @@ mod tests {
             4,
             probe,
             TestZone::none(),
+            None,
         ));
 
         // The first round publishes, then the loop enters the 1h cadence sleep.
@@ -2623,6 +2660,7 @@ mod tests {
             4,
             probe,
             zone.clone(),
+            None,
         ));
 
         // Round 1 is in flight (captured zone az-1); flip the zone, then release it.

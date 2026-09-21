@@ -109,6 +109,24 @@ func run(input, nativeList string) error {
 		metrics.BackendConnGauge.WithLabelValues(b.addr).Set(float64(b.conns))
 	}
 
+	// Backend health. The three families are written straight to the Go
+	// collectors because the observer helpers that drive them in production
+	// are unexported. The fixture pins the semantics that distinguish them:
+	// b_status has a child only for an address that has been healthy at least
+	// once, while ping_duration_seconds has one for every address dialled.
+	for _, b := range fixedBackendHealth {
+		metrics.PingBackendGauge.WithLabelValues(b.addr).Set(b.pingSeconds)
+		if !b.everHealthy {
+			continue
+		}
+		value := 0.0
+		if b.healthy {
+			value = 1
+		}
+		metrics.BackendStatusGauge.WithLabelValues(b.addr).Set(value)
+	}
+	metrics.HealthCheckCycleGauge.Set(fixedHealthCheckCycleSeconds)
+
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
 		return err
@@ -172,6 +190,27 @@ var fixedMigrations = []struct {
 	{from: "10.0.0.1:4000", to: "10.0.0.2:4000", reason: "conn", result: "fail", seconds: 0.5, settled: true},
 	{from: "10.0.0.1:4000", to: "10.0.0.3:4000", reason: "status", settled: false},
 }
+
+// Backend health, mirrored exactly by the Rust golden test.
+//
+// `10.0.0.3:4000` has never been healthy, so it is dialled -- and reports a
+// ping -- without ever creating a `b_status` child. That asymmetry is the
+// point of the case: Go only creates the status child on a transition into
+// healthy, so a backend that has only ever failed is absent from b_status
+// rather than present at zero.
+var fixedBackendHealth = []struct {
+	addr        string
+	everHealthy bool
+	healthy     bool
+	pingSeconds float64
+}{
+	{addr: "10.0.0.1:4000", everHealthy: true, healthy: true, pingSeconds: 0.004},
+	{addr: "10.0.0.2:4000", everHealthy: true, healthy: false, pingSeconds: 0.012},
+	{addr: "10.0.0.3:4000", everHealthy: false, healthy: false, pingSeconds: 0.25},
+}
+
+// One health check cycle's duration.
+const fixedHealthCheckCycleSeconds = 1.5
 
 type nativeFamilies struct {
 	Families []string `json:"families"`
