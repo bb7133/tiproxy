@@ -1857,7 +1857,7 @@ mod tests {
         );
     }
 
-    /// Dial timing excludes waiting for the MySQL greeting after TCP accepts.
+    /// Dial timing excludes waiting for the `MySQL` greeting after TCP accepts.
     #[tokio::test]
     async fn review_sql_dial_excludes_delayed_greeting() {
         let (_registry, lease) = owner_lease();
