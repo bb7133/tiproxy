@@ -56,6 +56,12 @@ tiproxy_backend_ping_duration_seconds{backend="10.0.0.3:4000"} 0.25
 # TYPE tiproxy_balance_b_conn gauge
 tiproxy_balance_b_conn{backend="10.0.0.1:4000"} 2
 tiproxy_balance_b_conn{backend="10.0.0.2:4000"} 1
+# HELP tiproxy_balance_b_score Gauge of backend scores.
+# TYPE tiproxy_balance_b_score gauge
+tiproxy_balance_b_score{backend="10.0.0.1:4000",factor="conn"} 3
+tiproxy_balance_b_score{backend="10.0.0.1:4000",factor="cpu"} 1
+tiproxy_balance_b_score{backend="10.0.0.2:4000",factor="conn"} 7
+tiproxy_balance_b_score{backend="10.0.0.3:4000",factor="status"} 0
 # HELP tiproxy_balance_migrate_duration_seconds Bucketed histogram of migrating time (s) of sessions.
 # TYPE tiproxy_balance_migrate_duration_seconds histogram
 tiproxy_balance_migrate_duration_seconds_bucket{from="10.0.0.1:4000",migrate_res="fail",to="10.0.0.2:4000",le="0.0001"} 0

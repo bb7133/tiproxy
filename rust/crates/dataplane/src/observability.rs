@@ -125,7 +125,7 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 30] = [
+pub const METRIC_SPECS: [MetricSpec; 31] = [
     MetricSpec {
         name: "tiproxy_backend_b_status",
         help: "Gauge of backend status.",
@@ -180,6 +180,13 @@ pub const METRIC_SPECS: [MetricSpec; 30] = [
         help: "Number of backend connections.",
         kind: MetricKind::Gauge,
         labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_b_score",
+        help: "Gauge of backend scores.",
+        kind: MetricKind::Gauge,
+        labels: &["backend", "factor"],
         buckets: &[],
     },
     MetricSpec {
@@ -464,6 +471,23 @@ impl HealthStateSource for control_topology::BackendHealthHistory {
     }
 }
 
+/// Authoritative source for `b_score`.
+///
+/// Held separately again because the writer is the balance round and the
+/// retention rule is its own: the family survives a backend leaving the
+/// topology and is cleared only by a configuration change.
+pub trait ScoreStateSource: Send + Sync {
+    /// The retained per-factor scores.
+    fn score_state(&self) -> control_router::ScoreSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl ScoreStateSource for control_router::ScoreHistory {
+    fn score_state(&self) -> control_router::ScoreSnapshot {
+        self.snapshot()
+    }
+}
+
 /// Authoritative source for `server_owner`.
 ///
 /// Separate again from the health families: the writers are the election
@@ -497,6 +521,8 @@ pub struct MetricsRegistry {
     health: Mutex<Option<Arc<dyn HealthStateSource>>>,
     /// `server_owner`'s source, held for the same reason.
     owner: Mutex<Option<Arc<dyn OwnerStateSource>>>,
+    /// `b_score`'s source, held for the same reason.
+    scores: Mutex<Option<Arc<dyn ScoreStateSource>>>,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -541,6 +567,32 @@ impl MetricsRegistry {
         source
             .map(|source| source.health_state())
             .unwrap_or_default()
+    }
+
+    /// Installs the authoritative source for `b_score`.
+    pub fn set_score_state_source(&self, source: Arc<dyn ScoreStateSource>) {
+        *self
+            .scores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads score state while holding no registry lock, as for the rest.
+    fn score_state(&self) -> control_router::ScoreSnapshot {
+        let source = self
+            .scores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.score_state())
+            .unwrap_or_default()
+    }
+
+    /// Label pairs the score retention refused, folded into the same counter.
+    #[must_use]
+    pub fn score_labels_dropped(&self) -> u64 {
+        self.score_state().labels_dropped
     }
 
     /// Installs the authoritative source for `server_owner`.
@@ -670,9 +722,15 @@ impl MetricsRegistry {
         let migrations = self.migration_state();
         let health = self.health_state();
         let owner = self.owner_state();
+        let scores = self.score_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_score_family(spec, &scores) {
+                // Owned by the balance round, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
             if let Some(rendered) = render_owner_family(spec, &owner) {
                 // Owned by the election workers, never accumulated here.
                 out.push_str(&rendered);
@@ -928,6 +986,45 @@ fn render_health_family(
             );
         }
         _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `b_score`: one sample per retained `(backend, factor)` pair.
+fn render_score_family(spec: &MetricSpec, state: &control_router::ScoreSnapshot) -> Option<String> {
+    if spec.name != "tiproxy_balance_b_score" {
+        return None;
+    }
+    let mut lines = String::new();
+    // Ordered by the rendered label, not by the `Factor` discriminant: the
+    // Go gatherer sorts label values, and the enum's declaration order is
+    // policy priority, which puts `cpu` before `conn` where Go puts `conn`
+    // first.
+    let mut rows: Vec<(&str, &'static str, u64)> = state
+        .scores
+        .iter()
+        .map(|((address, factor), score)| (address.as_str(), factor.metric_name(), *score))
+        .collect();
+    rows.sort_unstable_by_key(|(address, factor, _)| (*address, *factor));
+    for (address, factor, score) in rows {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[
+                ("backend", address.to_owned()),
+                ("factor", factor.to_owned()),
+            ],
+            None,
+            counter_as_f64(score),
+        );
     }
     if lines.is_empty() {
         return Some(String::new());
@@ -1796,7 +1893,8 @@ async fn run_exporter(
                         .saturating_add(registry.series_dropped())
                         .saturating_add(registry.migration_labels_dropped())
                         .saturating_add(registry.health_labels_dropped())
-                        .saturating_add(registry.owner_labels_dropped()),
+                        .saturating_add(registry.owner_labels_dropped())
+                        .saturating_add(registry.score_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -2386,6 +2484,31 @@ mod tests {
         );
     }
 
+    /// Mirrors `fixedBackendScores` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// A backend need not carry every factor: Go writes whatever the
+    /// configured factor set produced, so a partial row is a real shape and
+    /// not a fixture shortcut.
+    struct FixedScores;
+
+    impl ScoreStateSource for FixedScores {
+        fn score_state(&self) -> control_router::ScoreSnapshot {
+            use control_router::Factor;
+            control_router::ScoreSnapshot {
+                scores: [
+                    (("10.0.0.1:4000".to_owned(), Factor::Connection), 3),
+                    (("10.0.0.1:4000".to_owned(), Factor::Cpu), 1),
+                    (("10.0.0.2:4000".to_owned(), Factor::Connection), 7),
+                    (("10.0.0.3:4000".to_owned(), Factor::Status), 0),
+                ]
+                .into_iter()
+                .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
     /// Mirrors `fixedOwnedElections` and `fixedRetiredElection` in
     /// `tests/dataplane/metrics/gen/main.go`.
     ///
@@ -2852,6 +2975,9 @@ mod tests {
         aggregator
             .registry
             .set_owner_state_source(Arc::new(FixedOwner));
+        aggregator
+            .registry
+            .set_score_state_source(Arc::new(FixedScores));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");

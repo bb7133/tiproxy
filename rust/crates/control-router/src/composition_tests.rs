@@ -49,6 +49,9 @@ fn shared_go_composition_observation() {
         // This fixture tests policy inputs, not fabricated source authority.
         let mut state = State {
             ledger: Ledger::new(100),
+            score_history: None,
+            score_incarnation: None,
+            last_score_metric: None,
             factors: BTreeMap::new(),
             schedules: BTreeMap::new(),
             backends: BTreeMap::new(),

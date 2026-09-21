@@ -15,6 +15,7 @@
     "tiproxy_backend_keepalive_update_total",
     "tiproxy_backend_ping_duration_seconds",
     "tiproxy_balance_b_conn",
+    "tiproxy_balance_b_score",
     "tiproxy_balance_migrate_duration_seconds",
     "tiproxy_balance_migrate_total",
     "tiproxy_balance_pending_migrate",

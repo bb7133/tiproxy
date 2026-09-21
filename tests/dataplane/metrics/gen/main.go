@@ -138,6 +138,14 @@ func run(input, nativeList string) error {
 	metrics.OwnerGauge.MetricVec.DeletePartialMatch(
 		map[string]string{metrics.LblType: fixedRetiredElection})
 
+	// Per-factor backend scores. Go writes these from updateScore, one
+	// Set per (backend, factor), and only every updateMetricInterval; the
+	// cadence is covered by the Rust clock test, so the fixture just pins
+	// the label pairs and values.
+	for _, score := range fixedBackendScores {
+		metrics.BackendScoreGauge.WithLabelValues(score.addr, score.factor).Set(float64(score.score))
+	}
+
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
 		return err
@@ -230,6 +238,20 @@ var fixedOwnedElections = []string{"metric_reader", "metric_reader/z1"}
 
 // Won and then lost: Go deletes the child, so this must leave no series.
 const fixedRetiredElection = "metric_reader/z2"
+
+// Per-factor scores, mirrored exactly by the Rust golden test. A backend
+// need not carry every factor: Go writes whatever the configured factor set
+// produced, so a partial row is a real shape.
+var fixedBackendScores = []struct {
+	addr   string
+	factor string
+	score  int
+}{
+	{addr: "10.0.0.1:4000", factor: "conn", score: 3},
+	{addr: "10.0.0.1:4000", factor: "cpu", score: 1},
+	{addr: "10.0.0.2:4000", factor: "conn", score: 7},
+	{addr: "10.0.0.3:4000", factor: "status", score: 0},
+}
 
 type nativeFamilies struct {
 	Families []string `json:"families"`

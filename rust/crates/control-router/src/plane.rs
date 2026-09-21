@@ -306,9 +306,16 @@ pub struct RoutePlaneHandle {
     registry: Arc<Mutex<RegistryState>>,
     input_diagnostics: Arc<RouteInputDiagnostics>,
     ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
+    score_history: Arc<crate::ScoreHistory>,
 }
 
 impl RoutePlaneHandle {
+    /// The retained `b_score` values, for the exposition.
+    #[must_use]
+    pub fn score_history(&self) -> Arc<crate::ScoreHistory> {
+        Arc::clone(&self.score_history)
+    }
+
     /// Resolves once every namespace in the initial committed configuration has
     /// an exact router and retained topology-source lease in the registry.
     ///
@@ -497,6 +504,8 @@ pub struct RoutePlane {
     /// Cumulative migration history shared by every router this plane builds,
     /// so a destroyed incarnation cannot take its history with it.
     migration_history: Arc<crate::MigrationHistory>,
+    /// Retained per-factor scores, shared by every router this plane builds.
+    score_history: Arc<crate::ScoreHistory>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -520,6 +529,7 @@ impl RoutePlane {
         let registry = Arc::new(Mutex::new(RegistryState::default()));
         let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
         let migration_history = Arc::new(crate::MigrationHistory::default());
+        let score_history = Arc::new(crate::ScoreHistory::new());
         let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics {
             routers: Mutex::new(Vec::new()),
             history: Arc::clone(&migration_history),
@@ -529,8 +539,14 @@ impl RoutePlane {
         // clock, so this history registers as one of its targets. Done here
         // rather than at the composition root because the plane is where the
         // history is created and where the topology handle already is.
-        topology.backend_retirement().register(
+        let retirement = topology.backend_retirement();
+        retirement.register(
             Arc::clone(&migration_history) as Arc<dyn control_topology::BackendRetirementSink>
+        );
+        // `b_score` is keyed by backend address too, so Go's `DelBackend`
+        // takes it with the rest.
+        retirement.register(
+            Arc::clone(&score_history) as Arc<dyn control_topology::BackendRetirementSink>
         );
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
@@ -544,10 +560,12 @@ impl RoutePlane {
                 input_diagnostics: Arc::clone(&input_diagnostics),
                 migrations: None,
                 migration_history: Arc::clone(&migration_history),
+                score_history: Arc::clone(&score_history),
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
             RoutePlaneHandle {
+                score_history: Arc::clone(&score_history),
                 ready: ready_rx,
                 updates: updates_rx,
                 source,
@@ -602,6 +620,7 @@ impl RoutePlane {
                 max_sessions,
                 self.metrics.clone(),
                 crate::selector::RouterShared {
+                    scores: Arc::clone(&self.score_history),
                     input_diagnostics: Arc::clone(&self.input_diagnostics),
                     history: Arc::clone(&self.migration_history),
                 },

@@ -66,7 +66,125 @@ struct State {
     observed: Option<(Arc<RoutingSnapshot>, Arc<HealthSnapshot>)>,
     server_version: String,
     supports_redirection: bool,
+    /// Where this router's scores are published, or `None` when nothing
+    /// exposes them.
+    score_history: Option<Arc<crate::ScoreHistory>>,
+    /// The configuration generation the retained scores were written under.
+    ///
+    /// Go clears the whole family in `SetConfig`, so a change here wipes
+    /// every namespace's scores, not just this router's -- the gauge is
+    /// package-level in Go too, and each `FactorBasedBalance.SetConfig`
+    /// resets all of it.
+    score_incarnation: Option<control_config::ResourceIncarnation>,
+    /// Go `FactorBasedBalance.lastMetricTime`, in the same wall nanoseconds
+    /// the scoring uses.
+    ///
+    /// Per scoring instance, not per process: Go keeps it on the balance
+    /// object, so two routers throttle independently even though they write
+    /// into one set of series. `None` until this router has scored once,
+    /// which Go reaches through a zero `lastMetricTime` that any real time
+    /// exceeds.
+    last_score_metric: Option<i64>,
 }
+
+impl State {
+    /// Go `updateScore`'s metric branch: publish every backend's per-factor
+    /// score when this instance last did so more than `SCORE_METRIC_INTERVAL`
+    /// ago.
+    ///
+    /// The check happens at a real scoring, not on a timer, so a router that
+    /// stops scoring simply stops updating -- its last values stay exposed
+    /// for as long as that takes, which is Go's behaviour and the reason the
+    /// family cannot be described as bounded-staleness.
+    fn publish_scores(
+        &mut self,
+        now: i64,
+        incarnation: &control_config::ResourceIncarnation,
+        report: &crate::FactorReport,
+    ) {
+        let Some(history) = self.score_history.clone() else {
+            return;
+        };
+        let changed = self
+            .score_incarnation
+            .as_ref()
+            .is_none_or(|applied| !applied.same_as(incarnation));
+        // First application is adoption, not a change: Go has no reset to
+        // perform before its first `SetConfig`.
+        let decision = score_write_decision(
+            self.last_score_metric,
+            now,
+            changed && self.score_incarnation.is_some(),
+        );
+        if changed {
+            self.score_incarnation = Some(incarnation.clone());
+        }
+        if decision.reset {
+            history.reset();
+        }
+        if !decision.write {
+            return;
+        }
+        self.last_score_metric = Some(now);
+        for row in &report.rows {
+            // The row is keyed by the opaque routing id; the label is the
+            // address, resolved through the same state that produced the
+            // scores rather than derived anywhere else.
+            let Some(backend) = self.backends.get(&row.backend_id) else {
+                continue;
+            };
+            let address = backend.source.backend.addr.as_str();
+            if address.is_empty() {
+                continue;
+            }
+            for (factor, score) in &row.parts {
+                history.observe(address, *factor, *score);
+            }
+        }
+    }
+}
+
+/// What one scoring should do about the score gauges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScoreWrite {
+    /// Go `BackendScoreGauge.Reset()` from `SetConfig`.
+    reset: bool,
+    /// Go `updateScore`'s `needUpdateMetric`.
+    write: bool,
+}
+
+/// Go's two independent score-gauge decisions, separated from the state they
+/// read so the cadence can be exercised on a controlled clock.
+///
+/// They really are independent. A configuration change clears the family
+/// whether or not a write is due, and it does **not** touch
+/// `lastMetricTime`: Go's `SetConfig` resets the gauge and nothing else, so
+/// a reset does not earn an immediate write and a throttled scoring that
+/// follows one still waits out the remaining interval.
+const fn score_write_decision(
+    last_write: Option<i64>,
+    now: i64,
+    config_changed: bool,
+) -> ScoreWrite {
+    let write = match last_write {
+        // Go compares against a zero `lastMetricTime`, which any real time
+        // exceeds, so the first scoring always writes.
+        None => true,
+        // Strictly greater, as Go's `>` is.
+        Some(last) => now.saturating_sub(last) > SCORE_METRIC_INTERVAL_NANOS,
+    };
+    ScoreWrite {
+        reset: config_changed,
+        write,
+    }
+}
+
+/// [`crate::SCORE_METRIC_INTERVAL`] in the wall nanoseconds scoring uses.
+const SCORE_METRIC_INTERVAL_NANOS: i64 = 10_000_000_000;
+/// The two must not drift apart; the literal exists only because the cast
+/// from `Duration::as_nanos`'s `u128` is not const-checkable.
+const _: () = assert!(SCORE_METRIC_INTERVAL_NANOS.unsigned_abs() as u128
+    == crate::SCORE_METRIC_INTERVAL.as_nanos());
 
 #[cfg(test)]
 type MetricUseBarrier = (
@@ -172,6 +290,10 @@ pub struct RouterShared {
     pub input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
     /// Cumulative migration history, which outlives any one incarnation.
     pub history: Arc<crate::MigrationHistory>,
+    /// Retained `b_score` values, likewise process-level: Go's gauge is
+    /// shared by every balance instance, while the throttle that decides
+    /// when to write is per instance.
+    pub scores: Arc<crate::ScoreHistory>,
 }
 
 impl Router {
@@ -236,6 +358,9 @@ impl Router {
             next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
+                score_history: None,
+                score_incarnation: None,
+                last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),
@@ -276,6 +401,9 @@ impl Router {
             next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::with_history(max_sessions, shared.history),
+                score_history: Some(shared.scores),
+                score_incarnation: None,
+                last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),
@@ -1523,5 +1651,204 @@ impl Router {
             assert_eq!(ledger.close(&session, now), Settlement::Applied);
             drop(ledger.drain_migrations());
         }
+    }
+}
+
+#[cfg(test)]
+mod score_cadence_tests {
+    use super::{SCORE_METRIC_INTERVAL_NANOS, score_write_decision};
+
+    const T0: i64 = 1_000_000_000_000;
+
+    /// Go compares against a zero `lastMetricTime`, so the first scoring
+    /// always writes; there is no warm-up interval to wait out.
+    #[test]
+    fn the_first_scoring_writes() {
+        let decision = score_write_decision(None, T0, false);
+        assert!(decision.write);
+        assert!(!decision.reset);
+    }
+
+    /// Go's check is `now.Sub(last) > interval`, strictly. Exactly at the
+    /// boundary it does not write.
+    #[test]
+    fn the_interval_boundary_is_exclusive() {
+        assert!(
+            !score_write_decision(Some(T0), T0 + SCORE_METRIC_INTERVAL_NANOS, false).write,
+            "exactly one interval later is not yet past it"
+        );
+        assert!(score_write_decision(Some(T0), T0 + SCORE_METRIC_INTERVAL_NANOS + 1, false).write);
+        assert!(!score_write_decision(Some(T0), T0 + SCORE_METRIC_INTERVAL_NANOS - 1, false).write);
+    }
+
+    /// A scoring inside the interval changes nothing, which is what makes
+    /// the family a sample of the scores rather than a view of them.
+    #[test]
+    fn a_scoring_inside_the_interval_does_nothing() {
+        let decision = score_write_decision(Some(T0), T0 + 1, false);
+        assert!(!decision.write);
+        assert!(!decision.reset);
+    }
+
+    /// The two decisions are independent. Go's `SetConfig` resets the gauge
+    /// and does not touch `lastMetricTime`, so a configuration change clears
+    /// the family without earning a write, and the scoring that follows it
+    /// still waits out the rest of the interval.
+    #[test]
+    fn a_configuration_change_clears_without_writing() {
+        let throttled = score_write_decision(Some(T0), T0 + 1, true);
+        assert!(throttled.reset, "the family is cleared regardless");
+        assert!(
+            !throttled.write,
+            "a reset is not itself a reason to write; Go does not reset lastMetricTime"
+        );
+
+        // Past the interval, a change both clears and writes.
+        let due = score_write_decision(Some(T0), T0 + SCORE_METRIC_INTERVAL_NANOS + 1, true);
+        assert!(due.reset);
+        assert!(due.write);
+    }
+}
+
+#[cfg(test)]
+mod score_publication_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use control_config::{ConfigNamespaceSource, ConfigNamespaceStore};
+    use control_topology::{BackendInfo, MergedBackend};
+
+    use super::{Backend, PortRoutes, SCORE_METRIC_INTERVAL_NANOS, State};
+    use crate::factors::Factor;
+    use crate::ledger::Ledger;
+
+    const T0: i64 = 1_000_000_000_000;
+
+    fn store(policy: &str) -> ConfigNamespaceStore {
+        ConfigNamespaceStore::from_toml(
+            format!("[balance]\npolicy=\"{policy}\"").as_bytes(),
+            None,
+            Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("fixture config: {error}"))
+    }
+
+    /// A state with one backend whose routing id is deliberately not its
+    /// address, so a label taken from the wrong field is visible.
+    fn state_with_backend(history: &Arc<crate::ScoreHistory>) -> (State, Arc<str>) {
+        let id: Arc<str> = Arc::from("cluster-a/10.0.0.1:4000");
+        let mut state = State {
+            ledger: Ledger::new(8),
+            score_history: Some(Arc::clone(history)),
+            score_incarnation: None,
+            last_score_metric: None,
+            factors: BTreeMap::new(),
+            schedules: BTreeMap::new(),
+            backends: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            ports: PortRoutes::default(),
+            next_group: 1,
+            observed: None,
+            server_version: String::new(),
+            supports_redirection: true,
+        };
+        let account = state
+            .ledger
+            .add_account()
+            .unwrap_or_else(|error| unreachable!("account: {error:?}"));
+        state.backends.insert(
+            Arc::clone(&id),
+            Backend {
+                source: MergedBackend {
+                    backend_id: Arc::clone(&id),
+                    cluster_name: Arc::from("cluster-a"),
+                    backend: BackendInfo {
+                        addr: "10.0.0.1:4000".into(),
+                        keyspace: String::new(),
+                        ip: String::new(),
+                        status_port: 0,
+                        version: String::new(),
+                        git_hash: String::new(),
+                        deploy_path: String::new(),
+                        start_timestamp: 0,
+                        labels: BTreeMap::new(),
+                    },
+                },
+                account,
+                healthy: true,
+                supports_redirection: true,
+                group: None,
+                failover_since: None,
+                routing_identity: super::RoutingIdentity::new("10.0.0.1:4000"),
+            },
+        );
+        (state, id)
+    }
+
+    fn report(id: &Arc<str>, conn: u64, cpu: u64) -> crate::FactorReport {
+        crate::FactorReport {
+            rows: vec![crate::FactorScore {
+                backend_id: Arc::clone(id),
+                score: conn,
+                parts: vec![(Factor::Connection, conn), (Factor::Cpu, cpu)],
+                routeable: true,
+                advice_to_best: Vec::new(),
+            }],
+            preferred: Vec::new(),
+            balance: None,
+        }
+    }
+
+    /// The whole publication path on a controlled clock: the first scoring
+    /// writes, a scoring inside the interval changes nothing, one past it
+    /// writes again, and a configuration change clears the family without
+    /// earning a write.
+    ///
+    /// It also pins the label. `FactorScore.backend_id` is the opaque
+    /// routing identity, and `b_status` shipped labelled with exactly that
+    /// kind of value because a fixture typed the expected label by hand.
+    /// Here the id and the address differ, so using the wrong one shows.
+    #[test]
+    fn scores_publish_on_gos_cadence_and_are_labelled_by_address() {
+        let history = Arc::new(crate::ScoreHistory::new());
+        let (mut state, id) = state_with_backend(&history);
+        let first = store("connection").current().resource_incarnation();
+
+        state.publish_scores(T0, &first, &report(&id, 3, 1));
+        let scores = history.snapshot().scores;
+        assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)], 3);
+        assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Cpu)], 1);
+        assert!(
+            !scores.keys().any(|(label, _)| label.contains('/')),
+            "the opaque routing id must never reach a metric label: {:?}",
+            scores.keys().collect::<Vec<_>>()
+        );
+
+        // Inside the interval: nothing moves.
+        state.publish_scores(T0 + 1, &first, &report(&id, 99, 99));
+        assert_eq!(
+            history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
+            3,
+            "a scoring inside the interval must not update the gauge"
+        );
+
+        // Past it: the new values land.
+        let later = T0 + SCORE_METRIC_INTERVAL_NANOS + 1;
+        state.publish_scores(later, &first, &report(&id, 5, 2));
+        assert_eq!(
+            history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
+            5
+        );
+
+        // A configuration change clears the family. It is throttled, so it
+        // writes nothing back -- Go's SetConfig resets the gauge and leaves
+        // lastMetricTime alone.
+        let changed = store("resource").current().resource_incarnation();
+        state.publish_scores(later + 1, &changed, &report(&id, 8, 8));
+        assert!(
+            history.snapshot().scores.is_empty(),
+            "a configuration change clears the whole family and does not refill it"
+        );
     }
 }

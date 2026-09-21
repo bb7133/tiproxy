@@ -79,6 +79,9 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            // Go `updateScore` writes the score gauges here: at a real
+            // scoring, behind its own per-instance 10s check.
+            state.publish_scores(now, &candidate.config.resource_incarnation(), &report);
             let diagnostic_pair = report.balance.clone();
             let prepared = (|| {
                 if let Some(pair) = report.balance {
