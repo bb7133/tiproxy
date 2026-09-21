@@ -345,13 +345,13 @@ struct HistogramState {
 struct RegistryState {
     counters: BTreeMap<MetricKey, u64>,
     histograms: BTreeMap<MetricKey, HistogramState>,
-    gauges: BTreeMap<&'static str, f64>,
+    gauges: BTreeMap<MetricKey, f64>,
     series_dropped: u64,
 }
 
 impl RegistryState {
     fn series_count(&self) -> usize {
-        self.counters.len() + self.histograms.len()
+        self.counters.len() + self.histograms.len() + self.gauges.len()
     }
 }
 
@@ -412,7 +412,19 @@ impl MetricsRegistry {
     }
 
     fn set_gauge(&self, name: &'static str, value: f64) {
-        self.lock().gauges.insert(name, value);
+        self.set_labeled_gauge(&MetricKey::new(name, Vec::new()), value);
+    }
+
+    /// Sets one label combination of a gauge family. Labeled gauges (per
+    /// backend, per migration pair) are unbounded in principle, so they share
+    /// the counter/histogram series bound rather than growing without limit.
+    fn set_labeled_gauge(&self, key: &MetricKey, value: f64) {
+        let mut state = self.lock();
+        if !state.gauges.contains_key(key) && state.series_count() >= MAX_REGISTRY_SERIES {
+            state.series_dropped = state.series_dropped.saturating_add(1);
+            return;
+        }
+        state.gauges.insert(key.clone(), value);
     }
 
     /// Number of new series shed because the registry reached its bound.
@@ -444,8 +456,14 @@ impl MetricsRegistry {
                     }
                 }
                 MetricKind::Gauge => {
-                    let value = state.gauges.get(spec.name).copied().unwrap_or(0.0);
-                    push_sample(&mut lines, spec.name, "", &[], None, value);
+                    let mut any = false;
+                    for (key, value) in state.gauges.range(family_range(spec.name)) {
+                        any = true;
+                        push_sample(&mut lines, spec.name, "", &key.labels, None, *value);
+                    }
+                    if !any && spec.labels.is_empty() {
+                        push_sample(&mut lines, spec.name, "", &[], None, 0.0);
+                    }
                 }
                 MetricKind::Histogram => {
                     let mut any = false;
@@ -1573,6 +1591,57 @@ mod tests {
         assert!(small.render_prometheus_text().contains(
             "tiproxy_backend_dial_backend_fail{backend=\"quote\\\"back\\\\slash\\nline\"} 1\n"
         ));
+    }
+
+    /// Labeled gauges share the counter/histogram bound. Per-backend and
+    /// per-migration-pair gauges are unbounded in principle, so a family that
+    /// grows without limit must shed new series instead of the registry
+    /// growing forever. Rendering of labeled gauge families is covered by the
+    /// first catalogued labeled gauge family; this pins the storage contract.
+    #[test]
+    fn labeled_gauges_are_kept_per_label_set_and_share_the_series_bound() {
+        let registry = MetricsRegistry::new();
+        let key = |backend: &str| {
+            MetricKey::new(
+                "tiproxy_server_connections",
+                vec![("backend", backend.to_owned())],
+            )
+        };
+        registry.set_labeled_gauge(&key("a"), 1.0);
+        registry.set_labeled_gauge(&key("b"), 2.0);
+        registry.set_labeled_gauge(&key("a"), 3.0);
+        {
+            let state = registry.lock();
+            assert_eq!(state.gauges.len(), 2, "one series per label set");
+            assert_eq!(state.gauges.get(&key("a")), Some(&3.0), "last write wins");
+            assert_eq!(state.gauges.get(&key("b")), Some(&2.0));
+        }
+
+        let bounded = MetricsRegistry::new();
+        for index in 0..MAX_REGISTRY_SERIES + 3 {
+            bounded.set_labeled_gauge(
+                &MetricKey::new(
+                    "tiproxy_server_connections",
+                    vec![("backend", format!("backend-{index}"))],
+                ),
+                1.0,
+            );
+        }
+        assert_eq!(bounded.series_dropped(), 3);
+        assert_eq!(bounded.lock().gauges.len(), MAX_REGISTRY_SERIES);
+        // An already-present series is still writable once the bound is hit.
+        bounded.set_labeled_gauge(
+            &MetricKey::new(
+                "tiproxy_server_connections",
+                vec![("backend", "backend-0".to_owned())],
+            ),
+            9.0,
+        );
+        assert_eq!(
+            bounded.series_dropped(),
+            3,
+            "updating an existing series is not a new one"
+        );
     }
 
     /// The deterministic observation script shared with the Go parity
