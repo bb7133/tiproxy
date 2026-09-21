@@ -25,7 +25,10 @@ async fn review_interrupted_round_publishes_accepted_prefix() -> TestResult {
     struct Recording(Mutex<Vec<crate::MigrationObservation>>);
     impl crate::MigrationSink for Recording {
         fn record(&self, event: crate::MigrationObservation) {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         }
     }
     struct Invalidating {
@@ -33,14 +36,35 @@ async fn review_interrupted_round_publishes_accepted_prefix() -> TestResult {
         commands: Mutex<Vec<crate::MigrationCommand>>,
     }
     impl crate::scheduler::MigrationCommandSink for Invalidating {
-        fn try_send(&self, command: crate::MigrationCommand) -> Result<(), crate::scheduler::RejectedCommand> {
-            self.commands.lock().unwrap_or_else(PoisonError::into_inner).push(command);
-            must(self.source.store.apply_toml(b"[balance.status]\nmigrations-per-second=999", None, 4, Path::new("/tmp")));
+        fn try_send(
+            &self,
+            command: crate::MigrationCommand,
+        ) -> Result<(), crate::scheduler::RejectedCommand> {
+            self.commands
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(command);
+            must(self.source.store.apply_toml(
+                b"[balance.status]\nmigrations-per-second=999",
+                None,
+                4,
+                Path::new("/tmp"),
+            ));
             Ok(())
         }
     }
-    let h = Harness::with_health("", "connection", &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
-        HealthCheckConfig { enabled: false, interval_nanos: 3_600_000_000_000, ..HealthCheckConfig::default() }, "").await?;
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
     let sim = simulation(&h, 16);
     let sink = Arc::new(Recording::default());
     sim.router().set_migration_sink(sink.clone());
@@ -48,17 +72,44 @@ async fn review_interrupted_round_publishes_accepted_prefix() -> TestResult {
     let _sessions: Vec<_> = (0..8).map(|_| active(&sim, &c)).collect();
     h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\n[balance.status]\nmigrations-per-second=1000", 3);
     let c = ready(&sim).await;
-    let command_sink = Invalidating { source: h.source.clone(), commands: Mutex::new(Vec::new()) };
+    let command_sink = Invalidating {
+        source: h.source.clone(),
+        commands: Mutex::new(Vec::new()),
+    };
     let (_stop_tx, stop) = watch::channel(false);
     let now = Instant::now();
-    let result = sim.router().migration_round(&c, &command_sink, true, &stop,
-        &crate::scheduler::RoundClock { fixed: Some((now, now, 1)) });
-    assert!(matches!(result, Err(RouteError::StaleCandidate)), "fixture must invalidate later offers: {result:?}");
-    assert_eq!(command_sink.commands.lock().unwrap_or_else(PoisonError::into_inner).len(), 1,
-        "one admission precedes source invalidation");
-    assert_eq!(counts(&sim, A).3, 1, "the accepted prefix was committed in the ledger");
-    assert_eq!(sink.0.lock().unwrap_or_else(PoisonError::into_inner).len(), 1,
-        "round error must publish its accepted prefix before returning");
+    let result = sim.router().migration_round(
+        &c,
+        &command_sink,
+        true,
+        &stop,
+        &crate::scheduler::RoundClock {
+            fixed: Some((now, now, 1)),
+        },
+    );
+    assert!(
+        matches!(result, Err(RouteError::StaleCandidate)),
+        "fixture must invalidate later offers: {result:?}"
+    );
+    assert_eq!(
+        command_sink
+            .commands
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1,
+        "one admission precedes source invalidation"
+    );
+    assert_eq!(
+        counts(&sim, A).3,
+        1,
+        "the accepted prefix was committed in the ledger"
+    );
+    assert_eq!(
+        sink.0.lock().unwrap_or_else(PoisonError::into_inner).len(),
+        1,
+        "round error must publish its accepted prefix before returning"
+    );
     Ok(())
 }
 
@@ -68,10 +119,18 @@ async fn review_force_close_publishes_migration_terminal() -> TestResult {
     struct Recording(Mutex<Vec<crate::MigrationObservation>>);
     impl crate::MigrationSink for Recording {
         fn record(&self, event: crate::MigrationObservation) {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         }
     }
-    let h = Harness::with_backends("", "connection", &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])]).await?;
+    let h = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
     let sim = simulation(&h, 4);
     let sink = Arc::new(Recording::default());
     sim.router().set_migration_sink(sink.clone());
@@ -80,18 +139,37 @@ async fn review_force_close_publishes_migration_terminal() -> TestResult {
     let prepared = must(sim.prepare(&session, &c, B));
     assert!(must(sim.offer(&prepared)));
     let redirect = sim.take_redirect().unwrap_or_else(|| unreachable!());
-    assert_eq!(sink.0.lock().unwrap_or_else(PoisonError::into_inner).len(), 1);
-    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=0", 3);
+    assert_eq!(
+        sink.0.lock().unwrap_or_else(PoisonError::into_inner).len(),
+        1
+    );
+    h.patch(
+        "[proxy]\nfail-backend-list=[\"127.0.0.1:4000\"]\nfailover-timeout=0",
+        3,
+    );
     let c = ready(&sim).await;
     let now = Instant::now();
     must(sim.router().refresh_failover(&c, now));
     let (_stop_tx, stop) = watch::channel(false);
     must(sim.round_at(&c, false, &stop, now, now, 1));
-    let Some(crate::MigrationCommand::ForceClose(close)) = sim.take_command() else { unreachable!("fixture admits force-close") };
+    let Some(crate::MigrationCommand::ForceClose(close)) = sim.take_command() else {
+        unreachable!("fixture admits force-close")
+    };
     assert_eq!(sim.observe_close(&close), Settlement::Applied);
-    let observed = sink.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    assert_eq!(observed.len(), 2, "ForceClose must publish the failed migration without another callback");
-    assert!(matches!(observed[1].outcome, crate::MigrationOutcome::Settled { success: false, .. }));
+    let observed = sink
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        observed.len(),
+        2,
+        "ForceClose must publish the failed migration without another callback"
+    );
+    assert!(matches!(
+        observed[1].outcome,
+        crate::MigrationOutcome::Settled { success: false, .. }
+    ));
     assert_eq!(sim.finish(&redirect, true), Settlement::Ignored);
     Ok(())
 }
@@ -102,10 +180,18 @@ async fn review_automatic_round_publishes_before_terminal() -> TestResult {
     struct Recording(Mutex<Vec<crate::MigrationObservation>>);
     impl crate::MigrationSink for Recording {
         fn record(&self, event: crate::MigrationObservation) {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         }
     }
-    let h = Harness::with_backends("", "connection", &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])]).await?;
+    let h = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
     let sim = simulation(&h, 16);
     let sink = Arc::new(Recording::default());
     sim.router().set_migration_sink(sink.clone());
@@ -114,10 +200,23 @@ async fn review_automatic_round_publishes_before_terminal() -> TestResult {
     let (_stop_tx, stop) = watch::channel(false);
     let now = Instant::now();
     must(sim.round_at(&c, true, &stop, now, now, 1));
-    assert!(matches!(sim.take_command(), Some(crate::MigrationCommand::Redirect(_))), "fixture must admit a migration");
+    assert!(
+        matches!(
+            sim.take_command(),
+            Some(crate::MigrationCommand::Redirect(_))
+        ),
+        "fixture must admit a migration"
+    );
     let events = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
-    assert!(!events.is_empty(), "automatic round must publish admission before any terminal");
-    assert!(events.iter().all(|e| matches!(e.outcome, crate::MigrationOutcome::Issued)));
+    assert!(
+        !events.is_empty(),
+        "automatic round must publish admission before any terminal"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e.outcome, crate::MigrationOutcome::Issued))
+    );
     Ok(())
 }
 fn simulation(h: &Harness, capacity: usize) -> MigrationSimulation {

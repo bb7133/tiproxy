@@ -357,6 +357,43 @@ struct Account {
     physical: Vec<u64>,
 }
 
+/// One migration label set, exactly Go's `(from, to, reason)`.
+///
+/// Held as owned strings because the backend addresses are captured when the
+/// redirect is issued and must survive the routing state that produced them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MigrationLabels {
+    /// Source backend address.
+    pub from: String,
+    /// Destination backend address.
+    pub to: String,
+    /// Reason frozen at issue.
+    pub reason: RedirectReason,
+}
+
+/// The authoritative per-label-set migration state this ledger owns.
+///
+/// This is the truth the exposition reads, rather than a running total
+/// accumulated from notifications: a lost notification leaves the reader
+/// briefly stale, never permanently wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MigrationTotals {
+    /// Migrations accepted and not yet settled.
+    pub pending: u64,
+    /// Settled successfully, cumulative.
+    pub succeeded: u64,
+    /// Settled unsuccessfully, cumulative.
+    pub failed: u64,
+    /// Summed settlement latency in nanoseconds, cumulative.
+    pub elapsed_nanos: u128,
+}
+
+/// Ceiling on distinct migration label sets one ledger retains.
+///
+/// This bounds THIS map, not some other one: the defect being avoided here is
+/// a capacity check that consulted a different table than the one it limited.
+pub(crate) const MAX_MIGRATION_LABEL_SETS: usize = 4096;
+
 pub(crate) struct Ledger {
     identity: Arc<()>,
     next_session: u64,
@@ -370,6 +407,12 @@ pub(crate) struct Ledger {
     /// Settled migrations awaiting publication. The ledger records; it never
     /// touches a metric registry itself.
     migrations: Vec<MigrationObservation>,
+    /// Authoritative migration state per label set, retained after a label set
+    /// returns to zero so the exposition keeps reporting the series, exactly
+    /// as Go keeps a child registered once it has been created.
+    migration_totals: BTreeMap<MigrationLabels, MigrationTotals>,
+    /// Label sets refused because the retained map was full.
+    migration_labels_dropped: u64,
 }
 
 impl Ledger {
@@ -385,7 +428,54 @@ impl Ledger {
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
             migrations: Vec::new(),
+            migration_totals: BTreeMap::new(),
+            migration_labels_dropped: 0,
         }
+    }
+
+    /// The authoritative migration state, for a reader that holds this
+    /// ledger's lock. Retained label sets with `pending == 0` are included:
+    /// dropping them would hide a completed migration from the next scrape.
+    pub(crate) fn migration_totals(&self) -> &BTreeMap<MigrationLabels, MigrationTotals> {
+        &self.migration_totals
+    }
+
+    /// Label sets refused because this ledger's retained map was full.
+    pub(crate) const fn migration_labels_dropped(&self) -> u64 {
+        self.migration_labels_dropped
+    }
+
+    /// Records a settlement in the authoritative state: the pending count
+    /// falls, and the matching cumulative total rises. `pending` saturates at
+    /// zero so an unmatched settlement cannot underflow, and the label set is
+    /// retained afterwards so the series keeps reporting.
+    fn settle_migration(&mut self, labels: MigrationLabels, success: bool, elapsed: Duration) {
+        self.record_migration(labels, |totals| {
+            totals.pending = totals.pending.saturating_sub(1);
+            if success {
+                totals.succeeded = totals.succeeded.saturating_add(1);
+            } else {
+                totals.failed = totals.failed.saturating_add(1);
+            }
+            totals.elapsed_nanos = totals.elapsed_nanos.saturating_add(elapsed.as_nanos());
+        });
+    }
+
+    /// Applies one migration event to the authoritative state. A new label set
+    /// is refused once the retained map is full, so a hostile or pathological
+    /// label cardinality cannot grow this map without bound.
+    fn record_migration(
+        &mut self,
+        labels: MigrationLabels,
+        apply: impl FnOnce(&mut MigrationTotals),
+    ) {
+        if !self.migration_totals.contains_key(&labels)
+            && self.migration_totals.len() >= MAX_MIGRATION_LABEL_SETS
+        {
+            self.migration_labels_dropped = self.migration_labels_dropped.saturating_add(1);
+            return;
+        }
+        apply(self.migration_totals.entry(labels).or_default());
     }
 
     /// Takes the migrations settled since the last drain.
@@ -737,17 +827,29 @@ impl Ledger {
                 .counts
                 .incoming += 1;
         }
+        if admitted {
+            // Go increments the pending gauge only once the offer is accepted.
+            // Recorded before the session borrow so the authoritative update
+            // and the notification stay together in one place.
+            let labels = MigrationLabels {
+                from: redirect.from.backend_address.clone(),
+                to: redirect.to.backend_address.clone(),
+                reason: redirect.reason,
+            };
+            self.record_migration(labels.clone(), |totals| {
+                totals.pending = totals.pending.saturating_add(1);
+            });
+            self.migrations.push(MigrationObservation {
+                from: labels.from,
+                to: labels.to,
+                reason: labels.reason,
+                outcome: MigrationOutcome::Issued,
+            });
+        }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("prepared active session")
         };
         if admitted {
-            // Go increments the pending gauge only once the offer is accepted.
-            self.migrations.push(MigrationObservation {
-                from: redirect.from.backend_address.clone(),
-                to: redirect.to.backend_address.clone(),
-                reason: redirect.reason,
-                outcome: MigrationOutcome::Issued,
-            });
             active.redirect = Some(redirect);
         } else {
             active.failed_at = Some(now);
@@ -801,16 +903,20 @@ impl Ledger {
             // Go's cooldown starts at issuance, not when the failure arrives.
             active.failed_at = Some(redirect.issued_at);
         }
-        self.migrations.push(MigrationObservation {
+        // Saturating: a settlement can never predate its own issuance, and a
+        // non-monotonic reading must not panic a routing settlement.
+        let elapsed = now.saturating_duration_since(redirect.issued_at);
+        let labels = MigrationLabels {
             from: redirect.from.backend_address.clone(),
             to: redirect.to.backend_address.clone(),
             reason: redirect.reason,
-            outcome: MigrationOutcome::Settled {
-                success,
-                // Saturating: a settlement can never predate its own issuance,
-                // and a non-monotonic reading must not panic a settlement.
-                elapsed: now.saturating_duration_since(redirect.issued_at),
-            },
+        };
+        self.settle_migration(labels.clone(), success, elapsed);
+        self.migrations.push(MigrationObservation {
+            from: labels.from,
+            to: labels.to,
+            reason: labels.reason,
+            outcome: MigrationOutcome::Settled { success, elapsed },
         });
         Settlement::Applied
     }
@@ -957,13 +1063,20 @@ impl Ledger {
                     // one, with its elapsed time. Releasing the accounting
                     // without recording it would leave `pending_migrate`
                     // permanently holding a migration that can never settle.
-                    self.migrations.push(MigrationObservation {
+                    let elapsed = now.saturating_duration_since(redirect.issued_at);
+                    let labels = MigrationLabels {
                         from: redirect.from.backend_address.clone(),
                         to: redirect.to.backend_address.clone(),
                         reason: redirect.reason,
+                    };
+                    self.settle_migration(labels.clone(), false, elapsed);
+                    self.migrations.push(MigrationObservation {
+                        from: labels.from,
+                        to: labels.to,
+                        reason: labels.reason,
                         outcome: MigrationOutcome::Settled {
                             success: false,
-                            elapsed: now.saturating_duration_since(redirect.issued_at),
+                            elapsed,
                         },
                     });
                 }

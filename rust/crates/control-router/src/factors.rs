@@ -28,7 +28,7 @@ mod resource;
 pub(crate) mod window;
 
 /// One Go factor, in score-composition order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Factor {
     /// Strict business-label isolation.
     Label,
@@ -80,7 +80,7 @@ impl Factor {
 /// issue time and reads it back when the migration settles, because by then the
 /// scores that triggered it have moved on. The value is therefore captured
 /// here, never recomputed at settlement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RedirectReason {
     /// The first actionable factor in policy priority order.
     Balance(Factor),

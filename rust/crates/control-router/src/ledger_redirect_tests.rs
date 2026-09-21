@@ -25,10 +25,20 @@ fn review_close_settles_accepted_migration_once() {
     ledger.admit_redirect(op.clone(), true, now);
     assert_eq!(ledger.drain_migrations().len(), 1);
     assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
-    assert_eq!(ledger.finish_redirect(&op, true, Instant::now()), Settlement::Ignored);
+    assert_eq!(
+        ledger.finish_redirect(&op, true, Instant::now()),
+        Settlement::Ignored
+    );
     let events = ledger.drain_migrations();
-    assert_eq!(events.len(), 1, "accepted migration closed early must emit a terminal");
-    assert!(matches!(events[0].outcome, MigrationOutcome::Settled { success: false, .. }));
+    assert_eq!(
+        events.len(),
+        1,
+        "accepted migration closed early must emit a terminal"
+    );
+    assert!(matches!(
+        events[0].outcome,
+        MigrationOutcome::Settled { success: false, .. }
+    ));
 }
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
@@ -620,4 +630,103 @@ fn worker_close_tokens_reject_foreign_sequence_and_exhaustion() {
         "WORKER_CLOSE_EXHAUSTED"
     );
     assert_eq!(counts(&ledger, &owner), (1, 1, 0, 0, 0));
+}
+
+/// The authoritative state must not depend on anyone consuming the
+/// notifications. Every observation is drained and thrown away here, exactly
+/// as a full queue would drop it, and the totals still describe reality.
+#[test]
+fn migration_totals_survive_every_notification_being_dropped() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let issued = Instant::now();
+
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        issued,
+        RedirectReason::Balance(Factor::Cpu),
+    ));
+    ledger.admit_redirect(op.clone(), true, issued);
+    drop(ledger.drain_migrations()); // the issue notification is lost
+
+    let labels = MigrationLabels {
+        from: "10.0.0.1:4000".to_owned(),
+        to: "10.0.0.2:4000".to_owned(),
+        reason: RedirectReason::Balance(Factor::Cpu),
+    };
+    assert_eq!(
+        ledger.migration_totals().get(&labels).map(|t| t.pending),
+        Some(1),
+        "state is authoritative even though nothing consumed the event"
+    );
+
+    assert_eq!(
+        ledger.finish_redirect(&op, true, issued + Duration::from_millis(80)),
+        Settlement::Applied
+    );
+    drop(ledger.drain_migrations()); // the settlement notification is lost too
+
+    let totals = *ledger
+        .migration_totals()
+        .get(&labels)
+        .unwrap_or_else(|| unreachable!("label set retained"));
+    // This is the case that permanently corrupted the delta-based gauge: the
+    // terminal is gone and no future event will arrive, yet a reader still
+    // sees a finished migration.
+    assert_eq!(totals.pending, 0);
+    assert_eq!(totals.succeeded, 1);
+    assert_eq!(totals.failed, 0);
+    assert_eq!(totals.elapsed_nanos, Duration::from_millis(80).as_nanos());
+}
+
+/// A label set that has returned to zero stays retained, because Go keeps a
+/// child registered once created and a scrape has to keep seeing the zero.
+#[test]
+fn a_settled_label_set_is_retained_at_zero() {
+    let mut ledger = Ledger::new(8);
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let now = Instant::now();
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        now,
+        RedirectReason::Test,
+    ));
+    ledger.admit_redirect(op.clone(), true, now);
+    assert_eq!(ledger.finish_redirect(&op, false, now), Settlement::Applied);
+    assert_eq!(
+        ledger.migration_totals().len(),
+        1,
+        "the series must not vanish when it returns to zero"
+    );
+}
+
+/// The retained map is bounded against itself, which is the defect that made
+/// the previous bound useless: it consulted a different table.
+#[test]
+fn retained_migration_label_sets_are_bounded() {
+    let mut ledger = Ledger::new(4);
+    for index in 0..(MAX_MIGRATION_LABEL_SETS + 16) {
+        ledger.record_migration(
+            MigrationLabels {
+                from: format!("10.0.0.1:{index}"),
+                to: "10.0.0.2:4000".to_owned(),
+                reason: RedirectReason::Test,
+            },
+            |totals| totals.pending = totals.pending.saturating_add(1),
+        );
+    }
+    assert_eq!(ledger.migration_totals().len(), MAX_MIGRATION_LABEL_SETS);
+    assert_eq!(ledger.migration_labels_dropped(), 16);
 }
