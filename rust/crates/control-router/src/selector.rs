@@ -71,11 +71,17 @@ struct State {
     score_history: Option<Arc<crate::ScoreHistory>>,
     /// The configuration generation the retained scores were written under.
     ///
-    /// Go clears the whole family in `SetConfig`, so a change here wipes
-    /// every namespace's scores, not just this router's -- the gauge is
-    /// package-level in Go too, and each `FactorBasedBalance.SetConfig`
-    /// resets all of it.
-    score_incarnation: Option<control_config::ResourceIncarnation>,
+    /// Deliberately the accepted generation and **not**
+    /// `ResourceIncarnation`: that identity is documented to survive
+    /// Resource/Location switches, while Go's `setFactors` calls
+    /// `BackendScoreGauge.Reset()` unconditionally at the end of every
+    /// `SetConfig`, whether or not the policy changed. Keying the reset on
+    /// the incarnation would miss exactly the switches it survives.
+    ///
+    /// A change wipes every namespace's scores, not just this router's --
+    /// Go's gauge is package-level too, and each balance instance's
+    /// `SetConfig` resets all of it.
+    score_generation: Option<u64>,
     /// Go `FactorBasedBalance.lastMetricTime`, in the same wall nanoseconds
     /// the scoring uses.
     ///
@@ -96,28 +102,20 @@ impl State {
     /// stops scoring simply stops updating -- its last values stay exposed
     /// for as long as that takes, which is Go's behaviour and the reason the
     /// family cannot be described as bounded-staleness.
-    fn publish_scores(
-        &mut self,
-        now: i64,
-        incarnation: &control_config::ResourceIncarnation,
-        report: &crate::FactorReport,
-    ) {
+    fn publish_scores(&mut self, now: i64, generation: u64, report: &crate::FactorReport) {
         let Some(history) = self.score_history.clone() else {
             return;
         };
-        let changed = self
-            .score_incarnation
-            .as_ref()
-            .is_none_or(|applied| !applied.same_as(incarnation));
+        let changed = self.score_generation != Some(generation);
         // First application is adoption, not a change: Go has no reset to
         // perform before its first `SetConfig`.
         let decision = score_write_decision(
             self.last_score_metric,
             now,
-            changed && self.score_incarnation.is_some(),
+            changed && self.score_generation.is_some(),
         );
         if changed {
-            self.score_incarnation = Some(incarnation.clone());
+            self.score_generation = Some(generation);
         }
         if decision.reset {
             history.reset();
@@ -360,7 +358,7 @@ impl Router {
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
                 score_history: None,
-                score_incarnation: None,
+                score_generation: None,
                 last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
@@ -403,7 +401,7 @@ impl Router {
             state: Mutex::new(State {
                 ledger: Ledger::with_history(max_sessions, shared.history),
                 score_history: Some(shared.scores),
-                score_incarnation: None,
+                score_generation: None,
                 last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
@@ -725,6 +723,12 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            // Routing scores too. Go reaches `updateScore` from both
+            // `BackendToRoute` and `BackendsToBalance`, so both write the
+            // gauges behind the one shared throttle; publishing only from
+            // the balance path would leave a proxy that routes without
+            // rebalancing reporting nothing.
+            state.publish_scores(now, candidate.config.generation(), &report);
             self.sources.validate(candidate)?;
             // Scoring happens even when every scored backend is rejected by
             // a factor. Persist only after the source and metric fences hold.
@@ -827,6 +831,9 @@ impl Router {
                     &inputs,
                     &candidate.config.resource_incarnation(),
                 );
+                // Deliberately not published: `factor_report` is a
+                // diagnostic read with no Go counterpart, and letting it
+                // write would let an observer move a gauge by looking.
                 let report = factors
                     .core
                     .evaluate(&inputs, &candidate.policy, &queries, now);
@@ -1735,6 +1742,25 @@ mod score_publication_tests {
         .unwrap_or_else(|error| unreachable!("fixture config: {error}"))
     }
 
+    /// Applies a new configuration to the *same* store, as production does.
+    ///
+    /// Two independently constructed stores differ by construction, so a
+    /// test built from those would pass whatever signal the reset keyed on.
+    /// A real apply is the only thing that distinguishes the accepted
+    /// generation from `ResourceIncarnation`, which is documented to
+    /// survive a Resource/Location switch.
+    fn apply(store: &ConfigNamespaceStore, policy: &str, revision: u64) -> u64 {
+        store
+            .apply_toml(
+                format!("[balance]\npolicy=\"{policy}\"").as_bytes(),
+                None,
+                revision,
+                Path::new("/tmp"),
+            )
+            .unwrap_or_else(|error| unreachable!("apply config: {error}"));
+        store.current().generation()
+    }
+
     /// A state with one backend whose routing id is deliberately not its
     /// address, so a label taken from the wrong field is visible.
     fn state_with_backend(history: &Arc<crate::ScoreHistory>) -> (State, Arc<str>) {
@@ -1742,7 +1768,7 @@ mod score_publication_tests {
         let mut state = State {
             ledger: Ledger::new(8),
             score_history: Some(Arc::clone(history)),
-            score_incarnation: None,
+            score_generation: None,
             last_score_metric: None,
             factors: BTreeMap::new(),
             schedules: BTreeMap::new(),
@@ -1814,9 +1840,11 @@ mod score_publication_tests {
     fn scores_publish_on_gos_cadence_and_are_labelled_by_address() {
         let history = Arc::new(crate::ScoreHistory::new());
         let (mut state, id) = state_with_backend(&history);
-        let first = store("connection").current().resource_incarnation();
+        let config = store("resource");
+        let first = config.current().generation();
+        let first_incarnation = config.current().resource_incarnation();
 
-        state.publish_scores(T0, &first, &report(&id, 3, 1));
+        state.publish_scores(T0, first, &report(&id, 3, 1));
         let scores = history.snapshot().scores;
         assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)], 3);
         assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Cpu)], 1);
@@ -1827,7 +1855,7 @@ mod score_publication_tests {
         );
 
         // Inside the interval: nothing moves.
-        state.publish_scores(T0 + 1, &first, &report(&id, 99, 99));
+        state.publish_scores(T0 + 1, first, &report(&id, 99, 99));
         assert_eq!(
             history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
             3,
@@ -1836,17 +1864,30 @@ mod score_publication_tests {
 
         // Past it: the new values land.
         let later = T0 + SCORE_METRIC_INTERVAL_NANOS + 1;
-        state.publish_scores(later, &first, &report(&id, 5, 2));
+        state.publish_scores(later, first, &report(&id, 5, 2));
         assert_eq!(
             history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
             5
         );
 
-        // A configuration change clears the family. It is throttled, so it
-        // writes nothing back -- Go's SetConfig resets the gauge and leaves
+        // A real apply on the same store, switching Resource to Location --
+        // precisely the transition `ResourceIncarnation` is documented to
+        // survive, so a reset keyed on that identity would not fire here.
+        let changed = apply(&config, "location", 2);
+        assert_ne!(changed, first, "the accepted generation advances");
+        assert!(
+            config
+                .current()
+                .resource_incarnation()
+                .same_as(&first_incarnation),
+            "the fixture must exercise a switch the incarnation survives, \
+             otherwise it cannot tell the two signals apart"
+        );
+
+        // The change clears the family. It is throttled, so it writes
+        // nothing back -- Go's SetConfig resets the gauge and leaves
         // lastMetricTime alone.
-        let changed = store("resource").current().resource_incarnation();
-        state.publish_scores(later + 1, &changed, &report(&id, 8, 8));
+        state.publish_scores(later + 1, changed, &report(&id, 8, 8));
         assert!(
             history.snapshot().scores.is_empty(),
             "a configuration change clears the whole family and does not refill it"

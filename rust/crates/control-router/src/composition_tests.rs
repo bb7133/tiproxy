@@ -50,7 +50,7 @@ fn shared_go_composition_observation() {
         let mut state = State {
             ledger: Ledger::new(100),
             score_history: None,
-            score_incarnation: None,
+            score_generation: None,
             last_score_metric: None,
             factors: BTreeMap::new(),
             schedules: BTreeMap::new(),

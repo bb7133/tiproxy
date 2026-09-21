@@ -15,6 +15,7 @@
 //! Stateful, process-local routing and exact reservation accounting.
 
 mod authority;
+mod backend_metric_history;
 mod factors;
 mod ledger;
 mod migration_history;
@@ -62,6 +63,7 @@ impl RedirectAllSummary {
         self.accepted += other.accepted;
     }
 }
+pub use backend_metric_history::{BackendMetric, BackendMetricHistory, BackendMetricSnapshot};
 pub use ledger::{MigrationLabels, MigrationObservation, MigrationOutcome, MigrationTotals};
 pub use migration_history::{
     DurationKey, DurationSeries, MAX_RETAINED_LABEL_SETS, MIGRATE_DURATION_BUCKETS,
