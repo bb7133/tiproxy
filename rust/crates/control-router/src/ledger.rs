@@ -933,10 +933,10 @@ impl Ledger {
         {
             return Settlement::Ignored;
         }
-        self.close(&close.session)
+        self.close(&close.session, Instant::now())
     }
 
-    pub(crate) fn close(&mut self, session: &Session) -> Settlement {
+    pub(crate) fn close(&mut self, session: &Session, now: Instant) -> Settlement {
         if self.stage(session).is_err() {
             return Settlement::Ignored;
         }
@@ -953,6 +953,19 @@ impl Ledger {
             Stage::Active(active) => {
                 if let Some(redirect) = active.redirect {
                     self.release_redirect(&redirect);
+                    // Go counts a migration interrupted by a close as a failed
+                    // one, with its elapsed time. Releasing the accounting
+                    // without recording it would leave `pending_migrate`
+                    // permanently holding a migration that can never settle.
+                    self.migrations.push(MigrationObservation {
+                        from: redirect.from.backend_address.clone(),
+                        to: redirect.to.backend_address.clone(),
+                        reason: redirect.reason,
+                        outcome: MigrationOutcome::Settled {
+                            success: false,
+                            elapsed: now.saturating_duration_since(redirect.issued_at),
+                        },
+                    });
                 }
                 if let Some(account) = self.accounts.get_mut(&active.account.sequence) {
                     account.counts.active -= 1;
@@ -1013,7 +1026,7 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(evidence.unsettled_redirects, 1);
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert_eq!(
             ledger.evidence(),
             RouteLedgerEvidence {
@@ -1145,8 +1158,8 @@ mod tests {
                 ..Accounting::default()
             })
         );
-        assert_eq!(ledger.close(&session), Settlement::Applied);
-        assert_eq!(ledger.close(&session), Settlement::Ignored);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Ignored);
         assert_eq!(ledger.finish(&first, true), Settlement::Ignored);
         assert_eq!(ledger.counts(&account), Some(Accounting::default()));
         assert!(matches!(
@@ -1176,7 +1189,7 @@ mod tests {
             })
         );
         assert_eq!(ledger.finish(&second, true), Settlement::Applied);
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert_eq!(ledger.counts(&new), Some(Accounting::default()));
     }
 
@@ -1187,13 +1200,13 @@ mod tests {
         let session = must(ledger.open());
         let first = must(ledger.reserve(&session, &old, assignment("a")));
         assert!(!ledger.prune(&old));
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert!(ledger.prune(&old));
         let new = must(ledger.add_account());
         let replacement = must(ledger.open());
         let next = must(ledger.reserve(&replacement, &new, assignment("a")));
         assert_eq!(ledger.finish(&first, true), Settlement::Ignored);
-        assert_eq!(ledger.close(&session), Settlement::Ignored);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Ignored);
         assert_eq!(
             ledger.counts(&new),
             Some(Accounting {
@@ -1216,7 +1229,10 @@ mod tests {
         let reservation = must(left.reserve(&session_left, &account_left, assignment("a")));
         let _ = must(right.reserve(&session_right, &account_right, assignment("a")));
         assert_eq!(right.finish(&reservation, true), Settlement::Ignored);
-        assert_eq!(right.close(&session_left), Settlement::Ignored);
+        assert_eq!(
+            right.close(&session_left, Instant::now()),
+            Settlement::Ignored
+        );
         assert!(right.counts(&account_left).is_none());
         assert!(!right.prune(&account_left));
         assert_eq!(
@@ -1242,7 +1258,7 @@ mod tests {
         ));
         assert_eq!(ledger.counts(&account), Some(Accounting::default()));
         assert!(must(ledger.pending(&session)).is_none());
-        ledger.close(&session);
+        ledger.close(&session, Instant::now());
         assert!(ledger.sessions.is_empty());
         ledger.next_session = u64::MAX;
         assert!(matches!(ledger.open(), Err(LedgerError::Exhausted)));
@@ -1265,7 +1281,7 @@ mod tests {
             ledger.counts(&account).map(Accounting::connection_score),
             Some(2)
         );
-        ledger.close(&first);
+        ledger.close(&first, Instant::now());
         assert_eq!(
             ledger.counts(&account),
             Some(Accounting {
@@ -1324,7 +1340,10 @@ mod tests {
                     );
                 }
                 "close" => {
-                    ledger.close(session.as_ref().unwrap_or_else(|| unreachable!()));
+                    ledger.close(
+                        session.as_ref().unwrap_or_else(|| unreachable!()),
+                        Instant::now(),
+                    );
                 }
                 "old_commit" | "old_fail" => {
                     ledger.finish(

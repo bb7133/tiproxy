@@ -220,7 +220,7 @@ fn redirect_transfers_score_then_physical_and_failure_returns_only_score() {
             )
             .is_ok()
     );
-    assert_eq!(ledger.close(&s), Settlement::Applied);
+    assert_eq!(ledger.close(&s, Instant::now()), Settlement::Applied);
     assert_eq!(counts(&ledger, &b), (0, 0, 0, 0, 0));
 }
 
@@ -265,7 +265,7 @@ fn redirect_close_and_retired_equal_name_owners_ignore_all_late_and_foreign_resu
     let now = Instant::now();
     let op = must(redirect(&ledger, &s, &b, assignment("same-name"), now));
     ledger.admit_redirect(op.clone(), true, now);
-    assert_eq!(ledger.close(&s), Settlement::Applied);
+    assert_eq!(ledger.close(&s, Instant::now()), Settlement::Applied);
     assert!(ledger.prune(&a));
     assert!(ledger.prune(&b));
     let replacement = must(ledger.add_account());
@@ -276,7 +276,7 @@ fn redirect_close_and_retired_equal_name_owners_ignore_all_late_and_foreign_resu
             Settlement::Ignored
         );
     }
-    assert_eq!(ledger.close(&s), Settlement::Ignored);
+    assert_eq!(ledger.close(&s, Instant::now()), Settlement::Ignored);
     assert_eq!(counts(&ledger, &replacement), (1, 1, 0, 0, 0));
     let mut foreign = Ledger::new(4);
     let fa = must(foreign.add_account());
@@ -486,7 +486,7 @@ fn shared_go_redirect_observation() {
                 );
             }
             "close" => {
-                ledger.close(&session);
+                ledger.close(&session, Instant::now());
             }
             "remove_source" => {
                 assert!(!ledger.prune(&op.as_ref().unwrap_or_else(|| unreachable!()).source));
@@ -547,7 +547,7 @@ fn redirect_old_same_pair_terminal_cannot_settle_new_operation() {
         ledger.finish_redirect(&current, true, now),
         Settlement::Applied
     );
-    assert_eq!(ledger.close(&s), Settlement::Applied);
+    assert_eq!(ledger.close(&s, Instant::now()), Settlement::Applied);
     assert_eq!(counts(&ledger, &a), (0, 0, 0, 0, 0));
     assert_eq!(counts(&ledger, &b), (0, 0, 0, 0, 0));
 }

@@ -202,7 +202,15 @@ impl Router {
                         )?;
                     }
                 }
-                self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected)
+                let closed =
+                    self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected);
+                // The scheduler reaches the ledger through `offer_redirect_locked`
+                // and `close_timed_out`, both of which bypass the public router
+                // entry points that publish. Without this the automatic path's
+                // acceptances would sit buffered until some unrelated call
+                // happened to drain them, arriving after their own settlement.
+                self.publish_migrations(state.ledger.drain_migrations());
+                closed
             })()
         };
         // Rejected envelopes were disarmed while the router still serialized

@@ -34,7 +34,9 @@ done
 
 # Anything still listening or still alive after owned cleanup is the direct
 # evidence for a teardown failure, and is gone by the time CI is inspected.
+# A command line can carry an authentication value, so this goes through the
+# same redaction as every other collected file rather than straight to disk.
 {
 	echo "# processes matching this run's tag, after cleanup"
 	ps -eo pid,ppid,stat,etime,command 2>/dev/null | grep -F -- "$(basename "$run_dir")" | grep -v grep || echo "(none)"
-} >"$teardown_dir/survivors.txt" 2>&1
+} 2>&1 | awk -f "$script_dir/redact.awk" >"$teardown_dir/survivors.txt"

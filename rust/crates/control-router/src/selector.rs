@@ -889,7 +889,7 @@ impl Router {
     /// Closing twice or closing a foreign session has no effect.
     pub fn close(&self, session: &Session) -> Settlement {
         let mut state = self.lock();
-        let settlement = state.ledger.close(session);
+        let settlement = state.ledger.close(session, Instant::now());
         self.publish_migrations(state.ledger.drain_migrations());
         settlement
     }

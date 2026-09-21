@@ -80,7 +80,7 @@ fn shared_go_physical_arrival_order() {
                 );
             }
             "close" => {
-                assert_eq!(ledger.close(&sessions[&id]), Settlement::Applied);
+                assert_eq!(ledger.close(&sessions[&id], now), Settlement::Applied);
             }
             _ => unreachable!("arrival action"),
         }
