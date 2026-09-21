@@ -23,6 +23,7 @@ mod plane;
 mod policy;
 mod retry;
 mod scheduler;
+mod score_history;
 mod selector;
 mod simulation;
 
@@ -67,6 +68,7 @@ pub use migration_history::{
     MigrationHistory, MigrationHistorySnapshot, TerminalKey,
 };
 pub use retry::Selector;
+pub use score_history::{SCORE_METRIC_INTERVAL, ScoreHistory, ScoreSnapshot};
 pub use selector::{MigrationSink, Router};
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
