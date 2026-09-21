@@ -150,9 +150,12 @@ func newRustMetricsStore() *rustMetricsStore {
 
 var rustMetrics = newRustMetricsStore()
 
-// RustMetricNames lists every metric family the Rust dataplane may publish, in
-// no particular order. The native Rust exposition parity gate uses it to select
-// the families it compares against the Go promhttp output.
+// RustMetricNames lists the metric families carried by the retired
+// MetricsBatch wire contract, in no particular order, and exists for that
+// contract's validation. It is NOT the set of families the Rust process
+// serves natively: since CP-ADMIN slice 5c Rust owns the exposition and also
+// serves families that never crossed the wire. The native exposition parity
+// gate selects families from tests/dataplane/metrics/native-families.json.
 func RustMetricNames() []string {
 	names := make([]string, 0, len(rustMetricSpecs))
 	for name := range rustMetricSpecs {

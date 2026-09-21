@@ -40,6 +40,12 @@ tiproxy_backend_get_backend_duration_seconds_count 2
 # TYPE tiproxy_backend_keepalive_update_total counter
 tiproxy_backend_keepalive_update_total{backend="10.0.0.1:4000",health="unhealthy",result="succeed"} 1
 tiproxy_backend_keepalive_update_total{backend="10.0.0.2:4000",health="healthy",result="fail"} 1
+# HELP tiproxy_monitor_keep_alive_total Counter of proxy keep alive.
+# TYPE tiproxy_monitor_keep_alive_total counter
+tiproxy_monitor_keep_alive_total 3
+# HELP tiproxy_monitor_time_jump_back_total Counter of system time jumps backward.
+# TYPE tiproxy_monitor_time_jump_back_total counter
+tiproxy_monitor_time_jump_back_total 2
 # HELP tiproxy_server_connections Number of connections.
 # TYPE tiproxy_server_connections gauge
 tiproxy_server_connections 1

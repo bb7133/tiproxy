@@ -142,6 +142,10 @@
       "reason": "Payload-free lifecycle log fields depend on connection, listener, namespace, backend, and quit context unavailable in a byte trace."
     },
     {
+      "parity_id": "MTR-006",
+      "reason": "Process-level observations with no client wire traffic: the two monitor families come from a wall-clock sampling loop, and the rest read health, election and balancer state. An immutable MySQL byte trace cannot produce or observe them. Verification is the clock-driven monitor unit test, the Go promhttp oracle over native-families.json, and the startup-rollback test that the monitor is stopped and joined; ten of the twelve families are not implemented yet."
+    },
+    {
       "parity_id": "PKT-006",
       "reason": "Buffer sizing, pooling, direct writes, counters, flush behavior, and post-TLS bounds require concrete I/O implementations."
     },

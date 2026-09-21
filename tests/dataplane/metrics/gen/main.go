@@ -1,27 +1,32 @@
 // Copyright 2026 PingCAP, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Command gen renders the Go promhttp text exposition for a recorded sequence
-// of Rust MetricsBatch deltas. It is the oracle for the Rust native
-// exposition parity gate (tests/dataplane/metrics/parity-expected.txt): the
-// same batches the Rust exporter would ship over the bridge are applied to the
-// Go metrics store, and the families owned by the Rust catalog are printed in
-// the exact bytes Prometheus would scrape from the Go API server.
+// Command gen renders the Go promhttp text exposition that the Rust native
+// exposition must match (tests/dataplane/metrics/parity-expected.txt).
+//
+// Families that used to cross the control bridge are driven by the recorded
+// MetricsBatch deltas. Families Rust serves natively without ever having
+// crossed it are driven by explicit fixed observations written straight to
+// the Go collectors, because faking them as a batch would assert a wire
+// contract that slice 5c retired.
+//
+// The printed set is tests/dataplane/metrics/native-families.json, not the
+// wire catalogue: since slice 5c, Rust owns the exposition and serves
+// families the bridge never carried. Registration happens without starting
+// the system time monitor, whose real wall clock would otherwise make the
+// fixture depend on how long generation took.
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"sort"
 
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
-	"go.uber.org/zap"
 )
 
 type recordedMetric struct {
@@ -39,14 +44,15 @@ type recordedBatch struct {
 
 func main() {
 	input := flag.String("batches", "tests/dataplane/metrics/parity-batches.json", "recorded Rust metrics batches")
+	native := flag.String("native-families", "tests/dataplane/metrics/native-families.json", "families Rust serves natively")
 	flag.Parse()
-	if err := run(*input); err != nil {
+	if err := run(*input, *native); err != nil {
 		fmt.Fprintln(os.Stderr, "metrics parity generator:", err)
 		os.Exit(1)
 	}
 }
 
-func run(input string) error {
+func run(input, nativeList string) error {
 	data, err := os.ReadFile(input)
 	if err != nil {
 		return err
@@ -55,9 +61,7 @@ func run(input string) error {
 	if err := json.Unmarshal(data, &batches); err != nil {
 		return fmt.Errorf("decode %s: %w", input, err)
 	}
-	manager := metrics.NewMetricsManager()
-	manager.Init(context.Background(), zap.NewNop())
-	defer manager.Close()
+	metrics.RegisterProxyMetrics()
 	for _, batch := range batches {
 		wire := &controlpb.MetricsBatch{Sequence: batch.Sequence}
 		for _, metric := range batch.Metrics {
@@ -73,16 +77,42 @@ func run(input string) error {
 			return fmt.Errorf("apply batch %d: %w", batch.Sequence, err)
 		}
 	}
+	// Families that never crossed the bridge get explicit fixed observations,
+	// so the fixture carries a real sample rather than a zero shell. The
+	// 100ms/10-tick/5-callback production rule is covered by the Rust unit
+	// test against a controllable clock, not by these values.
+	for range fixedKeepAlives {
+		metrics.KeepAliveCounter.Inc()
+	}
+	for range fixedTimeJumps {
+		metrics.TimeJumpBackCounter.Inc()
+	}
+
+	native, err := readNativeFamilies(nativeList)
+	if err != nil {
+		return err
+	}
 	families, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
 		return err
 	}
-	owned := metrics.RustMetricNames()
-	sort.Strings(owned)
+	gathered := make(map[string]struct{}, len(families))
+	for _, family := range families {
+		gathered[family.GetName()] = struct{}{}
+	}
+	for _, name := range native {
+		if _, ok := gathered[name]; !ok {
+			return fmt.Errorf("%s lists %s, which the Go collectors do not expose: "+
+				"the oracle cannot vouch for a family it never gathered", nativeList, name)
+		}
+	}
+	selected := make(map[string]struct{}, len(native))
+	for _, name := range native {
+		selected[name] = struct{}{}
+	}
 	encoder := expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeTextPlain))
 	for _, family := range families {
-		index := sort.SearchStrings(owned, family.GetName())
-		if index >= len(owned) || owned[index] != family.GetName() {
+		if _, ok := selected[family.GetName()]; !ok {
 			continue
 		}
 		if err := encoder.Encode(family); err != nil {
@@ -90,4 +120,39 @@ func run(input string) error {
 		}
 	}
 	return nil
+}
+
+// Fixed observations for the natively served families that have no recorded
+// batch. Both are non-zero so the fixture cannot pass on empty shells.
+const (
+	fixedKeepAlives = 3
+	fixedTimeJumps  = 2
+)
+
+type nativeFamilies struct {
+	Families []string `json:"families"`
+}
+
+// readNativeFamilies returns the families the Rust process serves natively,
+// rejecting duplicates so the list cannot silently disagree with itself.
+func readNativeFamilies(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var doc nativeFamilies
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if len(doc.Families) == 0 {
+		return nil, fmt.Errorf("%s lists no families", path)
+	}
+	seen := make(map[string]struct{}, len(doc.Families))
+	for _, name := range doc.Families {
+		if _, ok := seen[name]; ok {
+			return nil, fmt.Errorf("%s lists %s twice", path, name)
+		}
+		seen[name] = struct{}{}
+	}
+	return doc.Families, nil
 }

@@ -66,7 +66,8 @@ use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
     MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
-    install_session_log_writer, spawn_metrics_exporter,
+    SystemTimeMonitor, install_session_log_writer, spawn_metrics_exporter,
+    spawn_system_time_monitor,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -216,6 +217,17 @@ impl StopJoin for MeteringSampler {
     }
 }
 
+impl StopJoin for SystemTimeMonitor {
+    fn stop(&self) {
+        SystemTimeMonitor::stop(self);
+    }
+    fn join(self) -> startup::TeardownFuture {
+        Box::pin(async move {
+            let _ = SystemTimeMonitor::join(self).await;
+        })
+    }
+}
+
 impl StopJoin for JoinHandle<()> {
     fn stop(&self) {
         self.abort();
@@ -236,6 +248,7 @@ struct RunningProcess<R, E, S, H> {
     metering_sampler: S,
     health_task: Option<H>,
     metrics_http_task: Option<JoinHandle<()>>,
+    system_time_monitor: Option<SystemTimeMonitor>,
     log_reload_task: Option<JoinHandle<()>>,
     admin_task: Option<AdminTask>,
     routing_shadow: Option<legacy_router_shadow::consumer::Task>,
@@ -264,6 +277,7 @@ struct StartupGuard<R, E, S, H> {
     health_task: Option<H>,
     /// Native `/metrics` responder; a concrete task because no test fakes it.
     metrics_http_task: Option<JoinHandle<()>>,
+    system_time_monitor: Option<SystemTimeMonitor>,
     /// Applies `log.log-file.*` reloads to the process log output.
     log_reload_task: Option<JoinHandle<()>>,
     /// Management-plane HTTP server (CP-ADMIN), stopped gracefully at exit.
@@ -290,6 +304,7 @@ where
             metering_sampler: None,
             health_task: None,
             metrics_http_task: None,
+            system_time_monitor: None,
             log_reload_task: None,
             admin_task: None,
             routing_shadow: None,
@@ -333,6 +348,12 @@ where
         }
     }
 
+    fn set_system_time_monitor(&mut self, monitor: SystemTimeMonitor) {
+        if self.system_time_monitor.replace(monitor).is_some() {
+            unreachable!("the system time monitor was set twice");
+        }
+    }
+
     fn set_admin_task(&mut self, task: AdminTask) {
         if self.admin_task.replace(task).is_some() {
             unreachable!("the admin task was set twice");
@@ -370,6 +391,9 @@ where
         if let Some(task) = self.metrics_http_task.take() {
             steps.push(("metrics_http_task", startup::Teardown::teardown(task)));
         }
+        if let Some(monitor) = self.system_time_monitor.take() {
+            steps.push(("system_time_monitor", startup::Teardown::teardown(monitor)));
+        }
         if let Some(task) = self.log_reload_task.take() {
             steps.push(("log_reload_task", startup::Teardown::teardown(task)));
         }
@@ -406,6 +430,7 @@ where
             metering_sampler,
             health_task,
             metrics_http_task,
+            system_time_monitor,
             log_reload_task,
             admin_task,
             routing_shadow,
@@ -423,6 +448,7 @@ where
             metering_sampler,
             health_task,
             metrics_http_task,
+            system_time_monitor,
             log_reload_task,
             admin_task,
             routing_shadow,
@@ -565,6 +591,13 @@ async fn run(options: Options) -> Result<(), String> {
     // until its TTL); a successful startup ends with `guard.commit`.
     let mut guard = StartupGuard::arm(Arc::clone(&in_process), modules);
     // STARTUP-GUARD:ARMED
+    // Go starts this with the metrics manager, before anything control-plane
+    // related, and it is the only producer behind
+    // tiproxy_monitor_time_jump_back_total and tiproxy_monitor_keep_alive_total.
+    // Start it as soon as the guard can own it: a process still waiting on its
+    // control peer is exactly when a clock step matters, and Go counts there
+    // too. The guard stops and joins it on rollback and on shutdown.
+    guard.set_system_time_monitor(spawn_system_time_monitor(Arc::clone(&metrics_registry)));
     guard.routing_shadow = routing_shadow_socket.map(legacy_router_shadow::consumer::Task::spawn);
     if let Err(error) = guard.spawn_module(config_owner.module) {
         return Err(guard
@@ -982,6 +1015,7 @@ async fn run(options: Options) -> Result<(), String> {
             },
         health_task,
         metrics_http_task,
+        system_time_monitor,
         log_reload_task,
         admin_task,
         routing_shadow,
@@ -1151,6 +1185,10 @@ async fn run(options: Options) -> Result<(), String> {
     if let Some(task) = metrics_http_task {
         task.abort();
         let _ = task.await;
+    }
+    if let Some(monitor) = system_time_monitor {
+        monitor.stop();
+        let _ = monitor.join().await;
     }
     if let Some(task) = log_reload_task {
         task.abort();
@@ -2085,7 +2123,8 @@ mod tests {
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use dataplane::{MetricsRegistry, spawn_system_time_monitor_with_clock};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -2447,6 +2486,61 @@ mod tests {
         assert!(in_process.finish().is_err());
     }
 
+    /// The monitor is a background producer, so a failed startup has to stop
+    /// and join it rather than leave it ticking against a dead process. A unit
+    /// test of the loop and a fixed golden cannot show this: only the guard's
+    /// own rollback path can.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_startup_stops_the_system_time_monitor() {
+        let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
+        let in_process = armed_owner();
+        let mut guard = StartupGuard::arm(
+            Arc::clone(&in_process),
+            modules_with_stoppable(&in_process, &log),
+        );
+        guard.set_runtime(fake("legacy_runtime", &log));
+        guard.set_metrics_exporter(fake("metrics_exporter", &log));
+        guard.set_metering_sampler(fake("metering_sampler", &log));
+        guard.set_health_task(fake("health_task", &log));
+
+        // The clock closure counts every sample, so the task's liveness is
+        // observable from outside without reaching into its internals.
+        let samples = Arc::new(AtomicU64::new(0));
+        let counted = {
+            let samples = Arc::clone(&samples);
+            move || {
+                samples.fetch_add(1, Ordering::Relaxed);
+                0_i128
+            }
+        };
+        guard.set_system_time_monitor(spawn_system_time_monitor_with_clock(
+            Arc::new(MetricsRegistry::new()),
+            counted,
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            samples.load(Ordering::Relaxed) > 0,
+            "the monitor must be sampling before the rollback"
+        );
+
+        let error = guard.rollback("mark ready: injected".to_owned()).await;
+        assert_eq!(error, "mark ready: injected");
+        let after_rollback = samples.load(Ordering::Relaxed);
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            samples.load(Ordering::Relaxed),
+            after_rollback,
+            "rollback must stop and join the monitor, not leave it ticking"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_normal_commit_transfers_every_resource_and_disarms() {
         let log: TeardownLog = Arc::new(Mutex::new(Vec::new()));
@@ -2472,6 +2566,7 @@ mod tests {
             metering_sampler,
             health_task,
             metrics_http_task: _,
+            system_time_monitor: _,
             log_reload_task: _,
             admin_task: _,
             routing_shadow,
