@@ -2102,3 +2102,88 @@ async fn review_pull_pending_union_is_globally_bounded() -> TestResult {
     );
     Ok(())
 }
+
+/// The Rust side of the `b_conn` deviation recorded as MTR-007.
+///
+/// Two incarnations each holding one connection to the same backend address
+/// report 2 here, because the address label is meant to say how many
+/// connections this process holds. Go reports 1 for the same situation: it
+/// writes the gauge with Set from each namespace's own router, so the last
+/// writer decides. `pkg/metrics` `TestBackendConnGaugeOverwritesAcrossNamespaces`
+/// pins that side. The difference is declared, so it is asserted on both
+/// sides rather than left to the manifest text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_snapshot_sums_shared_backend_address() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut first = must(handle.admit(""));
+    let reservation = must(first.selector_mut().next(ClientInfo::default(), ""));
+    let shared = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        first.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+
+    // Force the second incarnation onto the same backend by failing the other
+    // one. Which backend a reservation lands on is not fixed by the fixture,
+    // and the balancer will otherwise steer the second away from the one the
+    // first is already using -- so the shared case has to be arranged, never
+    // assumed.
+    let other = if shared == "127.0.0.1:4000" {
+        "127.0.0.1:4001"
+    } else {
+        "127.0.0.1:4000"
+    };
+    harness.patch(
+        &format!("[proxy]\nfail-backend-list=[\"{other}\"]\nfailover-timeout=60"),
+        3,
+    );
+    harness.source.deliver();
+
+    // Retire the namespace; `first` keeps its incarnation alive.
+    retire_namespace(&harness, 4)?;
+    let mut second = must(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.admit_within("replacement", Duration::from_secs(5)),
+        )
+        .await?,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    let reservation = must(second.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(
+        reservation.assignment().backend_address,
+        shared,
+        "both incarnations must hold the same address for this to be the shared case"
+    );
+    assert_eq!(
+        second.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+
+    let snapshot = handle.migration_snapshot();
+    assert_eq!(
+        snapshot.backend_connections.get(&shared).copied(),
+        Some(2),
+        "Rust reports the process total; Go would report 1 here (MTR-007)"
+    );
+
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}

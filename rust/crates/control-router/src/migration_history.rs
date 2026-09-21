@@ -102,6 +102,10 @@ pub struct MigrationHistorySnapshot {
     /// Label sets ever seen, so a series that has returned to zero keeps
     /// being reported instead of vanishing between scrapes.
     pub known_pending: BTreeSet<(String, String, RedirectReason)>,
+    /// Backend addresses ever seen holding a connection. Go's `Set` creates
+    /// the child and it stays, so an address that drops to no connections
+    /// must keep reporting zero rather than disappear from the exposition.
+    pub known_backends: BTreeSet<String>,
     /// Label sets refused because a retained map was full.
     pub labels_dropped: u64,
 }
@@ -133,6 +137,23 @@ impl MigrationHistory {
             return false;
         }
         state.known_pending.insert(key);
+        true
+    }
+
+    /// Notes a backend address that holds a connection, so its series keeps
+    /// reporting zero once the connections go away. Returns whether it is
+    /// retained; the ceiling is the same one the migration label sets use, so
+    /// the two cannot admit different things.
+    pub fn remember_backend(&self, address: &str) -> bool {
+        let mut state = self.lock();
+        if state.known_backends.contains(address) {
+            return true;
+        }
+        if state.known_backends.len() >= MAX_RETAINED_LABEL_SETS {
+            state.labels_dropped = state.labels_dropped.saturating_add(1);
+            return false;
+        }
+        state.known_backends.insert(address.to_owned());
         true
     }
 

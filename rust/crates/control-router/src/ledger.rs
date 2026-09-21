@@ -668,6 +668,11 @@ impl Ledger {
         let stage = if connected {
             account.counts.active += 1;
             account.physical.push(reservation.session.sequence);
+            // Registered here, not when the exposition reads: a connection
+            // that opens and closes between two scrapes must still leave its
+            // address reporting zero.
+            self.history
+                .remember_backend(&reservation.assignment.backend_address);
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
@@ -912,6 +917,9 @@ impl Ledger {
                 .unwrap_or_else(|| unreachable!("retained target"));
             target.counts.active += 1;
             target.physical.push(redirect.session.sequence);
+            // The connection is now physically the target's; register the
+            // address at the moment it lands, for the same reason.
+            self.history.remember_backend(&redirect.to.backend_address);
         }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("matching active session")

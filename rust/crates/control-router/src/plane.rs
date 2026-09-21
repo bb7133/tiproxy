@@ -176,6 +176,13 @@ impl RouteLedgerDiagnostics {
             pending: BTreeMap::new(),
             backend_connections: BTreeMap::new(),
         };
+        // Every address ever seen reports, so one that has dropped to no
+        // connections shows zero instead of vanishing, as Go's child does.
+        // Admission already happened against the shared set, so this adds no
+        // second ceiling.
+        for address in &snapshot.history.known_backends {
+            snapshot.backend_connections.insert(address.clone(), 0);
+        }
         for router in routers {
             // No ceiling of its own on purpose. Every ledger only tracks
             // label sets the shared history retained, so this union is a
@@ -193,13 +200,6 @@ impl RouteLedgerDiagnostics {
             // holds to that backend. The difference is declared in the parity
             // manifest rather than hidden.
             for (address, active) in router.physical_connections() {
-                if !snapshot.backend_connections.contains_key(&address)
-                    && snapshot.backend_connections.len() >= crate::MAX_RETAINED_LABEL_SETS
-                {
-                    snapshot.history.labels_dropped =
-                        snapshot.history.labels_dropped.saturating_add(1);
-                    continue;
-                }
                 let entry = snapshot.backend_connections.entry(address).or_default();
                 *entry = entry.saturating_add(active);
             }

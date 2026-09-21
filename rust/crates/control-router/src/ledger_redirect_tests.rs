@@ -890,3 +890,84 @@ fn physical_connections_follow_gos_conn_list_exactly() {
     );
     assert!(ledger.physical_connections().is_empty());
 }
+
+/// Go creates the gauge child on the first `Set` and it stays. An address
+/// whose last connection closes must therefore keep reporting zero rather
+/// than disappearing from the exposition, which is what happens if the count
+/// is derived only from currently active sessions.
+#[test]
+fn a_backend_address_keeps_reporting_after_its_last_connection_closes() {
+    let history = Arc::new(MigrationHistory::default());
+    let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+    let a = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    assert_eq!(
+        ledger.physical_connections().get("10.0.0.1:4000").copied(),
+        Some(1)
+    );
+
+    assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
+    assert!(
+        ledger.physical_connections().is_empty(),
+        "the ledger reports live counts only"
+    );
+    assert!(
+        history.snapshot().known_backends.contains("10.0.0.1:4000"),
+        "but the address is retained, so the exposition can still report it as zero"
+    );
+}
+
+/// Registration happens when the connection lands, not when the exposition
+/// reads. A connection that opens and closes entirely between two scrapes is
+/// never seen by a read, so a read-time registration would lose its address
+/// and the series would never report the zero.
+#[test]
+fn an_address_connected_and_closed_between_scrapes_still_reports() {
+    let history = Arc::new(MigrationHistory::default());
+    let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+    let a = must(ledger.add_account());
+
+    // No scrape happens anywhere in this sequence.
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.9:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
+
+    assert!(
+        history.snapshot().known_backends.contains("10.0.0.9:4000"),
+        "the address must be known even though no read ever observed it live"
+    );
+}
+
+/// A migration that lands registers the target address at the moment it
+/// lands, for the same reason.
+#[test]
+fn a_migration_target_is_registered_when_it_lands() {
+    let history = Arc::new(MigrationHistory::default());
+    let mut ledger = Ledger::with_history(8, Arc::clone(&history));
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let now = Instant::now();
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        now,
+        RedirectReason::Test,
+    ));
+    ledger.admit_redirect(op.clone(), true, now);
+    assert!(
+        !history.snapshot().known_backends.contains("10.0.0.2:4000"),
+        "an accepted migration has not landed yet"
+    );
+    assert_eq!(ledger.finish_redirect(&op, true, now), Settlement::Applied);
+    assert!(
+        history.snapshot().known_backends.contains("10.0.0.2:4000"),
+        "a successful settlement registers the target"
+    );
+}
