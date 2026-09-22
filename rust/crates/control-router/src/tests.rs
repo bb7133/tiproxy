@@ -2187,3 +2187,166 @@ async fn migration_snapshot_sums_shared_backend_address() -> TestResult {
     let _ = plane_task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let resolved = crate::ResolvedNamespace::named(h.source.current(), "default")
+        .map_err(|e| format!("{e:?}"))?;
+    let scores = Arc::new(crate::ScoreHistory::new());
+    let router = Router::new_resolved(
+        Arc::new(h.source.clone()),
+        &h.topology,
+        &h.runtime.handle().module_context(),
+        &resolved,
+        16,
+        None,
+        crate::selector::RouterShared {
+            scores: Arc::clone(&scores),
+            backend_metrics: Arc::new(crate::BackendMetricHistory::new()),
+            input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
+            history: Arc::new(crate::MigrationHistory::default()),
+        },
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    router.set_replay_wall(1_000_000_000_000);
+    let candidate = router.capture().map_err(|e| format!("{e:?}"))?;
+    let session = router.open().map_err(|e| format!("{e:?}"))?;
+    let reservation = router
+        .reserve_with_ticket(&session, &candidate, ClientInfo::default(), "", &[], 0)
+        .map_err(|e| format!("{e:?}"))?;
+    let _ = router.finish(&reservation, false);
+    let _ = router.close(&session);
+    let published = scores.snapshot().scores;
+    println!("scores after successful real route evaluation: {published:?}");
+    assert!(
+        published.contains_key(&(
+            "127.0.0.1:4000".to_owned(),
+            crate::factors::Factor::Connection,
+        )),
+        "Go BackendToRoute calls updateScore; the first real route scoring must publish"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_bscore_real_plane_config_reset_without_further_scoring() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(Arc::new(h.source.clone()), h.topology.clone(), None);
+    let context = h.runtime.handle().module_context();
+    let task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    let observed = async {
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+        let mut admission = must(handle.admit(""));
+        let mut updates = admission.subscribe_updates();
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let scores = handle.score_history();
+        let initial = scores.snapshot().scores;
+        assert!(!initial.is_empty(), "real route must have produced scores before reset");
+        updates.borrow_and_update();
+        let old = h.source.current().generation();
+        h.patch("[balance]\npolicy=\"resource\"", 2);
+        let new = h.source.current().generation();
+        assert_ne!(old, new);
+        h.source.deliver();
+        tokio::time::timeout(Duration::from_secs(5), updates.changed()).await??;
+        let after = scores.snapshot().scores;
+        println!("real config reconciliation completed generation {old}->{new}, before={initial:?}, after={after:?}");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(after)
+    }.await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        observed?.is_empty(),
+        "Go SetConfig resets b_score on configuration, without requiring another updateScore"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_bscore_real_plane_reset_preserves_cadence() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(Arc::new(h.source.clone()), h.topology.clone(), None);
+    let context = h.runtime.handle().module_context();
+    let task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    let observed = async {
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+        let mut admission = must(handle.admit(""));
+        let mut updates = admission.subscribe_updates();
+        let router = admission.test_router();
+        router.set_replay_wall(1_000_000_000_000);
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let scores = handle.score_history();
+        let initial = scores.snapshot().scores;
+        assert!(!initial.is_empty(), "real route must have produced scores before reset");
+        updates.borrow_and_update();
+        let old = h.source.current().generation();
+        h.patch("[balance]\npolicy=\"connection\"\nrouting-policy=\"random\"", 2);
+        let new = h.source.current().generation();
+        assert_ne!(old, new);
+        h.source.deliver();
+        tokio::time::timeout(Duration::from_secs(5), updates.changed()).await??;
+        let after = scores.snapshot().scores;
+        println!("real config reconciliation completed generation {old}->{new}, before={initial:?}, after={after:?}");
+        assert!(after.is_empty(), "configuration reset must already be visible");
+        let mut admission = must(handle.admit(""));
+        router.set_replay_wall(1_000_000_000_001);
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        assert!(scores.snapshot().scores.is_empty(), "reset must not grant an early write");
+        router.set_replay_wall(1_010_000_000_001);
+        let mut admission = must(handle.admit(""));
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let resumed = scores.snapshot().scores;
+        println!("after reset: T+1ns remains empty; T+10s+1ns publishes {resumed:?}");
+        assert!(!resumed.is_empty(), "normal original cadence must resume");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(after)
+    }.await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        observed?.is_empty(),
+        "Go SetConfig resets b_score on configuration, without requiring another updateScore"
+    );
+    Ok(())
+}

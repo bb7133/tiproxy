@@ -629,114 +629,153 @@ fn single_time_entry_matches_ordered_windows_and_next_history() {
     }
 }
 
-/// `backend_metric` is published from inside the factors, on the values
-/// they accept, so this drives the real `evaluate` rather than inspecting a
-/// finished report.
-///
-/// Two backends, because `evaluate_window` only runs the health, memory and
-/// cpu factors under a resource policy with more than one input
-/// (`factors.rs:370`). A single-input fixture still produces a scored row,
-/// which is exactly why a row is not evidence that anything was published.
-///
-/// Each input's opaque routing id, Prometheus instance label and dial
-/// address are all different, so a label taken from the wrong one shows.
-/// The two cpu samples also differ from their average, so publishing the
-/// latest sample instead of `calcAvgUsage`'s average shows too.
+/// `CodexM5`'s review regression, adopted rather than restated: all six
+/// metrics for two real backends, the derived cpu average and memory
+/// value, a 1ms-later update proving there is no throttle, rejected and
+/// absent samples retaining what was already exposed, and a policy change
+/// leaving the family alone because Go never resets it.
 #[test]
-fn backend_metric_publishes_accepted_values_labelled_by_address() {
-    use crate::{BackendMetric, BackendMetricHistory};
-
-    let metrics = Arc::new(BackendMetricHistory::new());
+#[allow(clippy::too_many_lines)] // One scenario end to end; splitting it would hide the ordering.
+fn review_backend_metric_accepted_factor_samples_publish_derived_values() {
+    use crate::BackendMetric::{Cpu, FailurePd, FailureTikv, Memory, TotalPd, TotalTikv};
+    let metrics = Arc::new(crate::BackendMetricHistory::new());
     let mut state = State::default();
     state.set_backend_metrics(Some(Arc::clone(&metrics)));
-
     let mut ledger = Ledger::new(2);
-    let backends = [
-        ("10.0.0.8:4000", "10.0.0.8:10080"),
-        ("10.0.0.9:4000", "10.0.0.9:10080"),
-    ];
-    let inputs: Vec<Input> = backends
-        .iter()
-        .map(|(address, instance)| Input {
-            address: (*address).into(),
-            instance: (*instance).into(),
-            id: Arc::from(format!("cluster-a/{address}").as_str()),
+    let inputs: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|i| Input {
+            id: Arc::from(format!("opaque-backend-{i}")),
+            address: format!("sql-{i}:4000"),
+            instance: format!("status-{i}:10080"),
+            cluster: "default".to_owned(),
             owner: must(ledger.add_account()),
-            cluster: String::new(),
-            counts: Accounting::for_balance_test(1, 0, 0, 0),
+            counts: Accounting::for_factor_test(10, 0),
             healthy: true,
             local: true,
             label_matches: true,
         })
         .collect();
-
-    // Samples whose average is neither of them, per backend.
-    let series: Vec<Series> = backends
-        .iter()
-        .zip([0.0_f64, 0.1])
-        .map(|((_, instance), offset)| Series {
-            labels: BTreeMap::from([
-                ("instance".into(), (*instance).into()),
-                (
-                    "tiproxy_cluster".into(),
-                    control_topology::metrics::cluster_label(""),
-                ),
-            ]),
-            samples: vec![
-                Sample {
-                    timestamp_ms: 1_000,
-                    value: 0.2 + offset,
+    let mut policy = must(EffectiveConfig::default().routing());
+    policy.balance_policy = RoutingBalancePolicy::Resource;
+    let t = 1_000_000_000_000_i64;
+    let make_queries = |updated, sample_ms, cpu: [f64; 2], mem: f64| -> Queries {
+        [
+            (
+                QueryId::Cpu,
+                ValueKind::Matrix,
+                vec![(sample_ms - 1000, cpu[0]), (sample_ms, cpu[1])],
+            ),
+            (
+                QueryId::Memory,
+                ValueKind::Matrix,
+                vec![(sample_ms - 1000, 0.4), (sample_ms, mem)],
+            ),
+            (
+                QueryId::FailurePd,
+                ValueKind::Vector,
+                vec![(sample_ms, 2.0)],
+            ),
+            (QueryId::TotalPd, ValueKind::Vector, vec![(sample_ms, 10.0)]),
+            (
+                QueryId::FailureTikv,
+                ValueKind::Vector,
+                vec![(sample_ms, 3.0)],
+            ),
+            (
+                QueryId::TotalTikv,
+                ValueKind::Vector,
+                vec![(sample_ms, 20.0)],
+            ),
+        ]
+        .into_iter()
+        .map(|(id, kind, values)| {
+            (
+                id,
+                QueryResult {
+                    updated_nanos: Some(updated),
+                    kind,
+                    series: inputs
+                        .iter()
+                        .map(|input| Series {
+                            labels: BTreeMap::from([
+                                ("instance".to_owned(), input.instance.clone()),
+                                ("tiproxy_cluster".to_owned(), "default".to_owned()),
+                            ]),
+                            samples: values
+                                .iter()
+                                .map(|&(timestamp_ms, value)| Sample {
+                                    timestamp_ms,
+                                    value,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
                 },
-                Sample {
-                    timestamp_ms: 2_000,
-                    value: 0.6 + offset,
-                },
-            ],
+            )
         })
-        .collect();
-    let mut queries = Queries::new();
-    queries.insert(
-        QueryId::Cpu,
-        QueryResult {
-            updated_nanos: Some(1),
-            kind: ValueKind::Matrix,
-            series,
-        },
+        .collect()
+    };
+    let first = state.evaluate(
+        &inputs,
+        &policy,
+        &make_queries(t, t / 1_000_000, [0.2, 0.6], 0.95),
+        t,
     );
-
-    let mut config = must(EffectiveConfig::default().routing());
-    // Connection is the one policy that skips the resource factors entirely.
-    config.balance_policy = RoutingBalancePolicy::Resource;
-    let _ = state.evaluate(&inputs, &config, &queries, 3_000_000_000);
-
-    let published = metrics.snapshot().values;
-    for (address, instance) in backends {
-        assert!(
-            published.contains_key(&(address.to_owned(), BackendMetric::Cpu)),
-            "{address} must publish a cpu observation; got {:?}",
-            published.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !published.contains_key(&(instance.to_owned(), BackendMetric::Cpu)),
-            "the Prometheus instance label must not be used as the backend label"
-        );
+    assert_eq!(first.rows.len(), 2);
+    let first_values = metrics.snapshot().values;
+    println!("accepted actual factor sample -> backend_metric {first_values:?}");
+    assert_eq!(
+        first_values.len(),
+        12,
+        "all six accepted values for both actual addresses"
+    );
+    for input in &inputs {
+        for (metric, expected) in [
+            (Cpu, 0.4),
+            (Memory, 0.9),
+            (FailurePd, 2.0),
+            (TotalPd, 10.0),
+            (FailureTikv, 3.0),
+            (TotalTikv, 20.0),
+        ] {
+            let actual = first_values.get(&(input.address.clone(), metric)).copied();
+            assert!(
+                actual.is_some_and(|v| (v - expected).abs() < 1e-12),
+                "{metric:?}: {actual:?} expected {expected}"
+            );
+        }
     }
-    assert!(
-        !published.keys().any(|(label, _)| label.contains('/')),
-        "the opaque routing id must never reach a metric label: {:?}",
-        published.keys().collect::<Vec<_>>()
+    let next = make_queries(t + 1_000_000, t / 1_000_000 + 1, [0.1, 0.3], 0.5);
+    let _ = state.evaluate(&inputs, &policy, &next, t + 1_000_000);
+    let second = metrics.snapshot().values;
+    for input in &inputs {
+        assert!((second[&(input.address.clone(), Cpu)] - 0.2).abs() < 1e-12);
+        assert!((second[&(input.address.clone(), Memory)] - 0.5).abs() < 1e-12);
+    }
+    println!("accepted 1ms later without score throttle -> {second:?}");
+    let mut skipped = make_queries(t + 2_000_000, t / 1_000_000 + 2, [f64::NAN; 2], f64::NAN);
+    for (id, query) in &mut skipped {
+        if *id == QueryId::Memory {
+            for s in &mut query.series {
+                for sample in &mut s.samples {
+                    sample.value = f64::NAN;
+                }
+            }
+        }
+    }
+    skipped.retain(|id, _| matches!(id, QueryId::Cpu | QueryId::Memory));
+    let _ = state.evaluate(&inputs, &policy, &skipped, t + 2_000_000);
+    assert_eq!(
+        metrics.snapshot().values,
+        second,
+        "rejected resource values and absent health samples retain exposure"
     );
-    // Exact expectations, not merely "different from the latest sample":
-    // [0.2, 0.6] averages to 0.4 and [0.3, 0.7] to 0.5, so a wrong
-    // aggregation that still differs from the last sample is caught too.
-    let first = published[&("10.0.0.8:4000".to_owned(), BackendMetric::Cpu)];
-    let second = published[&("10.0.0.9:4000".to_owned(), BackendMetric::Cpu)];
-    assert!(
-        (first - 0.4).abs() < 1e-9,
-        "cpu is calcAvgUsage's average of [0.2, 0.6]; got {first}"
-    );
-    assert!(
-        (second - 0.5).abs() < 1e-9,
-        "cpu is calcAvgUsage's average of [0.3, 0.7]; got {second}"
+    policy.balance_policy = RoutingBalancePolicy::Connection;
+    let _ = state.evaluate(&inputs, &policy, &Queries::new(), t + 3_000_000);
+    assert_eq!(
+        metrics.snapshot().values,
+        second,
+        "configuration does not Reset backend_metric"
     );
 }
