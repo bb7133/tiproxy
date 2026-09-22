@@ -24,6 +24,7 @@
 pub mod config;
 pub mod logging;
 pub mod ownership;
+pub mod permit;
 pub mod runtime;
 
 pub use config::{

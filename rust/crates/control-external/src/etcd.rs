@@ -18,11 +18,11 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use control_plane::OwnerToken;
+use control_plane::permit::CommitPermit;
 use etcd_client::Client;
 use http::Uri;
 use thiserror::Error;
@@ -614,30 +614,13 @@ impl EtcdConnector {
 /// it is deliberately NOT derived, because a derived `Default` would build from
 /// `AtomicBool::default() == false` and be born already revoked (rejecting all
 /// I/O).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GenerationGate {
-    state: Arc<GateState>,
-}
-
-/// A gate's shared state: its liveness, and a short lock that serialises
-/// revocation against commits made under it.
-#[derive(Debug)]
-struct GateState {
-    live: AtomicBool,
-    /// Held across a revocation and across each [`GenerationGate::try_commit`].
-    ///
-    /// This is what turns the liveness check from a narrowing into a
-    /// guarantee. Reading `is_live` and then acting leaves a window in which
-    /// the flip lands between the two; taking this lock for both sides
-    /// removes the window, because the revocation and the commit can no
-    /// longer overlap at all.
-    commit: Mutex<()>,
-}
-
-impl Default for GenerationGate {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The shared authority. Built on `control-plane`'s primitive so that
+    /// ownership, configuration and topology revoke through the same
+    /// mechanism without depending on this crate -- `control-plane` is the
+    /// root of the internal graph, and this one sits above it.
+    permit: CommitPermit,
 }
 
 impl GenerationGate {
@@ -645,50 +628,33 @@ impl GenerationGate {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(GateState {
-                live: AtomicBool::new(true),
-                commit: Mutex::new(()),
-            }),
+            permit: CommitPermit::new(),
         }
     }
 
     /// Revokes the gate. Every connection carrying it is retired at once, and any
     /// in-flight operation is fenced at its next ownership check.
     ///
-    /// Takes the commit lock before flipping, so a [`Self::try_commit`]
-    /// already running finishes first and a later one is refused. A commit
-    /// is therefore never half-applied across a revocation.
+    /// Takes the commit lock before revoking, so a [`Self::try_commit`]
+    /// already running finishes first and a later one is refused.
     pub fn revoke(&self) {
-        let _commit = self
-            .state
-            .commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.state.live.store(false, Ordering::SeqCst);
+        self.permit.revoke();
     }
 
     /// Runs `commit` if and only if the gate is still live, with revocation
     /// excluded for its duration. Returns whether it ran.
     ///
-    /// The guarantee is symmetric: if a revocation takes the lock first the
-    /// commit is refused, and if the commit takes it first the revocation
-    /// waits for it to finish and the committed effect stands. It is a real
-    /// effect made under a live generation, not a leak.
-    ///
-    /// `commit` must be short and synchronous. It must not await, perform
-    /// I/O, or reach back for a lock that any holder takes before this one
-    /// -- in particular not the publisher or watch locks that revocation
-    /// paths hold.
+    /// See [`CommitPermit::commit`] for the contract the closure must meet:
+    /// short, synchronous, and reaching for no lock a revoker holds first.
     pub fn try_commit<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
-        let _guard = self
-            .state
-            .commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !self.state.live.load(Ordering::SeqCst) {
-            return None;
-        }
-        Some(commit())
+        self.permit.commit(commit)
+    }
+
+    /// The underlying authority, for a caller that must commit under this
+    /// gate together with other permits.
+    #[must_use]
+    pub const fn permit(&self) -> &CommitPermit {
+        &self.permit
     }
 
     /// Whether the gate is still live.
@@ -698,7 +664,7 @@ impl GenerationGate {
     /// generation belongs in [`Self::try_commit`].
     #[must_use]
     pub fn is_live(&self) -> bool {
-        self.state.live.load(Ordering::SeqCst)
+        self.permit.is_valid()
     }
 }
 
