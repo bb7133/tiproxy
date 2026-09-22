@@ -1337,3 +1337,67 @@ async fn a_dynamic_snapshot_is_refused_inside_the_commit_window_before_static_pu
     drop(module);
     Ok(())
 }
+
+/// `commit_current` runs an effect only while the whole composite
+/// authority holds, and a revocation of **any** member refuses it.
+///
+/// `still_current` answers and returns, so a revocation can land between
+/// the answer and the caller acting on it. This holds every authority the
+/// answer depended on for the effect's duration, which is the difference.
+#[tokio::test]
+async fn commit_current_runs_only_under_the_whole_authority() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    fixture.mode.publish(BackendSourceMode::Static);
+    let snapshot = fixture.handle.current().ok_or("static snapshot")?;
+    assert!(fixture.handle.still_current(&snapshot));
+
+    assert_eq!(
+        fixture.handle.commit_current(&snapshot, || 1),
+        Some(1),
+        "a fully current snapshot commits"
+    );
+
+    // Revoking the mode epoch alone is enough: the conjunction is only as
+    // valid as its weakest member.
+    fixture.mode.revoke();
+    assert_eq!(
+        fixture.handle.commit_current(&snapshot, || 1),
+        None,
+        "one revoked authority refuses the whole commit"
+    );
+    Ok(())
+}
+
+/// An effect can re-read the sources it committed under.
+///
+/// Scope, because the obvious stronger reading is wrong: this does **not**
+/// prove that `commit_current` released its watch borrows. A `watch`
+/// borrow is a read guard and taking a second one on the same thread is
+/// legal, so a control that holds the mode borrow across the commit still
+/// passes here. The borrow release rests on the scoped block in
+/// `commit_current` -- the guard is dropped before the first permit is
+/// taken -- and not on this test.
+///
+/// What it does establish is that committing does not leave the sources
+/// unreadable to the effect itself, which is the property a caller
+/// writing an effect actually depends on.
+#[tokio::test]
+async fn an_effect_can_re_read_the_sources_it_committed_under() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    fixture.mode.publish(BackendSourceMode::Static);
+    let snapshot = fixture.handle.current().ok_or("static snapshot")?;
+
+    // Inside the effect the mode slot must be free to read again. If the
+    // borrow were still held this would deadlock rather than fail.
+    let observed = fixture
+        .handle
+        .commit_current(&snapshot, || fixture.handle.still_current(&snapshot));
+    assert_eq!(
+        observed,
+        Some(true),
+        "the effect can re-read the sources it committed under"
+    );
+    Ok(())
+}

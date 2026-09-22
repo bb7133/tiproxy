@@ -49,6 +49,8 @@ use tokio::task::JoinHandle;
 use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::EpochResult;
 use crate::health_config::HealthRuntime;
+use control_plane::permit::PermitHolder;
+
 use crate::health_feed::HealthGenerationFeeder;
 use crate::health_history::{BackendHealthHistory, BackendRetirement, ObserverHealthMetrics};
 use crate::health_loop::{
@@ -832,12 +834,63 @@ impl BackendSourceHandle {
         self.still_current(&snapshot).then_some(snapshot)
     }
 
+    /// Runs `effect` only while `snapshot` is still authoritative through
+    /// this handle, holding every authority that currency depends on for
+    /// its duration.
+    ///
+    /// [`Self::still_current`] answers the same question and then returns,
+    /// which leaves a revocation free to land before the caller acts. This
+    /// closes that: the identity conditions are checked first, and the
+    /// effect then runs under the mode epoch's, routing's, health round's,
+    /// health feed's and owner's permits at once. A revocation of any of
+    /// them either precedes the commit, which refuses it, or waits for it.
+    ///
+    /// Every watch borrow is released before the commit begins. Holding
+    /// one across it would let a consumer wait on a permit while pinning a
+    /// slot a revoker needs, which is a cycle the permits themselves
+    /// cannot see.
+    ///
+    /// `effect` carries [`control_plane::permit::CommitPermit::commit`]'s
+    /// contract: short, synchronous, and reaching for no lock a revoker
+    /// takes first.
+    pub fn commit_current<T>(
+        &self,
+        snapshot: &BackendSourceSnapshot,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        // Identity first. None of these is revocable, so checking them
+        // outside the commit costs nothing and keeps the critical section
+        // to the part that needs it.
+        if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) || !self.namespace_current() {
+            return None;
+        }
+        let authorities = {
+            // Scoped so the watch borrow is gone before the commit.
+            let current = self.mode.borrow();
+            if !Arc::ptr_eq(&snapshot.epoch, &current) {
+                return None;
+            }
+            let (routing, health) = self.side(&snapshot.epoch);
+            if !health.still_current_for(&snapshot.health, &snapshot.routing, routing) {
+                return None;
+            }
+            let mut permits = vec![
+                snapshot.epoch.gate.permit().holder(),
+                snapshot.routing.source_gate().permit().holder(),
+            ];
+            permits.extend(snapshot.health.authorities()?);
+            permits
+        };
+        let borrowed: Vec<&PermitHolder> = authorities.iter().collect();
+        PermitHolder::commit_all(&borrowed, effect)
+    }
+
+    #[must_use]
     /// Whether `snapshot` is still authoritative through THIS handle: same
     /// handle, namespace incarnation still current at the source, the very same
     /// mode epoch still live and current (a mode value equal to the current one
     /// is never enough), and the selected side's exact routing/health pair still
     /// published and gated.
-    #[must_use]
     pub fn still_current(&self, snapshot: &BackendSourceSnapshot) -> bool {
         if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) || !self.namespace_current() {
             return false;
