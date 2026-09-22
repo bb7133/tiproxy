@@ -441,9 +441,6 @@ fn encode_resultset_terminator(status: StatusFlags, capabilities: CapabilityFlag
     }
 }
 
-/// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
-/// selects the shape: `0x80` sentinel = a backend error (e.g. execute after
-/// long data), `0x01` (read-only cursor) = a result-set header + column
 /// RSP-004: two result sets for one command. The first terminator carries
 /// `SERVER_MORE_RESULTS_EXISTS`, so the proxy must keep reading the backend
 /// instead of handing the command back to the client; the second clears it and
@@ -490,6 +487,9 @@ where
     true
 }
 
+/// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
+/// selects the shape: `0x80` sentinel = a backend error (e.g. execute after
+/// long data), `0x01` (read-only cursor) = a result-set header + column
 /// definition + a cursor-open terminator (`CURSOR_EXISTS`, no rows), otherwise
 /// a one-row result set with a plain terminator (no cursor).
 async fn respond_to_execute<R, W>(
