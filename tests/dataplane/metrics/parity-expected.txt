@@ -167,6 +167,7 @@ tiproxy_server_owner{type="metric_reader/z1"} 1
 # HELP tiproxy_server_reject_connection_total Number of rejected connections.
 # TYPE tiproxy_server_reject_connection_total counter
 tiproxy_server_reject_connection_total{type="max_connections"} 1
+tiproxy_server_reject_connection_total{type="memory"} 1
 # HELP tiproxy_session_conn_lifetime_seconds Bucketed histogram of connection lifetime (s).
 # TYPE tiproxy_session_conn_lifetime_seconds histogram
 tiproxy_session_conn_lifetime_seconds_bucket{le="0.1"} 0

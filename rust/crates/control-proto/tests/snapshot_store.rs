@@ -523,3 +523,185 @@ fn lineage_rollover_is_fresh_and_only_commit_advances_lineage() -> Result<(), Bo
     assert_eq!(back.snapshot.generation(), 1);
     Ok(())
 }
+
+/// One CFG-002 case: a name, a single-field mutation, and the substring the
+/// rejection detail must name.
+type ConfigBoundCase = (&'static str, Box<dyn Fn(&mut ConfigSnapshot)>, &'static str);
+
+/// Numeric and enum bounds: threshold, buffer size, PROXY mode.
+fn numeric_config_bound_cases() -> Vec<ConfigBoundCase> {
+    vec![
+        (
+            "threshold above one",
+            Box::new(|config: &mut ConfigSnapshot| config.high_memory_reject_threshold = 1.5),
+            "high_memory_reject_threshold",
+        ),
+        (
+            // Go rejects the whole 0 < t < 0.5 band, not just out-of-range
+            // values: a threshold that low would reject nearly every
+            // connection on a healthy process.
+            "threshold inside the forbidden band",
+            Box::new(|config: &mut ConfigSnapshot| config.high_memory_reject_threshold = 0.25),
+            "high_memory_reject_threshold",
+        ),
+        (
+            "threshold not a number",
+            Box::new(|config: &mut ConfigSnapshot| {
+                config.high_memory_reject_threshold = f64::NAN;
+            }),
+            "high_memory_reject_threshold",
+        ),
+        (
+            "buffer below one KiB",
+            Box::new(|config: &mut ConfigSnapshot| config.connection_buffer_bytes = 512),
+            "connection_buffer_bytes",
+        ),
+        (
+            "buffer above sixteen MiB",
+            Box::new(|config: &mut ConfigSnapshot| {
+                config.connection_buffer_bytes = 32 * 1024 * 1024;
+            }),
+            "connection_buffer_bytes",
+        ),
+        (
+            // The wire enum has no v1 member at all, so an unsupported
+            // version cannot be expressed; what CAN arrive is the proto3
+            // zero default, and defaulting THAT to either real mode would
+            // silently pick a PROXY behaviour nobody configured.
+            "an unspecified PROXY mode",
+            Box::new(|config: &mut ConfigSnapshot| config.proxy_protocol = 0),
+            "proxy_protocol",
+        ),
+        (
+            "a PROXY value outside the enum",
+            Box::new(|config: &mut ConfigSnapshot| config.proxy_protocol = 99),
+            "proxy_protocol",
+        ),
+    ]
+}
+
+/// Listener shape, keepalive presence, and the remaining identity fields.
+fn listener_config_bound_cases() -> Vec<ConfigBoundCase> {
+    vec![
+        (
+            "no listeners at all",
+            Box::new(|config: &mut ConfigSnapshot| config.listeners.clear()),
+            "listeners must contain",
+        ),
+        (
+            "a listener port of zero",
+            Box::new(|config: &mut ConfigSnapshot| config.listeners[0].port = 0),
+            "listener port",
+        ),
+        (
+            "a listener port beyond u16",
+            Box::new(|config: &mut ConfigSnapshot| config.listeners[0].port = 70_000),
+            "listener port",
+        ),
+        (
+            "an unnamed listener",
+            Box::new(|config: &mut ConfigSnapshot| config.listeners[0].name.clear()),
+            "listener name",
+        ),
+        (
+            // The expanded range is what arrives here, so a duplicated port
+            // in the projection must not silently bind once.
+            "a duplicated listener address",
+            Box::new(|config: &mut ConfigSnapshot| {
+                let duplicate = config.listeners[0].clone();
+                config.listeners.push(Listener {
+                    name: "sql-1".to_owned(),
+                    ..duplicate
+                });
+            }),
+            "duplicate",
+        ),
+        (
+            "a duplicated listener name",
+            Box::new(|config: &mut ConfigSnapshot| {
+                let duplicate = config.listeners[0].clone();
+                config.listeners.push(Listener {
+                    port: duplicate.port + 1,
+                    ..duplicate
+                });
+            }),
+            "duplicate",
+        ),
+        (
+            "a missing frontend keepalive policy",
+            Box::new(|config: &mut ConfigSnapshot| config.frontend_keepalive = None),
+            "frontend_keepalive",
+        ),
+        (
+            "a missing healthy backend keepalive policy",
+            Box::new(|config: &mut ConfigSnapshot| config.healthy_backend_keepalive = None),
+            "healthy_backend_keepalive",
+        ),
+        (
+            "a missing unhealthy backend keepalive policy",
+            Box::new(|config: &mut ConfigSnapshot| config.unhealthy_backend_keepalive = None),
+            "unhealthy_backend_keepalive",
+        ),
+        (
+            "an empty server version",
+            Box::new(|config: &mut ConfigSnapshot| config.server_version.clear()),
+            "server_version",
+        ),
+        (
+            "a malformed public CIDR",
+            Box::new(|config: &mut ConfigSnapshot| {
+                config.public_cidrs = vec!["10.0.0.0/99".to_owned()];
+            }),
+            "CIDR",
+        ),
+    ]
+}
+
+/// CFG-002: every config bound the Rust side owns rejects its own way, and a
+/// rejection never disturbs the retained last-good generation.
+///
+/// Go's `ProxyServer.Check` is the primary gate, so these arms should be
+/// unreachable in production — which is exactly why they had no test. The
+/// store is the last line before a bad generation becomes the one every new
+/// session reads, so each arm is driven here by mutating ONE field of an
+/// otherwise-valid snapshot. The mutations are one-field-at-a-time on purpose:
+/// a snapshot broken in two ways would pass even if only one check survived.
+#[test]
+fn config_bounds_are_rejected_without_disturbing_last_good() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::create()?;
+    let valid = write_valid_pair(directory.path(), "valid")?;
+    let store = SnapshotStore::new([directory.path().to_path_buf()])?;
+    store.apply(
+        1,
+        valid_snapshot(valid.clone()),
+        validation_time(),
+        lineage_a(),
+    )?;
+
+    let cases = numeric_config_bound_cases()
+        .into_iter()
+        .chain(listener_config_bound_cases());
+    for (name, mutate, expected) in cases {
+        let mut snapshot = valid_snapshot(valid.clone());
+        let config = snapshot.config.as_mut().ok_or("missing config")?;
+        mutate(config);
+        let error = store
+            .apply(2, snapshot, validation_time(), lineage_a())
+            .err()
+            .ok_or_else(|| format!("{name} was applied"))?;
+        assert_eq!(error.kind(), SnapshotErrorKind::Invalid, "{name}");
+        assert!(
+            error.detail().contains(expected),
+            "{name}: detail {:?} does not name {expected}",
+            error.detail()
+        );
+        let current = store.current()?.ok_or("missing last-good")?;
+        assert_eq!(current.generation(), 1, "{name} disturbed the last good");
+    }
+
+    // The same store still accepts a good generation afterwards: none of the
+    // rejections left it wedged.
+    store.apply(2, valid_snapshot(valid), validation_time(), lineage_a())?;
+    assert_eq!(store.current()?.ok_or("missing last-good")?.generation(), 2);
+    Ok(())
+}

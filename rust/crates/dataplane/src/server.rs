@@ -1264,6 +1264,22 @@ mod tests {
         let metrics = handle.metrics();
         assert_eq!(metrics.active_connections, 2);
         assert_eq!(metrics.rejected_max_connections_total, 1);
+
+        // `0` means unlimited, and the bounded reject above happened
+        // BEFORE an ID was created: the next admitted connection takes 3,
+        // not 4, and the old bound of 2 no longer holds any of them back.
+        let mut unlimited = Vec::new();
+        handle.update_snapshot(snapshot(2, 0, 0.0, one_listener())?)?;
+        for expected_id in 3_u64..=5 {
+            unlimited.push(TcpStream::connect(actual).await?);
+            let id = timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("accepted connection not reported")?;
+            assert_eq!(id.get(), expected_id, "a reject must not consume an ID");
+        }
+        assert_eq!(handle.registry().len(), 5);
+        assert_eq!(handle.metrics().rejected_max_connections_total, 1);
+
         handle.shutdown();
         owner.await??;
         assert!(handle.registry().is_empty());
