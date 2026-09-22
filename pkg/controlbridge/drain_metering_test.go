@@ -21,7 +21,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	proxymetrics "github.com/pingcap/tiproxy/pkg/metrics"
@@ -110,8 +109,7 @@ func TestMeteringConsumerDeduplicatesBySequence(t *testing.T) {
 }
 
 func TestCompositeHandlerAppliesMetricsWithoutControlFailure(t *testing.T) {
-	adapter := newTestAdapter(t, &recordingHandler{rt: router.NewStaticRouter(nil)})
-	composite, err := NewCompositeControlHandler(adapter, NewMeteringConsumer())
+	composite, err := NewRouteOwnerControlHandler(NewMeteringConsumer())
 	require.NoError(t, err)
 	peer := newFakeSender(61)
 
@@ -153,17 +151,18 @@ func TestCompositeHandlerAppliesMetricsWithoutControlFailure(t *testing.T) {
 	require.Equal(t, invalidBefore+1, invalidAfter)
 }
 
-// Go-restart direction of the reconcile contract: a fresh adapter (no
-// memory of any Rust session) answers a ReconcileRequest by identifying
-// the Rust connections as unknown to this lineage — an empty snapshot —
-// without inventing accounting for them or crashing; the Rust side
-// preserves those sessions (proven in the Rust model tests). With a
-// metering consumer attached, the snapshot acknowledges the consumer's
-// actually-applied sequence, not the producer's claim.
-func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
-	handler := &recordingHandler{rt: rt}
-	adapter := newTestAdapter(t, handler)
+// The reconcile acknowledgement reports the consumer's actually-applied
+// metering sequence, never the producer's claim. This is the only test
+// that distinguishes the two: `route_owner_handler_test.go` sends a claim
+// equal to the applied value, so it would pass either way.
+//
+// #223 Phase 2 note: this used to run the Go-restart rehydration direction
+// through the legacy RouterAdapter, asserting that unknown Rust sessions
+// were identified by omission. A route owner has no route sessions to
+// rehydrate and rejects a reconcile carrying connections outright
+// (`handleResidualReconcile`), so only the metering half survives, in its
+// residual form.
+func TestResidualReconcileAcksAppliedMeteringNotTheProducerClaim(t *testing.T) {
 	consumer := NewMeteringConsumer()
 	for sequence := uint64(1); sequence <= 4; sequence++ {
 		require.True(t, consumer.Apply(&controlpb.MeteringBatch{
@@ -173,38 +172,27 @@ func TestGoRestartIdentifiesUnknownConnectionsAndAcksMetering(t *testing.T) {
 			}},
 		}))
 	}
-	adapter.AttachMetering(consumer)
+	composite, err := NewRouteOwnerControlHandler(consumer)
+	require.NoError(t, err)
+	peer := newFakeSender(11)
 
-	peer := newFakeSender(11,
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION))
-	// Rust survived a Go restart and reports two live sessions plus a
-	// producer metering sequence beyond what this consumer ever saw.
+	// The producer claims 9; this consumer only ever applied 4.
 	reconcile := &controlpb.ControlEnvelope{
 		RequestId:  60,
 		Generation: 12,
 		Body: &controlpb.ControlEnvelope_ReconcileRequest{ReconcileRequest: &controlpb.ReconcileRequest{
 			KnownGeneration:      12,
 			LastMeteringSequence: 9,
-			Connections: []*controlpb.ReconcileConnection{
-				reconciledConnection(70, "tidb-a:4000", "r-70"),
-				reconciledConnection(71, "tidb-a:4000", ""),
-			},
 		}},
 	}
-	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcile))
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, reconcile))
 	snapshot := lastEnvelope(t, peer).GetReconcileSnapshot()
 	require.NotNil(t, snapshot)
-	require.Empty(t, snapshot.GetConnections(),
-		"unrehydratable connections (no router lookup attached) are identified by omission")
 	require.EqualValues(t, 4, snapshot.GetMeteringSequence(),
 		"the acknowledgement is the consumer's applied sequence, not the producer's claim")
-	require.Equal(t, 0, handler.closeCalls, "no phantom accounting, no negative counts")
-	require.Equal(t, 0, rt.ConnCount())
+	require.Empty(t, snapshot.GetConnections())
 
-	// Idempotent re-apply: the same request yields the same answer with
-	// no accounting drift.
-	require.NoError(t, adapter.HandleEnvelope(context.Background(), peer, reconcile))
-	require.Equal(t, 0, handler.closeCalls)
-	require.Equal(t, 0, rt.ConnCount())
+	// Idempotent re-apply: the same request yields the same answer.
+	require.NoError(t, composite.HandleEnvelope(context.Background(), peer, reconcile))
+	require.EqualValues(t, 4, lastEnvelope(t, peer).GetReconcileSnapshot().GetMeteringSequence())
 }

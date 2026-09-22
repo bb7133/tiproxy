@@ -229,12 +229,11 @@
       "id": "CP-ROUTE-001",
       "family": "routing",
       "summary": "Backend selection, retry exclusion, health, locality, keyspace, redirect, and exact route accounting match Go decisions.",
-      "go_owner": "pkg/balance/router and pkg/controlbridge/router_adapter.go",
+      "go_owner": "pkg/balance/router (pkg/controlbridge/router_adapter.go was deleted at #223 Phase 2)",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/router_adapter_test.go", "contains": "func TestRouterAdapterRetryAndExactlyOnceLifecycle"},
         {"path": "pkg/balance/router/router_score_test.go", "contains": "func TestNoBackends"},
         {"path": "pkg/balance/router/group_test.go", "contains": "func TestCrossKeyspaceFailoverRefusesRedirect"}
       ],
@@ -247,13 +246,12 @@
       "id": "CP-ROUTE-002",
       "family": "routing",
       "summary": "Namespace and keyspace matching, listener routing, conflict rejection, and dynamic change retain existing-session semantics.",
-      "go_owner": "pkg/manager/namespace, pkg/controlbridge, and pkg/balance/router",
+      "go_owner": "pkg/manager/namespace and pkg/balance/router (the pkg/controlbridge handshake-time half was deleted at #223 Phase 2)",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestNamespaceParityAcrossModes"},
-        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestDynamicNamespaceChangeKeepsExistingSession"},
+        {"path": "pkg/balance/router/cproute_group_evidence_test.go", "contains": "func TestCPRouteGroupObservation"},
         {"path": "pkg/balance/router/router_test.go", "contains": "func TestBackendKeyspacePrefersPathParsedOverLabel"}
       ],
       "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state", "rejection_code"],
@@ -265,14 +263,13 @@
       "id": "CP-ROUTE-003",
       "family": "routing",
       "summary": "Connection lifecycle, reconciliation, redirect watermarks, orphan closure, and generation reuse converge exactly once after either process restarts.",
-      "go_owner": "pkg/controlbridge/router_adapter.go and pkg/controlbridge/reconcile_rehydrate_test.go",
+      "go_owner": "pkg/controlbridge/drain_metering.go (residual only: #223 Phase 2 deleted router_adapter.go and reconcile_rehydrate_test.go, so Go performs none of this)",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestGoRestartRehydratesAccountingAndClosesExactlyOnce"},
-        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestReconcileConvergesReusedIdAcrossGenerations"},
-        {"path": "pkg/controlbridge/redirect_lifecycle_integration_test.go", "contains": "func TestRedirectFailureBalancesExactRouteAccounting"}
+        {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerResidualReconcileIsEmptyAndPreservesWatermarks"},
+        {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerRejectsNonemptyResidualReconcile"}
       ],
       "observed_fields": ["connection_id", "generation", "command_sequence", "pending_redirect_id", "terminal_count", "route_count"],
       "fault_scenarios": ["CP-FAULT-BRIDGE-RECONNECT", "CP-FAULT-PROCESS-DEATH"],

@@ -304,10 +304,9 @@ the real-TiDB migration phase:
   dial, one snapshot, one restore, zero stale-target I/O, and that every later
   user command reaches only the new owner. Final CLOSED accounting still
   includes the retired old socket and current socket exactly once.
-- `TestRouterAdapterWithFakeRustUDSPeer` crosses the real framed Unix socket and
-  proves generation/sequence propagation plus exactly one Go callback for
-  duplicated success, failure, and CLOSED terminals. A failure leaves the
-  projected server address and connection count on the successful owner.
+- The Go `TestRouterAdapterWithFakeRustUDSPeer` framed-Unix-socket test was
+  deleted at #223 Phase 2 together with `router_adapter.go`; the Rust side of
+  that seam is still covered by the dataplane integration suite.
 - `TestRedirectFailureBalancesExactRouteAccounting` uses the production
   `ScoreBasedRouter` health/rebalance loop. It observes the real old-to-target
   pending gauge rise, feeds the exact failed Rust terminal, and requires the
