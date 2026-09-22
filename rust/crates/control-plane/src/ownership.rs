@@ -314,16 +314,21 @@ fn validate_identifier(kind: &'static str, value: String) -> Result<Arc<str>, Ow
 mod owner_permit_tests {
     use super::{OwnerScope, OwnershipRegistry};
 
-    /// `CodexM5`'s counterexample, replayed through the public API: a
-    /// holder revokes its own copy of the permit, and the lease's release
-    /// must still unregister the scope.
+    /// What a token holder can do, and what it can no longer do.
     ///
-    /// The bug this pins is a conflation -- "the authority is invalid" and
-    /// "the one-time unregistration has happened" are different facts, and
-    /// deciding the second from the first leaves the scope owned forever
-    /// by a lease that has already been dropped.
+    /// `CodexM5`'s counterexample went `token.permit().revoke()` and then
+    /// dropped the lease, stranding the scope. That call no longer
+    /// compiles: [`PermitHolder`] has no `revoke`. This test therefore
+    /// pins the *capability*, not the old failure -- it asserts that a
+    /// holder can commit and that committing does not end the lease.
+    ///
+    /// The conflation the counterexample exposed is pinned separately by
+    /// `an_already_invalid_permit_does_not_skip_unregistration`, which
+    /// reaches the authority directly. Neither test substitutes for the
+    /// other: one says nobody can trigger it, the other says triggering it
+    /// is harmless.
     #[test]
-    fn a_revoked_permit_copy_does_not_strand_the_scope() {
+    fn a_holder_can_commit_but_cannot_end_the_lease() {
         let registry = OwnershipRegistry::new();
         let lease = registry
             .claim(OwnerScope::Process, "owner-1")
