@@ -21,6 +21,7 @@ use std::path::Path;
 use std::str;
 use std::sync::{Arc, RwLock};
 
+use control_plane::permit::{CommitPermit, PermitHolder};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -212,6 +213,18 @@ pub struct ConfigNamespaceSnapshot {
     namespace_identities: BTreeMap<String, Arc<()>>,
     resource_incarnation: ResourceIncarnation,
     prepared: PreparedArtifact,
+    /// The authority to act on this exact snapshot.
+    ///
+    /// Minted per published snapshot and revoked when the next one
+    /// replaces it, so an effect made under a superseded configuration is
+    /// refused rather than racing the swap. Deliberately **not** carried
+    /// forward by [`Self::retain_identities`]: the resource incarnation
+    /// survives some changes on purpose, but being the current
+    /// configuration does not.
+    ///
+    /// Private; [`Self::permit`] hands out a holder. Ending a
+    /// configuration's authority belongs to the store that publishes it.
+    permit: CommitPermit,
 }
 
 /// Continuous lifetime of Resource/Location factors and their six queries.
@@ -249,6 +262,16 @@ impl PartialEq for ConfigNamespaceSnapshot {
 }
 
 impl ConfigNamespaceSnapshot {
+    /// The authority to act on this snapshot while it is current.
+    ///
+    /// An effect that must not outlive this configuration runs inside the
+    /// holder's `commit`; reading a generation and then acting leaves the
+    /// next publication free to land in between.
+    #[must_use]
+    pub fn permit(&self) -> PermitHolder {
+        self.permit.holder()
+    }
+
     /// Resource-factor incarnation committed atomically with this config.
     #[must_use]
     pub fn resource_incarnation(&self) -> ResourceIncarnation {
@@ -757,6 +780,10 @@ impl ConfigNamespaceStore {
         )?;
         candidate.retain_identities(&state.current);
         let candidate = Arc::new(candidate);
+        // As in `publish_candidate`: the outgoing snapshot loses its
+        // authority just before it stops being current. A failed
+        // `validate_candidate` above returned without reaching here.
+        state.current.permit.revoke();
         state.current = Arc::clone(&candidate);
         self.updates.send_replace(Arc::clone(&candidate));
         Ok(candidate)
@@ -1208,6 +1235,10 @@ fn publish_candidate(
     }
     candidate.retain_identities(&state.current);
     let candidate = Arc::new(candidate);
+    // Immediately before the swap, and only here: an unchanged candidate
+    // returned above and a rejected one never reached this point, so
+    // neither ends the current configuration's authority.
+    state.current.permit.revoke();
     state.current = Arc::clone(&candidate);
     updates.send_replace(Arc::clone(&candidate));
     Ok(Some(candidate))
@@ -1241,6 +1272,7 @@ fn build_snapshot(
     };
     Ok(ConfigNamespaceSnapshot {
         resource_incarnation,
+        permit: CommitPermit::new(),
         generation,
         source_revision,
         config_checksum: crc32fast::hash(config_data.as_bytes()),
@@ -1278,5 +1310,101 @@ const fn max_revision(left: SourceRevision, right: SourceRevision) -> SourceRevi
         } else {
             right.etcd_revision
         },
+    }
+}
+
+#[cfg(test)]
+mod config_permit_tests {
+    use super::{ConfigNamespaceSource, ConfigNamespaceStore};
+    use std::path::Path;
+
+    fn store(policy: &str) -> ConfigNamespaceStore {
+        ConfigNamespaceStore::from_toml(
+            format!("[balance]\npolicy=\"{policy}\"").as_bytes(),
+            None,
+            Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("fixture config: {error}"))
+    }
+
+    /// Publishing a new configuration ends the previous one's authority,
+    /// and the new snapshot carries its own.
+    #[test]
+    fn a_published_configuration_revokes_the_one_it_replaces() {
+        let store = store("connection");
+        let first = store.current();
+        let permit = first.permit();
+        assert_eq!(permit.commit(|| 1), Some(1));
+
+        store
+            .apply_toml(
+                b"[balance]\npolicy=\"resource\"",
+                None,
+                2,
+                Path::new("/tmp"),
+            )
+            .unwrap_or_else(|error| unreachable!("apply: {error}"));
+
+        assert_eq!(
+            permit.commit(|| 1),
+            None,
+            "the superseded configuration authorises nothing further"
+        );
+        assert_eq!(store.current().permit().commit(|| 1), Some(1));
+    }
+
+    /// An unchanged configuration is not a publication. Revoking on one
+    /// would end the authority of a snapshot that is still current.
+    #[test]
+    fn an_unchanged_configuration_keeps_its_authority() {
+        let store = store("connection");
+        let permit = store.current().permit();
+
+        store
+            .apply_toml(
+                b"[balance]\npolicy=\"connection\"",
+                None,
+                2,
+                Path::new("/tmp"),
+            )
+            .unwrap_or_else(|error| unreachable!("apply: {error}"));
+
+        assert_eq!(
+            permit.commit(|| 1),
+            Some(1),
+            "nothing replaced this snapshot, so it still authorises"
+        );
+    }
+
+    /// A candidate rejected **before** publication leaves the current
+    /// authority in force.
+    ///
+    /// Scope, stated because the name could suggest more: this input is
+    /// refused by `validated()` in `apply_toml`, upstream of
+    /// `publish_candidate`, so it exercises the outer path only. A
+    /// rejection *inside* `publish_candidate` cannot strand the authority
+    /// for a structural reason rather than a tested one -- the revocation
+    /// is the statement immediately before the swap, with nothing between
+    /// them, so no early return can separate the two. A control that
+    /// moves the revoke above `build_snapshot` therefore does not change
+    /// this test's outcome, and I have not claimed it as coverage.
+    #[test]
+    fn a_configuration_rejected_before_publication_keeps_the_current_authority() {
+        let store = store("connection");
+        let permit = store.current().permit();
+
+        let rejected = store.apply_toml(
+            b"[balance]\npolicy=\"nonsense\"",
+            None,
+            2,
+            Path::new("/tmp"),
+        );
+        assert!(rejected.is_err(), "the fixture must actually be rejected");
+
+        assert_eq!(
+            permit.commit(|| 1),
+            Some(1),
+            "a rejected candidate leaves the configuration in force"
+        );
     }
 }
