@@ -15,10 +15,12 @@
 //! In-process ownership fencing for control responsibilities.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use thiserror::Error;
+
+use crate::permit::CommitPermit;
 
 /// Maximum byte length for owner, namespace, and cluster identifiers.
 pub const MAX_OWNER_ID_BYTES: usize = 256;
@@ -164,7 +166,7 @@ impl OwnershipRegistry {
             scope,
             owner_id,
             generation,
-            active: AtomicBool::new(true),
+            active: CommitPermit::new(),
         });
         Ok(OwnerLease { state })
     }
@@ -181,12 +183,21 @@ struct LeaseState {
     scope: OwnerScope,
     owner_id: Arc<str>,
     generation: u64,
-    active: AtomicBool,
+    /// This lease's authority.
+    ///
+    /// A `CommitPermit` rather than a flag so a holder can make an effect
+    /// that the release cannot land in the middle of. Reading
+    /// [`OwnerToken::is_current`] and then acting leaves that window open;
+    /// [`OwnerToken::permit`] is how a caller closes it.
+    active: CommitPermit,
 }
 
 impl LeaseState {
     fn release(&self) {
-        if !self.active.swap(false, Ordering::AcqRel) {
+        // Exactly one caller unregisters, as the previous `swap` decided.
+        // The permit lock is released before the registry lock is taken, so
+        // this adds no nesting to the existing order.
+        if !self.active.revoke_once() {
             return;
         }
         let Some(registry) = self.registry.upgrade() else {
@@ -260,7 +271,16 @@ impl OwnerToken {
     pub fn is_current(&self) -> bool {
         self.state
             .upgrade()
-            .is_some_and(|state| state.active.load(Ordering::Acquire))
+            .is_some_and(|state| state.active.is_valid())
+    }
+
+    /// This owner's authority, for a caller that must make an effect the
+    /// release cannot interleave with.
+    ///
+    /// `None` once the lease itself is gone, which is already terminal.
+    #[must_use]
+    pub fn permit(&self) -> Option<CommitPermit> {
+        self.state.upgrade().map(|state| state.active.clone())
     }
 
     /// Returns the owner generation while the lease is alive.
@@ -275,4 +295,35 @@ fn validate_identifier(kind: &'static str, value: String) -> Result<Arc<str>, Ow
         return Err(OwnerError::InvalidIdentifier { kind, value });
     }
     Ok(Arc::from(value))
+}
+
+#[cfg(test)]
+mod owner_permit_tests {
+    use super::{OwnerScope, OwnershipRegistry};
+
+    /// The owner's authority is now committable, not merely readable: an
+    /// effect made under it cannot be interleaved by the release, and one
+    /// attempted after the release is refused.
+    #[test]
+    fn an_effect_is_refused_once_the_lease_is_released() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let permit = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+
+        assert_eq!(permit.commit(|| 1), Some(1));
+        assert!(token.is_current());
+
+        drop(lease);
+        assert!(!token.is_current());
+        assert_eq!(
+            permit.commit(|| 1),
+            None,
+            "a released lease authorises no further effect"
+        );
+    }
 }

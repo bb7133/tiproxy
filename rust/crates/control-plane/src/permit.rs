@@ -79,6 +79,18 @@ impl CommitPermit {
         self.state.valid.store(false, Ordering::SeqCst);
     }
 
+    /// Revokes, reporting whether this call was the one that did it.
+    ///
+    /// For a revoker that must also perform a one-time teardown -- freeing
+    /// a registry entry, say -- and would otherwise need a second flag to
+    /// tell a repeat call from the first. The decision is made under the
+    /// commit lock, so exactly one caller sees `true` however many race.
+    #[must_use]
+    pub fn revoke_once(&self) -> bool {
+        let _commit = self.lock();
+        self.state.valid.swap(false, Ordering::SeqCst)
+    }
+
     /// Runs `effect` if and only if the authority is still valid, with
     /// revocation excluded for its duration. Returns `None` if refused.
     ///
@@ -103,8 +115,24 @@ impl CommitPermit {
     /// where committing under a subset would leave the rest free to be
     /// revoked mid-effect. The permits are ordered by address and
     /// deduplicated before locking, so any two callers passing overlapping
-    /// sets take them in the same order and a permit named twice is not
-    /// self-deadlocked.
+    /// sets take them in the same order and a permit named twice within
+    /// one call is not self-deadlocked.
+    ///
+    /// # Contract
+    ///
+    /// `effect` inherits [`Self::commit`]'s: short, synchronous, no await,
+    /// no I/O, and no lock a revoker takes first.
+    ///
+    /// It must also **not re-enter any permit held by this call or by an
+    /// enclosing one** — neither [`Self::commit`] nor `commit_all` is
+    /// reentrant, and a nested call naming a permit already held blocks
+    /// forever on it.
+    ///
+    /// The address ordering fixes only the locks taken *within a single
+    /// call*. It does nothing for a caller that already holds some permits
+    /// and then calls this with others: that outer scope has fixed its own
+    /// order, this one cannot see it, and the two can disagree. Acquire
+    /// every permit an effect needs in one call.
     #[must_use]
     pub fn commit_all<T>(permits: &[&Self], effect: impl FnOnce() -> T) -> Option<T> {
         let mut ordered: Vec<&Self> = permits.to_vec();
@@ -237,5 +265,37 @@ mod tests {
     #[test]
     fn commit_all_of_nothing_runs() {
         assert_eq!(CommitPermit::commit_all(&[], || 5), Some(5));
+    }
+
+    /// Exactly one caller sees the transition, however many race for it.
+    #[test]
+    fn revoke_once_reports_the_transition_to_a_single_caller() {
+        let permit = CommitPermit::new();
+        assert!(permit.revoke_once(), "the first call performed it");
+        assert!(!permit.revoke_once(), "a repeat call did not");
+        assert!(!permit.is_valid());
+
+        let permit = CommitPermit::new();
+        let winners: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let permit = permit.clone();
+                    scope.spawn(move || permit.revoke_once())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| unreachable!("revoking thread panicked"))
+                })
+                .collect()
+        });
+        assert_eq!(
+            winners.iter().filter(|won| **won).count(),
+            1,
+            "eight racing revokers, one transition"
+        );
     }
 }

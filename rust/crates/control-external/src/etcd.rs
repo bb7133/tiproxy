@@ -610,10 +610,12 @@ impl EtcdConnector {
 /// operation on a retired generation is fenced even while the process owner is
 /// still current.
 ///
-/// `Default` is hand-written to equal [`GenerationGate::new`] (a **live** gate);
-/// it is deliberately NOT derived, because a derived `Default` would build from
-/// `AtomicBool::default() == false` and be born already revoked (rejecting all
-/// I/O).
+/// `Default` is derived and gives a **live** gate, because it delegates to
+/// [`CommitPermit::default`], which is itself written to equal
+/// `CommitPermit::new`. That delegation is the contract: a permit whose
+/// `Default` ever became "already revoked" would silently make every
+/// derived gate reject all I/O, so the initial value belongs with the
+/// permit and not with a flag here.
 #[derive(Clone, Debug, Default)]
 pub struct GenerationGate {
     /// The shared authority. Built on `control-plane`'s primitive so that
