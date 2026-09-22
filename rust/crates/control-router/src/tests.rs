@@ -2431,7 +2431,36 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
             }
         };
         router.set_replay_wall(t0);
-        let first = must(router.capture());
+        // A published routing snapshot is not this fixture's precondition.
+        // `BackendSourceHandle::current` also requires a valid namespace and
+        // mode plus the health overlay published for that exact R, and
+        // `Sources::live` additionally requires the owner current and the
+        // lifecycle Ready; returning unavailable while any of those lags is
+        // designed behaviour, not a race -- production callers treat it as a
+        // retryable boundary (`RouteAdmission::subscribe_updates`,
+        // `LocalRouteChannel::next_assignment`). This test builds a Router by
+        // hand and so bypasses that retry layer, and it is about revocation
+        // refusing both metric commits, not initial availability. So wait for
+        // the real precondition. Unfixed this failed 2 of 12 whole-suite runs
+        // while passing 5 of 5 alone.
+        let mut last_error = None;
+        let Ok(first) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match router.capture() {
+                    Ok(candidate) => break candidate,
+                    Err(error) => {
+                        last_error = Some(error);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        })
+        .await
+        else {
+            // Surface why it never became available rather than a bare
+            // timeout: the last RouteError names which input was missing.
+            unreachable!("router never became capturable: {last_error:?}")
+        };
         assert!(matches!(
             first.metrics,
             crate::authority::MetricInputs::Dynamic(Some(_))
