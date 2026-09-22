@@ -9,9 +9,7 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
-	"github.com/pingcap/tiproxy/pkg/balance/router"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
-	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 )
 
 // DefaultOrphanResolveInterval paces the rehydration/orphan cadence
@@ -26,9 +24,10 @@ const DefaultSnapshotSyncInterval = 50 * time.Millisecond
 type BridgeConfig struct {
 	// Transport configures the mode-0600 control UDS owner.
 	Transport transport.ServerConfig
-	// RouteOwner installs the post-cutover residual handler. It is a
-	// compatibility assertion: this process never constructs a RouterAdapter
-	// and never falls back to Go routing after the first negotiation.
+	// RouteOwner installs the post-cutover residual handler. Since #223
+	// Phase 2 deleted the legacy RouterAdapter there is no other
+	// composition, so this must be true; it is retained as an explicit
+	// assertion rather than an implicit default.
 	RouteOwner bool
 	// NativeMeterOwner leaves durable metering entirely in Rust. Requires RouteOwner.
 	NativeMeterOwner bool
@@ -36,16 +35,6 @@ type BridgeConfig struct {
 	// starts no API server and metrics batches are retired wire bodies.
 	// Requires RouteOwner.
 	NativeAPIOwner bool
-	// Handshake is the router adapter's authentication/routing seam.
-	// It is required only for the legacy, non-RouteOwner composition.
-	Handshake backend.HandshakeHandler
-	// RouterLookup resolves a namespace to its router for
-	// rehydration; optional at construction, attachable later through
-	// the adapter.
-	RouterLookup func(namespace string) (router.Router, error)
-	// OrphanResolveInterval paces ResolveOrphans; zero uses the
-	// default.
-	OrphanResolveInterval time.Duration
 	// Publisher owns complete StateSnapshot generations. Nil keeps the
 	// bridge in the legacy Go-dataplane composition.
 	Publisher *SnapshotPublisher
@@ -118,17 +107,16 @@ var ErrInvalidDrainBudget = errors.New("drain budget is negative or exceeds the 
 var ErrSnapshotNotReady = errors.New("no applied configuration generation yet")
 
 // Bridge is the single Go composition entry for the control plane
-// (CTL-06): it owns the transport listener, the composite handler
-// (router adapter + metering consumer), and the
-// orphan-resolution and snapshot cadences. DPL-03's proxy bootstrap
-// starts it behind the explicit Rust dataplane config gate.
+// (CTL-06): it owns the transport listener, the residual composite
+// handler and the snapshot cadence. DPL-03's proxy bootstrap starts it
+// behind the explicit Rust dataplane config gate. Orphan resolution went
+// with the RouterAdapter at #223 Phase 2: there are no Go-owned route
+// sessions left to orphan.
 type Bridge struct {
 	server           *transport.Server
-	adapter          *RouterAdapter
 	handler          *CompositeControlHandler
 	routeOwner       bool
 	consumer         *MeteringConsumer
-	interval         time.Duration
 	publisher        *SnapshotPublisher
 	snapshotInterval time.Duration
 }
@@ -144,20 +132,13 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if config.NativeAPIOwner && !config.RouteOwner {
 		return nil, errors.New("native API ownership requires route owner")
 	}
-	var adapter *RouterAdapter
-	var err error
+	// #223 Phase 2 deleted the legacy RouterAdapter, so a non-route-owner
+	// composition no longer exists. Refusing here keeps the impossibility
+	// explicit instead of silently building a bridge that cannot route.
 	if !config.RouteOwner {
-		if config.Handshake == nil {
-			return nil, errors.New("bridge requires a handshake handler")
-		}
-		adapter, err = NewRouterAdapter(config.Handshake)
-		if err != nil {
-			return nil, err
-		}
-		if config.RouterLookup != nil {
-			adapter.AttachRouterLookup(config.RouterLookup)
-		}
+		return nil, errors.New("bridge requires route owner: the legacy Go routing composition was removed")
 	}
+	var err error
 	var consumer *MeteringConsumer
 	if !config.NativeMeterOwner {
 		consumer = NewMeteringConsumer()
@@ -171,10 +152,8 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	var composite *CompositeControlHandler
 	if config.NativeMeterOwner {
 		composite, err = NewNativeMeterOwnerControlHandler()
-	} else if config.RouteOwner {
-		composite, err = NewRouteOwnerControlHandler(consumer)
 	} else {
-		composite, err = NewCompositeControlHandler(adapter, consumer)
+		composite, err = NewRouteOwnerControlHandler(consumer)
 	}
 	if err != nil {
 		return nil, err
@@ -187,35 +166,21 @@ func NewBridge(config BridgeConfig) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	interval := config.OrphanResolveInterval
-	if interval <= 0 {
-		interval = DefaultOrphanResolveInterval
-	}
 	snapshotInterval := config.SnapshotSyncInterval
 	if snapshotInterval <= 0 {
 		snapshotInterval = DefaultSnapshotSyncInterval
 	}
 	return &Bridge{
 		server:           server,
-		adapter:          adapter,
 		handler:          composite,
 		routeOwner:       config.RouteOwner,
 		consumer:         consumer,
-		interval:         interval,
 		publisher:        config.Publisher,
 		snapshotInterval: snapshotInterval,
 	}, nil
 }
 
-// Adapter exposes the router adapter (bootstrap attaches the namespace
-// router lookup here when it comes up after the bridge).
-func (bridge *Bridge) Adapter() *RouterAdapter {
-	return bridge.adapter
-}
-
-// RouteOwnerStatus exposes the residual handler's zero-route evidence. The
-// boolean is false for legacy compositions, where RouterAdapter intentionally
-// remains live.
+// RouteOwnerStatus exposes the residual handler's zero-route evidence.
 func (bridge *Bridge) RouteOwnerStatus() (RouteOwnerStatus, bool) {
 	if !bridge.routeOwner || bridge.handler == nil {
 		return RouteOwnerStatus{}, false
@@ -248,32 +213,24 @@ func (bridge *Bridge) Status() SnapshotStatus {
 	return status
 }
 
-// Run serves the control socket and drives the orphan-resolution
-// cadence until ctx cancels or Close is called; it returns the serve
-// result after the cadence worker has stopped.
+// Run serves the control socket and drives the snapshot cadence until
+// ctx cancels or Close is called; it returns the serve result after the
+// cadence worker has stopped.
+//
+// The orphan-resolution cadence went with the RouterAdapter at #223
+// Phase 2. Orphans were Go-owned route sessions whose Rust peer had gone;
+// a route owner has none, because it owns no route sessions.
 func (bridge *Bridge) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var cadence waitgroup.WaitGroup
 	cadence.Run(func() {
-		var orphanTicker *time.Ticker
-		var orphanTick <-chan time.Time
-		if bridge.adapter != nil {
-			orphanTicker = time.NewTicker(bridge.interval)
-			orphanTick = orphanTicker.C
-			defer orphanTicker.Stop()
-		}
 		snapshotTicker := time.NewTicker(bridge.snapshotInterval)
 		defer snapshotTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-orphanTick:
-				// Bounded-retry convergence: unresolvable orphans end
-				// in a per-connection close; send errors keep the
-				// obligation for the next tick.
-				_ = bridge.adapter.ResolveOrphans(ctx)
 			case <-snapshotTicker.C:
 				if bridge.publisher != nil {
 					// A topology change (namespace commit, backend

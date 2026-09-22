@@ -304,17 +304,22 @@ the real-TiDB migration phase:
   dial, one snapshot, one restore, zero stale-target I/O, and that every later
   user command reaches only the new owner. Final CLOSED accounting still
   includes the retired old socket and current socket exactly once.
-- `TestRouterAdapterWithFakeRustUDSPeer` crosses the real framed Unix socket and
-  proves generation/sequence propagation plus exactly one Go callback for
-  duplicated success, failure, and CLOSED terminals. A failure leaves the
-  projected server address and connection count on the successful owner.
-- `TestRedirectFailureBalancesExactRouteAccounting` uses the production
-  `ScoreBasedRouter` health/rebalance loop. It observes the real old-to-target
-  pending gauge rise, feeds the exact failed Rust terminal, and requires the
-  gauge to return to its prior baseline once; replay cannot decrement it twice.
+- The Go `TestRouterAdapterWithFakeRustUDSPeer` framed-Unix-socket test was
+  deleted at #223 Phase 2 together with `router_adapter.go`; the Rust side of
+  that seam is still covered by the dataplane integration suite.
+- `TestRedirectFailureBalancesExactRouteAccounting` was deleted at #223
+  Phase 2 with `router_adapter.go`. It drove the production
+  `ScoreBasedRouter` health/rebalance loop, fed the exact failed Rust
+  terminal, and required the pending gauge to return to its prior baseline
+  once. That is **frozen Go-adapter qualification**, not current evidence:
+  no Rust terminal feeds a Go router any more. Re-establishing the
+  pending-gauge once-and-only-once property natively is CP-ADMIN slice 5d,
+  which is **not in this tree** -- see MTR-004.
 
 Together these rows make the live A0 -> A1 result a single-owner atomic swap
-with generation-safe, idempotent control effects and balanced Go accounting.
+with generation-safe, idempotent control effects. The balanced Go-side
+accounting that sentence used to claim is old-bridge history: #223 Phase 2
+retired the route family, so no Rust terminal reaches a Go router.
 
 ## Control-frame dropper (chaos-E2E control-loss)
 

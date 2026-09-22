@@ -82,14 +82,17 @@ cmp "$tmp_dir/go-groups.tsv" "$tmp_dir/rust-groups.tsv"
 python3 tests/controlplane/cproute/groups/mutations.py "$tmp_dir/go-groups.tsv"
 echo "CP-ROUTE group matching and port-conflict evidence passed"
 
-CPROUTE_LEDGER_FIXTURE="$repo_root/tests/controlplane/cproute/ledger/events.tsv" \
-CPROUTE_LEDGER_OUTPUT="$tmp_dir/go-ledger.tsv" \
-    go test ./pkg/controlbridge -run '^TestCPRouteLedgerObservation$' -count=1
+# The Go half of this comparison ran the legacy controlbridge RouterAdapter,
+# deleted at #223 Phase 2 along with the rest of the pre-cutover route path.
+# `ledger/expected.tsv` is that adapter's captured output, frozen at its last
+# live run and rechecked here on every run -- the same treatment
+# `balance/arrival.expected.tsv` already gets. Rust must still reproduce Go's
+# reservation accounting exactly; what is gone is Go's ability to recompute it.
 CPROUTE_LEDGER_FIXTURE="$repo_root/tests/controlplane/cproute/ledger/events.tsv" \
 CPROUTE_LEDGER_OUTPUT="$tmp_dir/rust-ledger.tsv" \
     cargo test --locked --quiet --manifest-path rust/Cargo.toml -p control-router \
         ledger::tests::shared_go_ledger_observation -- --exact
-cmp "$tmp_dir/go-ledger.tsv" "$tmp_dir/rust-ledger.tsv"
+cmp tests/controlplane/cproute/ledger/expected.tsv "$tmp_dir/rust-ledger.tsv"
 echo "CP-ROUTE reservation accounting evidence passed"
 
 # Inject deterministic ticks into a temporary copy of the actual Go selector.

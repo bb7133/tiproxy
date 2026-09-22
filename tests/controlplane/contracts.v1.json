@@ -229,12 +229,11 @@
       "id": "CP-ROUTE-001",
       "family": "routing",
       "summary": "Backend selection, retry exclusion, health, locality, keyspace, redirect, and exact route accounting match Go decisions.",
-      "go_owner": "pkg/balance/router and pkg/controlbridge/router_adapter.go",
+      "go_owner": "pkg/balance/router (pkg/controlbridge/router_adapter.go was deleted at #223 Phase 2)",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/router_adapter_test.go", "contains": "func TestRouterAdapterRetryAndExactlyOnceLifecycle"},
         {"path": "pkg/balance/router/router_score_test.go", "contains": "func TestNoBackends"},
         {"path": "pkg/balance/router/group_test.go", "contains": "func TestCrossKeyspaceFailoverRefusesRedirect"}
       ],
@@ -246,17 +245,17 @@
     {
       "id": "CP-ROUTE-002",
       "family": "routing",
-      "summary": "Namespace and keyspace matching, listener routing, conflict rejection, and dynamic change retain existing-session semantics.",
-      "go_owner": "pkg/manager/namespace, pkg/controlbridge, and pkg/balance/router",
+      "summary": "Namespace and keyspace matching, listener routing and conflict rejection. Existing-session retention is covered only for topology change (a keyspace-changing failover refuses to migrate established sessions). FROZEN HISTORY: handshake-time dynamic namespace change and the client-visible rejection-message allowlist were qualified by pkg/controlbridge/namespace_parity_test.go, deleted at #223 Phase 2. Current Rust cover, and its limits: namespace resolution by control-router::namespace::tests; dynamic retention by control-router tests.rs::route_plane_replaces_admission_but_retains_an_existing_selector, which runs a real RoutePlane, publishes a same-name namespace replacement and proves the old selector still reserves/finishes while new admissions bind a different router -- but it asserts nothing about old/new keyspace backend groups, so it does not reproduce the deleted test in full. The rejection text has no Rust assertion at all (task #111).",
+      "go_owner": "pkg/manager/namespace and pkg/balance/router (the pkg/controlbridge handshake-time half was deleted at #223 Phase 2)",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestNamespaceParityAcrossModes"},
-        {"path": "pkg/controlbridge/namespace_parity_test.go", "contains": "func TestDynamicNamespaceChangeKeepsExistingSession"},
+        {"path": "pkg/balance/router/cproute_group_evidence_test.go", "contains": "func TestCPRouteGroupObservation"},
+        {"path": "pkg/balance/router/group_test.go", "contains": "func TestCrossKeyspaceFailoverRefusesRedirect"},
         {"path": "pkg/balance/router/router_test.go", "contains": "func TestBackendKeyspacePrefersPathParsedOverLabel"}
       ],
-      "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state", "rejection_code"],
+      "observed_fields": ["namespace", "keyspace", "listener_address", "backend_cluster", "existing_session_state"],
       "fault_scenarios": ["CP-FAULT-NAMESPACE-CHANGE"],
       "bridge_messages": ["handshake_response", "handshake_decision", "handshake_result", "state_snapshot", "snapshot_result"],
       "handoff": "#146 owns namespace persistence, canonical identity, TLS validation, and immutable source generations only. #147 owns keyspace discovery input, listener/user/backend binding, conflict rejection, and immutable per-session routing."
@@ -264,17 +263,17 @@
     {
       "id": "CP-ROUTE-003",
       "family": "routing",
-      "summary": "Connection lifecycle, reconciliation, redirect watermarks, orphan closure, and generation reuse converge exactly once after either process restarts.",
-      "go_owner": "pkg/controlbridge/router_adapter.go and pkg/controlbridge/reconcile_rehydrate_test.go",
+      "summary": "Go-router re-attachment and terminal accounting converge exactly once: RehydrateConn restores an established connection as a successful assignment without re-running selection, and terminals retire it once. FROZEN HISTORY, not covered by the anchors below: cross-process restart, orphan closure, and bridge-protocol generation reuse. Those were qualified by the pkg/controlbridge adapter and its reconcile tests, deleted at #223 Phase 2; RehydrateConn now has no production caller and survives as a test-exercised reference implementation. The current Rust-owner path is the residual one: ControlCommandHandler::build_reconcile_request takes its route_owner branch into CommandGate::build_residual_reconcile_request, which sends no connections, evidenced by route_owner_reconcile_rejects_route_state_and_accepts_residual_ack. It is deliberately NOT the full legacy build_reconcile_request / apply_reconcile_snapshot gate path, which carried connection identity and no longer runs. See ADM-003.",
+      "go_owner": "pkg/balance/router (AssignmentRehydrator: RehydrateConn/LookupBackend on Group, ScoreBasedRouter, StaticRouter); #223 Phase 2 deleted the pkg/controlbridge half",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestGoRestartRehydratesAccountingAndClosesExactlyOnce"},
-        {"path": "pkg/controlbridge/reconcile_rehydrate_test.go", "contains": "func TestReconcileConvergesReusedIdAcrossGenerations"},
-        {"path": "pkg/controlbridge/redirect_lifecycle_integration_test.go", "contains": "func TestRedirectFailureBalancesExactRouteAccounting"}
+        {"path": "pkg/balance/router/cproute_arrival_evidence_test.go", "contains": "func TestCPRouteArrivalObservation"},
+        {"path": "pkg/balance/router/api_differential_test.go", "contains": "func TestRouterAPIDifferential"},
+        {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerRejectsNonemptyResidualReconcile"}
       ],
-      "observed_fields": ["connection_id", "generation", "command_sequence", "pending_redirect_id", "terminal_count", "route_count"],
+      "observed_fields": ["connection_id", "terminal_count", "route_count"],
       "fault_scenarios": ["CP-FAULT-BRIDGE-RECONNECT", "CP-FAULT-PROCESS-DEATH"],
       "bridge_messages": ["connection_event", "redirect_command", "redirect_result", "reconcile_request", "reconcile_snapshot", "close_command", "close_result"],
       "handoff": "Collapse reconciliation into direct Rust state ownership only after restart and duplicate-event traces are differential-green."
