@@ -1,0 +1,21 @@
+# Generated for the TiProxy dataplane integration topology. Do not use in production.
+
+[security]
+ssl-ca = ""
+ssl-cert = ""
+ssl-key = ""
+tls-version = "TLSv1.2"
+[REDACTED AUTHENTICATION MATERIAL]
+# support_redirection=false and the router never balances - the
+# keyspace-guard phase would be fake pressure. The same pair is shared
+# by all backends across BOTH clusters.
+[REDACTED AUTHENTICATION MATERIAL]
+[REDACTED AUTHENTICATION MATERIAL]
+
+[proxy-protocol]
+networks = ""
+fallbackable = true
+
+[labels]
+tiproxy-port = "17301"
+keyspace = "ks-new"

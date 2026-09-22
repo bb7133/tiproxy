@@ -97,11 +97,19 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 #[derive(Default)]
-struct RouteLedgerDiagnostics(Mutex<Vec<Weak<Router>>>);
+struct RouteLedgerDiagnostics {
+    routers: Mutex<Vec<Weak<Router>>>,
+    /// Held directly rather than reached through a router. Cumulative history
+    /// must be readable when no incarnation is alive at all; going through a
+    /// live router would make every counter vanish the moment the last one
+    /// is dropped, which is the same disappearance the process-level store
+    /// exists to prevent.
+    history: Arc<crate::MigrationHistory>,
+}
 
 impl RouteLedgerDiagnostics {
     fn register(&self, router: &Arc<Router>) {
-        self.0
+        self.routers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Arc::downgrade(router));
@@ -112,7 +120,7 @@ impl RouteLedgerDiagnostics {
         // are acquired afterwards, so diagnostics cannot invert registry or
         // route-ledger lock order.
         let routers = {
-            let mut registered = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut registered = self.routers.lock().unwrap_or_else(PoisonError::into_inner);
             let mut live = Vec::with_capacity(registered.len());
             registered.retain(|weak| {
                 if let Some(router) = weak.upgrade() {
@@ -130,6 +138,88 @@ impl RouteLedgerDiagnostics {
         }
         evidence
     }
+
+    /// The migration state of every router this plane has created, summed per
+    /// label set.
+    ///
+    /// Enumerating the plane's current routing table would be wrong: a router
+    /// retired by configuration can still own sessions with unsettled
+    /// migrations, and those are still pending. A weak reference is the right
+    /// test — an incarnation contributes for exactly as long as something
+    /// still holds it, and drops out only once nothing does.
+    ///
+    /// Summing matters as much as enumerating. Several namespaces, or a
+    /// retained incarnation beside its successor, can migrate between the same
+    /// backends for the same reason; they share one label set and must add up
+    /// rather than overwrite one another.
+    fn migration_snapshot(&self) -> MigrationSnapshot {
+        // Same discipline as `snapshot`: upgrade and prune under the weak-list
+        // lock alone, then take router locks one at a time, and never while a
+        // metrics-registry lock is held.
+        let routers = {
+            let mut registered = self.routers.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut live = Vec::with_capacity(registered.len());
+            registered.retain(|weak| {
+                if let Some(router) = weak.upgrade() {
+                    live.push(router);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        let mut snapshot = MigrationSnapshot {
+            // Read directly, so the cumulative series survive even when no
+            // incarnation is alive.
+            history: self.history.snapshot(),
+            pending: BTreeMap::new(),
+            backend_connections: BTreeMap::new(),
+        };
+        // Every address ever seen reports, so one that has dropped to no
+        // connections shows zero instead of vanishing, as Go's child does.
+        // Admission already happened against the shared set, so this adds no
+        // second ceiling.
+        for address in &snapshot.history.known_backends {
+            snapshot.backend_connections.insert(address.clone(), 0);
+        }
+        for router in routers {
+            // No ceiling of its own on purpose. Every ledger only tracks
+            // label sets the shared history retained, so this union is a
+            // subset of that set and is bounded by it. A second independent
+            // ceiling here would be free to keep a different arbitrary 4096
+            // and drop a set the history is still exposing.
+            for (labels, pending) in router.pending_migrations() {
+                let entry = snapshot.pending.entry(labels).or_default();
+                *entry = entry.saturating_add(pending);
+            }
+            // Go writes this gauge with Set from one namespace's router, so
+            // two namespaces sharing a backend address overwrite each other
+            // and the last writer decides. Summing instead makes the address
+            // label mean what it says: how many connections this process
+            // holds to that backend. The difference is declared in the parity
+            // manifest rather than hidden.
+            for (address, active) in router.physical_connections() {
+                let entry = snapshot.backend_connections.entry(address).or_default();
+                *entry = entry.saturating_add(active);
+            }
+        }
+        snapshot
+    }
+}
+
+/// Migration state for the exposition: in-flight counts summed over every
+/// router incarnation still held anywhere, plus the process-level cumulative
+/// history that outlives all of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationSnapshot {
+    /// In-flight migrations per label set, summed across incarnations.
+    pub pending: BTreeMap<crate::MigrationLabels, u64>,
+    /// Physically owned connections per backend address, summed across
+    /// incarnations including retired ones that still hold sessions.
+    pub backend_connections: BTreeMap<String, u64>,
+    /// Cumulative terminals and durations, plus every label set ever seen.
+    pub history: crate::MigrationHistorySnapshot,
 }
 
 /// A newly admitted connection bound to one exact router incarnation.
@@ -216,9 +306,23 @@ pub struct RoutePlaneHandle {
     registry: Arc<Mutex<RegistryState>>,
     input_diagnostics: Arc<RouteInputDiagnostics>,
     ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
+    score_history: Arc<crate::ScoreHistory>,
+    backend_metrics: Arc<crate::BackendMetricHistory>,
 }
 
 impl RoutePlaneHandle {
+    /// The retained `b_score` values, for the exposition.
+    #[must_use]
+    pub fn score_history(&self) -> Arc<crate::ScoreHistory> {
+        Arc::clone(&self.score_history)
+    }
+
+    /// The retained `backend_metric` observations, for the exposition.
+    #[must_use]
+    pub fn backend_metrics(&self) -> Arc<crate::BackendMetricHistory> {
+        Arc::clone(&self.backend_metrics)
+    }
+
     /// Resolves once every namespace in the initial committed configuration has
     /// an exact router and retained topology-source lease in the registry.
     ///
@@ -342,6 +446,16 @@ impl RoutePlaneHandle {
         self.ledger_diagnostics.snapshot()
     }
 
+    /// Migration state summed across current and retained router
+    /// incarnations, for the exposition to read at scrape time.
+    ///
+    /// Must be called with no metrics-registry lock held; it takes router
+    /// locks, and the settlement path already runs router lock then registry.
+    #[must_use]
+    pub fn migration_snapshot(&self) -> MigrationSnapshot {
+        self.ledger_diagnostics.migration_snapshot()
+    }
+
     /// Go `namespaceManager.RedirectConnections`: every current router offers
     /// each of its non-pending active sessions a redirect to its own backend
     /// through the production migration queue. Refused offers are not
@@ -390,10 +504,30 @@ pub struct RoutePlane {
     registry: Arc<Mutex<RegistryState>>,
     input_diagnostics: Arc<RouteInputDiagnostics>,
     ledger_diagnostics: Arc<RouteLedgerDiagnostics>,
+    /// Installed on every router this plane creates, including incarnations
+    /// created later, so a migration cannot go unpublished because its router
+    /// was built after the exporter started.
+    migrations: Option<Arc<dyn crate::selector::MigrationSink>>,
+    /// Cumulative migration history shared by every router this plane builds,
+    /// so a destroyed incarnation cannot take its history with it.
+    migration_history: Arc<crate::MigrationHistory>,
+    /// Retained per-factor scores, shared by every router this plane builds.
+    score_history: Arc<crate::ScoreHistory>,
+    /// Retained raw backend observations, likewise shared.
+    backend_metrics: Arc<crate::BackendMetricHistory>,
+    /// The configuration generation whose adoption last cleared `b_score`.
+    applied_score_generation: Option<u64>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
 impl RoutePlane {
+    /// Installs the sink that receives migration observations from every
+    /// router this plane owns. Call before `run`, so no incarnation is built
+    /// without it.
+    pub fn set_migration_sink(&mut self, sink: Arc<dyn crate::selector::MigrationSink>) {
+        self.migrations = Some(sink);
+    }
+
     /// Creates the route-plane module and its readiness/admission handle.
     #[must_use]
     pub fn new(
@@ -405,7 +539,30 @@ impl RoutePlane {
         let (updates, updates_rx) = watch::channel(0);
         let registry = Arc::new(Mutex::new(RegistryState::default()));
         let input_diagnostics = Arc::new(RouteInputDiagnostics::default());
-        let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics::default());
+        let migration_history = Arc::new(crate::MigrationHistory::default());
+        let score_history = Arc::new(crate::ScoreHistory::new());
+        let backend_metrics = Arc::new(crate::BackendMetricHistory::new());
+        let ledger_diagnostics = Arc::new(RouteLedgerDiagnostics {
+            routers: Mutex::new(Vec::new()),
+            history: Arc::clone(&migration_history),
+        });
+        // Go's `DelBackend` deletes b_conn and the migration series together
+        // with the health ones, and the health child owns the retention
+        // clock, so this history registers as one of its targets. Done here
+        // rather than at the composition root because the plane is where the
+        // history is created and where the topology handle already is.
+        let retirement = topology.backend_retirement();
+        retirement.register(
+            Arc::clone(&migration_history) as Arc<dyn control_topology::BackendRetirementSink>
+        );
+        // `b_score` is keyed by backend address too, so Go's `DelBackend`
+        // takes it with the rest.
+        retirement.register(
+            Arc::clone(&score_history) as Arc<dyn control_topology::BackendRetirementSink>
+        );
+        retirement.register(
+            Arc::clone(&backend_metrics) as Arc<dyn control_topology::BackendRetirementSink>
+        );
         let resolver = UserNamespaceResolver::new(Arc::clone(&source));
         (
             Self {
@@ -416,10 +573,17 @@ impl RoutePlane {
                 updates,
                 registry: Arc::clone(&registry),
                 input_diagnostics: Arc::clone(&input_diagnostics),
+                migrations: None,
+                migration_history: Arc::clone(&migration_history),
+                score_history: Arc::clone(&score_history),
+                backend_metrics: Arc::clone(&backend_metrics),
+                applied_score_generation: None,
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
             RoutePlaneHandle {
+                score_history: Arc::clone(&score_history),
+                backend_metrics: Arc::clone(&backend_metrics),
                 ready: ready_rx,
                 updates: updates_rx,
                 source,
@@ -436,6 +600,20 @@ impl RoutePlane {
         snapshot: &Arc<ConfigNamespaceSnapshot>,
         context: &ModuleContext,
     ) -> Result<(), RouteError> {
+        // Go `FactorBasedBalance.SetConfig` → `setFactors` →
+        // `BackendScoreGauge.Reset()`: the family is cleared when the
+        // configuration is applied, not when something next scores. A
+        // proxy that adopts a new generation and then sits idle must not
+        // keep showing scores computed under the old one.
+        //
+        // Owned here rather than by the routers because this is the config
+        // boundary, and because a router that also reset would wipe the
+        // scores written between this reconcile and its own first sight of
+        // the generation.
+        if self.applied_score_generation != Some(snapshot.generation()) {
+            self.applied_score_generation = Some(snapshot.generation());
+            self.score_history.reset();
+        }
         let configured_max_sessions = snapshot
             .effective()
             .serving()
@@ -473,8 +651,16 @@ impl RoutePlane {
                 &resolved,
                 max_sessions,
                 self.metrics.clone(),
-                Arc::clone(&self.input_diagnostics),
+                crate::selector::RouterShared {
+                    scores: Arc::clone(&self.score_history),
+                    backend_metrics: Arc::clone(&self.backend_metrics),
+                    input_diagnostics: Arc::clone(&self.input_diagnostics),
+                    history: Arc::clone(&self.migration_history),
+                },
             )?);
+            if let Some(sink) = self.migrations.clone() {
+                router.set_migration_sink(sink);
+            }
             self.ledger_diagnostics.register(&router);
             let dispatcher = RouteCommandDispatcher::new(Arc::clone(&router));
             let (stop_worker, stop) = watch::channel(false);

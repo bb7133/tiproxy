@@ -61,6 +61,7 @@ fn shared_go_physical_arrival_order() {
                     owner,
                     assignment(fields[3]),
                     now,
+                    RedirectReason::Balance(Factor::Connection),
                 ));
                 ledger.admit_redirect(op.clone(), fields[1] == "admit", now);
                 if fields[1] == "admit" {
@@ -79,7 +80,7 @@ fn shared_go_physical_arrival_order() {
                 );
             }
             "close" => {
-                assert_eq!(ledger.close(&sessions[&id]), Settlement::Applied);
+                assert_eq!(ledger.close(&sessions[&id], now), Settlement::Applied);
             }
             _ => unreachable!("arrival action"),
         }

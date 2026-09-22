@@ -18,6 +18,7 @@ use super::{
     Arc, Duration, GenerationGate, MetricCapture, Mutex, PoisonError, Shared, service, watch,
 };
 use crate::metric_owner::{PeerSet, election_name};
+use crate::owner_metrics::ElectionOwnerHistory;
 use control_etcd::{ElectionAuthority, ElectionConfig, ElectionSession, ElectionState};
 use control_external::IoFence;
 
@@ -177,8 +178,17 @@ impl OwnerWorker {
         let (current, receiver) = watch::channel(None);
         let active = Arc::clone(&scope);
         let scoped_zone = zone.clone();
+        let owner_history = shared.owner_history();
         let task = tokio::spawn(async move {
-            Box::pin(run(active, cluster, scoped_zone, stop, current)).await;
+            Box::pin(run(
+                active,
+                cluster,
+                scoped_zone,
+                stop,
+                current,
+                owner_history,
+            ))
+            .await;
         });
         Self {
             scope,
@@ -245,6 +255,7 @@ async fn run(
     zone: String,
     mut stop: watch::Receiver<bool>,
     current: watch::Sender<Option<Arc<LocalOwner>>>,
+    owner_history: Option<Arc<ElectionOwnerHistory>>,
 ) {
     let _guard = ScopeGuard(Arc::clone(&scope));
     let address = scope.serving.address.to_string();
@@ -254,8 +265,10 @@ async fn run(
         service::encode_query(&cluster),
         service::encode_query(&zone)
     );
-    let Ok(config) = ElectionConfig::new(election_name(&cluster, &zone), address, presence, 15)
-    else {
+    // Kept alongside the config because `ElectionConfig` does not expose the
+    // name back, and this is the exact key `server_owner` labels with.
+    let election_key = election_name(&cluster, &zone);
+    let Ok(config) = ElectionConfig::new(election_key.clone(), address, presence, 15) else {
         return;
     };
     while scope.is_live() && !*stop.borrow() {
@@ -274,11 +287,46 @@ async fn run(
         }
         let local = LocalOwner::from_session(&session);
         current.send_replace(Some(local));
+        // Go `onElected`. The key is the one this worker campaigned on, so
+        // the label is its own election rather than anything derived at the
+        // exposition.
+        //
+        // The matching `onRetired` is a guard, not a statement after the
+        // await: this task is torn down with `abort()`, which drops the
+        // future at its next suspension point and would skip any line that
+        // followed. A `server_owner` series left behind by an aborted worker
+        // would claim an election this process no longer holds.
+        let owned = owner_history
+            .as_ref()
+            .map(|history| OwnedElection::won(Arc::clone(history), election_key.clone()));
         Box::pin(maintain(&mut session, &scope, &mut stop)).await;
+        drop(owned);
         current.send_replace(None);
         let _ = session.shutdown().await;
     }
 }
+/// Holds `server_owner` for one election, releasing it on drop.
+///
+/// Drop runs when the task is aborted as well as when the loop exits
+/// normally, which a trailing statement would not.
+struct OwnedElection {
+    history: Arc<ElectionOwnerHistory>,
+    key: String,
+}
+
+impl OwnedElection {
+    fn won(history: Arc<ElectionOwnerHistory>, key: String) -> Self {
+        history.won(&key);
+        Self { history, key }
+    }
+}
+
+impl Drop for OwnedElection {
+    fn drop(&mut self) {
+        self.history.retired(&self.key);
+    }
+}
+
 async fn maintain(session: &mut ElectionSession, scope: &Scope, stop: &mut watch::Receiver<bool>) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -300,5 +348,53 @@ async fn maintain(session: &mut ElectionSession, scope: &Scope, stop: &mut watch
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "/tiproxy/metric_reader/owner";
+
+    /// The worker is torn down with `abort()`, which drops the future at its
+    /// next suspension point. A retirement written as a statement after the
+    /// await would never run, leaving `server_owner` claiming an election
+    /// this process no longer holds.
+    #[tokio::test]
+    async fn aborting_the_worker_still_retires_its_election() {
+        let history = Arc::new(ElectionOwnerHistory::new());
+        let (started, mut observe) = watch::channel(false);
+        let owned = Arc::clone(&history);
+        let task = tokio::spawn(async move {
+            let _election = OwnedElection::won(owned, KEY.to_owned());
+            started.send_replace(true);
+            // Park forever: the only way out is the abort.
+            std::future::pending::<()>().await;
+        });
+        let _ = observe.wait_for(|started| *started).await;
+        assert_eq!(
+            history.snapshot().owned.len(),
+            1,
+            "the election is held while the worker runs"
+        );
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            history.snapshot().owned.is_empty(),
+            "an aborted worker releases its election"
+        );
+    }
+
+    /// The ordinary exit releases it too, through the same guard.
+    #[tokio::test]
+    async fn a_normal_exit_retires_its_election() {
+        let history = Arc::new(ElectionOwnerHistory::new());
+        {
+            let _election = OwnedElection::won(Arc::clone(&history), KEY.to_owned());
+            assert_eq!(history.snapshot().owned.len(), 1);
+        }
+        assert!(history.snapshot().owned.is_empty());
     }
 }

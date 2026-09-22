@@ -15,13 +15,16 @@
 //! Stateful, process-local routing and exact reservation accounting.
 
 mod authority;
+mod backend_metric_history;
 mod factors;
 mod ledger;
+mod migration_history;
 mod namespace;
 mod plane;
 mod policy;
 mod retry;
 mod scheduler;
+mod score_history;
 mod selector;
 mod simulation;
 
@@ -29,12 +32,16 @@ mod simulation;
 pub mod shadow;
 
 pub use authority::{Candidate, RouteError, Unsupported};
-pub use factors::{BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore};
+pub use factors::{
+    BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore, RedirectReason,
+};
 pub use ledger::{
     Accounting, ForceClose, Redirect, Reservation, RouteLedgerEvidence, Session, Settlement,
 };
 pub use namespace::{ResolvedNamespace, RouteCandidateValidator, UserNamespaceResolver};
-pub use plane::{RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle};
+pub use plane::{
+    MigrationSnapshot, RouteAdmission, RouteInputEvidence, RoutePlane, RoutePlaneHandle,
+};
 
 /// Outcome of one management redirect sweep (Go `RedirectConnections`):
 /// counts only, no authority.
@@ -56,8 +63,15 @@ impl RedirectAllSummary {
         self.accepted += other.accepted;
     }
 }
+pub use backend_metric_history::{BackendMetric, BackendMetricHistory, BackendMetricSnapshot};
+pub use ledger::{MigrationLabels, MigrationObservation, MigrationOutcome, MigrationTotals};
+pub use migration_history::{
+    DurationKey, DurationSeries, MAX_RETAINED_LABEL_SETS, MIGRATE_DURATION_BUCKETS,
+    MigrationHistory, MigrationHistorySnapshot, TerminalKey,
+};
 pub use retry::Selector;
-pub use selector::Router;
+pub use score_history::{SCORE_METRIC_INTERVAL, ScoreHistory, ScoreSnapshot};
+pub use selector::{MigrationSink, Router};
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
 #[cfg(test)]

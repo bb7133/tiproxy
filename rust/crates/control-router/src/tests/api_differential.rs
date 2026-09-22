@@ -439,6 +439,7 @@ async fn replay() -> TestResult {
                         BackendHealth {
                             healthy: b["healthy"].as_bool().unwrap_or(true),
                             local: b["local"].as_bool().unwrap_or(true),
+                            sql_dial: None,
                             server_version: Some(text(b, "server_version").into()),
                         },
                     );

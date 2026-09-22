@@ -44,6 +44,7 @@ mod discovery_publish;
 // generation-fenced overlay surfaced through the module handle).
 mod health_config;
 mod health_feed;
+mod health_history;
 mod health_loop;
 mod health_overlay;
 mod merge;
@@ -53,6 +54,7 @@ mod metric_source;
 pub mod metrics;
 mod model;
 mod module;
+mod owner_metrics;
 mod register;
 mod registrar;
 mod resolver;
@@ -63,6 +65,10 @@ pub use backend_health::{BackendHealth, ClusterHealthNetwork};
 pub use discovery::{PrometheusError, poll_prometheus, poll_tidb_topology};
 pub use discovery_publish::{DiscoveryCapture, DiscoveryError, DiscoveryHandle, EpochResult};
 pub use health_config::HealthConfigError;
+pub use health_history::{
+    BACKEND_METRIC_RETENTION, BackendHealthHistory, BackendRetirement, BackendRetirementSink,
+    HealthMetricsSnapshot, MAX_RETAINED_BACKENDS, ObserverHealthMetrics, PingSample,
+};
 pub use health_overlay::{HealthOverlayHandle, HealthSnapshot, ObserverError};
 pub use merge::{
     ClusterTopologyFetch, MergedBackend, MergedTopology, TopologyUnavailable, merge_tidb_topology,
@@ -79,6 +85,9 @@ pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topolo
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
     TopologyModuleHandle, TopologyStatus, TopologyUpdateObserver,
+};
+pub use owner_metrics::{
+    ElectionOwnerHistory, MAX_RETAINED_ELECTIONS, OwnerSnapshot, election_label,
 };
 pub use register::{
     TIPROXY_TOPOLOGY_PATH, TOPOLOGY_REFRESH_INTERVAL_SECS, TOPOLOGY_SESSION_TTL_SECS, TopologyInfo,

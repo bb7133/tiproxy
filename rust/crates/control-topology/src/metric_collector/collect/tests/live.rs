@@ -684,3 +684,58 @@ async fn collector_real_immediate_first_round() -> Result<(), TestError> {
     println!("CP-METRIC-COLLECTOR immediate first round passed");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires reviewer-owned embedded etcd CP003_CONNECTION_FILE"]
+async fn review_real_won_worker_drop_retires_series() -> Result<(), TestError> {
+    let (direct, _, _) = live_endpoints()?;
+    let fixture = Fixture::new(&direct).await?;
+    let capture = fixture.capture()?;
+    let (collector, overlay) = fixture.bound().await?;
+    let history = Arc::new(crate::ElectionOwnerHistory::new());
+    overlay.set_owner_history(Arc::clone(&history));
+    let (_stop, receiver) = watch::channel(false);
+    let worker = owner::OwnerWorker::start(
+        &collector.shared,
+        capture,
+        "collector-fixture".to_owned(),
+        String::new(),
+        receiver,
+    );
+    let local = owner_ready(&worker).await?;
+    let expected = crate::owner_metrics::election_label(&crate::metric_owner::election_name(
+        "collector-fixture",
+        "",
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !history.snapshot().owned.contains(&expected) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert!(
+        local.authority.retains_local_ownership(),
+        "real campaign must hold authority"
+    );
+    println!("real campaign won: {:?}", history.snapshot().owned);
+    let role = worker.capture_role();
+    drop(worker);
+    // The task's watch sender closes when the production run future is destroyed.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while role.is_live() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert!(
+        !local.authority.retains_local_ownership(),
+        "cancellation retires real authority"
+    );
+    let remaining = history.snapshot().owned;
+    println!("after actual OwnerWorker::Drop cancellation: {remaining:?}");
+    assert!(
+        remaining.is_empty(),
+        "a cancelled real owner must not leave server_owner=1"
+    );
+    Ok(())
+}

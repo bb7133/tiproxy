@@ -65,9 +65,9 @@ use dataplane::session_engine::EngineSessionOwner;
 use dataplane::{
     BoundSessionHandler, ControlCommandHandler, DEFAULT_OBSERVATION_CAPACITY,
     DataplaneServingHandle, DataplaneSnapshotConsumer, DispatchConnectionHandler, MeteringLedger,
-    MetricsExporter, MetricsRecorder, MetricsRegistry, ServerError, SystemMemoryProbe,
-    SystemTimeMonitor, install_session_log_writer, spawn_metrics_exporter,
-    spawn_system_time_monitor,
+    MetricsExporter, MetricsRecorder, MetricsRegistry, MigrationMetrics, PlaneMigrationState,
+    ServerError, SystemMemoryProbe, SystemTimeMonitor, install_session_log_writer,
+    spawn_metrics_exporter, spawn_system_time_monitor,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -749,6 +749,11 @@ async fn run(options: Options) -> Result<(), String> {
                 .await);
         }
     };
+    // Installed before the collector runs, so no election worker can win
+    // without somewhere to report it. `server_owner` then renders from the
+    // same history at scrape.
+    metric_overlay.set_owner_history(topology_handle.owner_history());
+    metrics_registry.set_owner_state_source(topology_handle.owner_history());
     if let Err(error) = guard.spawn_module(metric_collector) {
         return Err(guard
             .rollback(format!("start metric collector module: {error}"))
@@ -762,11 +767,27 @@ async fn run(options: Options) -> Result<(), String> {
         Arc::new(config_owner.handle.source().clone());
     // CP-ADMIN reads the owner history bytes through the same collector.
     let backend_metrics = metric_overlay.backend_metrics_reader();
-    let (route_plane, mut route_plane_handle) = RoutePlane::new(
+    let (mut route_plane, mut route_plane_handle) = RoutePlane::new(
         Arc::clone(&route_config_source),
         topology_handle.clone(),
         Some(metric_overlay),
     );
+    // The router records migrations but owns no registry; publish them onto
+    // the same non-blocking recorder the SQL path uses, before the plane runs
+    // so no router incarnation is built without a sink.
+    route_plane.set_migration_sink(Arc::new(MigrationMetrics::new(metrics.clone())));
+    // The three migration families are served from router and process state
+    // at scrape time, not accumulated from those notifications.
+    metrics_registry.set_migration_state_source(Arc::new(PlaneMigrationState::new(
+        route_plane_handle.clone(),
+    )));
+    // `backend_metric` from the store the resource and health factors write.
+    metrics_registry.set_backend_metric_state_source(route_plane_handle.backend_metrics());
+    // `b_score` likewise, from the store the balance rounds write into.
+    metrics_registry.set_score_state_source(route_plane_handle.score_history());
+    // The three backend health families are served the same way, from the
+    // history the topology health child and the SQL probes write into.
+    metrics_registry.set_health_state_source(topology_handle.health_history());
     // CP-ADMIN's debug redirect sweeps every current router.
     let redirect_plane = route_plane_handle.clone();
     if let Err(error) = guard.spawn_module(route_plane) {

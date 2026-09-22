@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use thiserror::Error;
 
+use crate::permit::{CommitPermit, PermitHolder};
+
 /// Maximum byte length for owner, namespace, and cluster identifiers.
 pub const MAX_OWNER_ID_BYTES: usize = 256;
 
@@ -164,7 +166,8 @@ impl OwnershipRegistry {
             scope,
             owner_id,
             generation,
-            active: AtomicBool::new(true),
+            active: CommitPermit::new(),
+            unregistered: AtomicBool::new(false),
         });
         Ok(OwnerLease { state })
     }
@@ -181,12 +184,32 @@ struct LeaseState {
     scope: OwnerScope,
     owner_id: Arc<str>,
     generation: u64,
-    active: AtomicBool,
+    /// This lease's authority.
+    ///
+    /// A `CommitPermit` rather than a flag so a holder can make an effect
+    /// that the release cannot land in the middle of. Reading
+    /// [`OwnerToken::is_current`] and then acting leaves that window open;
+    /// [`OwnerToken::permit`] is how a caller closes it.
+    active: CommitPermit,
+    /// Whether this lease's one-time registry teardown has been performed.
+    unregistered: AtomicBool,
 }
 
 impl LeaseState {
     fn release(&self) {
-        if !self.active.swap(false, Ordering::AcqRel) {
+        // Revoke first, on **every** call. A release that returned before
+        // revoking would leave the owner current on return -- which is
+        // what a concurrent second release did when this was ordered the
+        // other way round, because the loser of the swap bailed out early.
+        // Revoking is idempotent and excludes any commit in flight.
+        self.active.revoke();
+        // Then decide who performs the one-time teardown. These are two
+        // different facts and neither may be derived from the other:
+        // deriving the teardown from the permit's validity let a holder
+        // that revoked its own copy strand the scope, and deriving the
+        // revocation from the teardown flag leaves the authority live on
+        // a losing thread's return.
+        if self.unregistered.swap(true, Ordering::AcqRel) {
             return;
         }
         let Some(registry) = self.registry.upgrade() else {
@@ -260,7 +283,20 @@ impl OwnerToken {
     pub fn is_current(&self) -> bool {
         self.state
             .upgrade()
-            .is_some_and(|state| state.active.load(Ordering::Acquire))
+            .is_some_and(|state| state.active.is_valid())
+    }
+
+    /// This owner's authority, for a caller that must make an effect the
+    /// release cannot interleave with.
+    ///
+    /// A holder, not the permit: revoking this lease is the lease's own
+    /// business, and a token that could revoke would let a consumer end an
+    /// ownership it does not hold.
+    ///
+    /// `None` once the lease itself is gone, which is already terminal.
+    #[must_use]
+    pub fn permit(&self) -> Option<PermitHolder> {
+        self.state.upgrade().map(|state| state.active.holder())
     }
 
     /// Returns the owner generation while the lease is alive.
@@ -275,4 +311,173 @@ fn validate_identifier(kind: &'static str, value: String) -> Result<Arc<str>, Ow
         return Err(OwnerError::InvalidIdentifier { kind, value });
     }
     Ok(Arc::from(value))
+}
+
+#[cfg(test)]
+mod owner_permit_tests {
+    use super::{OwnerScope, OwnershipRegistry};
+
+    /// What a token holder can do, and what it can no longer do.
+    ///
+    /// `CodexM5`'s counterexample went `token.permit().revoke()` and then
+    /// dropped the lease, stranding the scope. That call no longer
+    /// compiles: [`PermitHolder`] has no `revoke`. This test therefore
+    /// pins the *capability*, not the old failure -- it asserts that a
+    /// holder can commit and that committing does not end the lease.
+    ///
+    /// The conflation the counterexample exposed is pinned separately by
+    /// `an_already_invalid_permit_does_not_skip_unregistration`, which
+    /// reaches the authority directly. Neither test substitutes for the
+    /// other: one says nobody can trigger it, the other says triggering it
+    /// is harmless.
+    #[test]
+    fn a_holder_can_commit_but_cannot_end_the_lease() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let permit = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+
+        // The holder cannot revoke at all now -- that is the fix. It can
+        // only commit, and committing does not end the lease.
+        assert_eq!(permit.commit(|| 1), Some(1));
+        drop(lease);
+
+        // The scope must be free: the lease is gone.
+        registry
+            .claim(OwnerScope::Process, "owner-2")
+            .unwrap_or_else(|error| {
+                unreachable!("the scope stayed owned after its lease was dropped: {error:?}")
+            });
+    }
+
+    /// The conflation itself, pinned independently of the capability that
+    /// exposed it.
+    ///
+    /// Removing `revoke` from the holder stops an outsider reaching this
+    /// state, but the two facts must stay separate on their own merits:
+    /// the unregistration is decided by its own one-shot flag, so an
+    /// already-invalid permit -- however it got that way -- cannot make
+    /// the lease skip freeing its scope.
+    #[test]
+    fn an_already_invalid_permit_does_not_skip_unregistration() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+
+        // Reach past the public API to the authority itself, which is how
+        // the original counterexample arrived here.
+        lease.state.active.revoke();
+        assert!(!lease.token().is_current());
+
+        drop(lease);
+        registry
+            .claim(OwnerScope::Process, "owner-2")
+            .unwrap_or_else(|error| {
+                unreachable!("an invalid permit stranded the scope: {error:?}")
+            });
+    }
+
+    /// `CodexM5`'s concurrency counterexample, with the detail that makes
+    /// it bite: a commit is **in flight** while two threads release.
+    ///
+    /// The in-flight commit holds the permit's lock, so the thread that
+    /// wins the teardown flag blocks inside `revoke()` waiting for it.
+    /// With the flag checked first, the thread that loses returns straight
+    /// away having revoked nothing -- and a caller that released and then
+    /// asked found the owner still current. Without the in-flight commit
+    /// the winner revokes immediately and the loser almost never observes
+    /// the gap, which is why a plainer two-thread race passes on the
+    /// broken ordering.
+    #[test]
+    fn a_concurrent_release_revokes_before_returning_even_under_an_in_flight_commit() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let holder = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+        let state = Arc::clone(&lease.state);
+
+        // Released once the commit is demonstrably inside the permit.
+        let committing = Arc::new(Barrier::new(2));
+        let releasing = Arc::new(Barrier::new(3));
+
+        let seen = std::thread::scope(|scope| {
+            {
+                let committing = Arc::clone(&committing);
+                scope.spawn(move || {
+                    holder.commit(|| {
+                        committing.wait();
+                        // Hold the permit while both releases run.
+                        std::thread::sleep(Duration::from_millis(200));
+                    });
+                });
+            }
+            committing.wait();
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    let releasing = Arc::clone(&releasing);
+                    let token = token.clone();
+                    scope.spawn(move || {
+                        releasing.wait();
+                        state.release();
+                        token.is_current()
+                    })
+                })
+                .collect();
+            releasing.wait();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| unreachable!("releasing thread panicked"))
+                })
+                .collect::<Vec<bool>>()
+        });
+
+        assert!(
+            seen.iter().all(|current| !current),
+            "a release returned with the owner still current: {seen:?}"
+        );
+        drop(lease);
+    }
+
+    /// The owner's authority is now committable, not merely readable: an
+    /// effect made under it cannot be interleaved by the release, and one
+    /// attempted after the release is refused.
+    #[test]
+    fn an_effect_is_refused_once_the_lease_is_released() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let permit = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+
+        assert_eq!(permit.commit(|| 1), Some(1));
+        assert!(token.is_current());
+
+        drop(lease);
+        assert!(!token.is_current());
+        assert_eq!(
+            permit.commit(|| 1),
+            None,
+            "a released lease authorises no further effect"
+        );
+    }
 }

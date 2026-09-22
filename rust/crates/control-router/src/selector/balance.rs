@@ -79,6 +79,23 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            // Go `updateScore` writes the score gauges here: at a real
+            // scoring, behind its own per-instance 10s check.
+            //
+            // Committed under the whole candidate authority, so a
+            // revocation cannot land between the validation above and the
+            // write. The closure touches only the metric stores -- it must
+            // not read the configuration store, whose publisher takes that
+            // lock before the permits.
+            //
+            // `backend_metric` publishes in the same commit: both families
+            // describe this one scoring round.
+            #[cfg(test)]
+            self.review_before_metric_commit();
+            self.sources.commit_valid(candidate, || {
+                factors.core.publish_backend_metrics();
+                state.publish_scores(now, &report);
+            });
             let diagnostic_pair = report.balance.clone();
             let prepared = (|| {
                 if let Some(pair) = report.balance {
@@ -94,6 +111,7 @@ impl Router {
                             source: Arc::clone(&source.account),
                             target: Arc::clone(&target.account),
                             target_id: Arc::clone(&pair.to),
+                            reason: crate::RedirectReason::Balance(pair.reason),
                         })
                         .collect();
                     Ok(Some(crate::PreparedBalance { pair, redirects }))

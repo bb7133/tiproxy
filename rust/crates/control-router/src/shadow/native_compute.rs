@@ -84,6 +84,10 @@ impl Backend for Values<'_> {
     fn touch_address(&self) {
         self.use_field(2);
     }
+    fn address(&self) -> &str {
+        self.touch_address();
+        &self.account.addr
+    }
     fn instance(&self) -> Cow<'_, str> {
         self.touch_address();
         let addr = &self.account.addr;

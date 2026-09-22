@@ -40,7 +40,9 @@
 //! against the process owner AND the caller's source [`GenerationGate`]; a
 //! fence failure is terminal and wins over any coincident I/O error.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::time::Instant;
 
 use mysql_wire::{PacketHeader, ResponseHeader};
 use thiserror::Error;
@@ -125,6 +127,41 @@ impl From<ClusterConnectError> for SqlGreetingError {
     }
 }
 
+/// One observed SQL-port dial.
+///
+/// Carries when the dial finished as well as how long it took, because the
+/// order these are published in is the dial-completion order, not the order
+/// the surrounding probes finish -- a slow greeting inverts those. `sequence`
+/// breaks ties between dials that finish at the same instant, so the order is
+/// total rather than merely mostly-defined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlDialObservation {
+    /// How long the connect took: Go's `ping_duration_seconds`.
+    pub duration: Duration,
+    /// When the connect returned, frozen at the same point as `duration`.
+    ///
+    /// Diagnostic only. It is *not* the ordering key: it is read in its own
+    /// statement, so two concurrent dials can take their instants and their
+    /// sequences in opposite orders. Comparing these to decide which
+    /// observation is newer would disagree with `sequence` under exactly the
+    /// concurrency that makes the question worth asking.
+    pub completed_at: Instant,
+    /// The publication order of this dial, and the only ordering key.
+    ///
+    /// One atomic increment, so it is a total order over every dial in the
+    /// process -- which `completed_at` is not. A consumer deciding whether an
+    /// observation supersedes the one it holds compares this alone.
+    ///
+    /// It orders observations; it does not authorise them. A larger sequence
+    /// from a retired source or a stale address mapping is still refused --
+    /// the caller's fence runs first, and only an admitted observation is
+    /// ordered against the stored one.
+    pub sequence: u64,
+}
+
+/// Assigns `SqlDialObservation::sequence`.
+static DIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// An owner-fenced, single-attempt SQL-greeting probe for one backend cluster's
 /// material and generation. Reusable across probes within one
 /// cluster-material/epoch.
@@ -207,32 +244,76 @@ impl SqlGreetingProbe {
         port: u16,
         source_gate: &GenerationGate,
     ) -> Result<(), SqlGreetingError> {
+        self.check_once_timed(host, port, source_gate, &|_| {})
+            .await
+            .1
+    }
+
+    /// As [`Self::check_once`], also reporting how long the **connect** took.
+    ///
+    /// Go updates `ping_duration_seconds` as soon as `DialContext` returns and
+    /// before it reads the greeting, so the reported duration must exclude the
+    /// greeting read. Timing the whole check instead would fold a slow
+    /// greeting into what Go reports as a dial. The duration is returned on
+    /// failure and on timeout as well, because Go sets the gauge there too.
+    ///
+    /// `on_dial` runs at that same point, before the greeting is awaited.
+    /// Returning the observation is not enough to match Go: the return only
+    /// happens once the greeting read finishes, so a caller publishing from
+    /// the return value would expose every successful dial one greeting late
+    /// -- on a hung backend, a whole `dial_timeout` late. Go's `Set` has
+    /// already happened by then. The hook is synchronous and must stay cheap;
+    /// it runs before the stream is even matched.
+    pub async fn check_once_timed(
+        &self,
+        host: &str,
+        port: u16,
+        source_gate: &GenerationGate,
+        on_dial: &(dyn Fn(&SqlDialObservation) + Sync),
+    ) -> (SqlDialObservation, Result<(), SqlGreetingError>) {
+        let started = Instant::now();
         let dialed = tokio::time::timeout(
             self.dial_timeout,
             self.connector.connect_once(host, port, source_gate),
         )
         .await;
+        // Frozen here: the dial is done, the greeting is not yet read. The
+        // completion instant is taken at the same point, because ordering
+        // these by when their probes finish would let a slow greeting put a
+        // later dial first.
+        let dial = SqlDialObservation {
+            duration: started.elapsed(),
+            completed_at: Instant::now(),
+            sequence: DIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        };
+        // Published here, not at the return: this is Go's `setPingBackendMetrics`
+        // position, inside the retry loop and ahead of the greeting read.
+        on_dial(&dial);
         let mut stream = match dialed {
-            Ok(result) => result?,
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return (dial, Err(error.into())),
             Err(_elapsed) => {
                 // A revoke coincident with the deadline is terminal and wins over
                 // the timeout classification.
-                self.connector.fence(source_gate)?;
-                return Err(SqlGreetingError::Timeout);
+                if let Err(error) = self.connector.fence(source_gate) {
+                    return (dial, Err(error.into()));
+                }
+                return (dial, Err(SqlGreetingError::Timeout));
             }
         };
-        match tokio::time::timeout(
+        let greeting = match tokio::time::timeout(
             self.dial_timeout,
             self.judge_first_packet(&mut stream, source_gate),
         )
         .await
         {
             Ok(result) => result,
-            Err(_elapsed) => {
-                self.connector.fence(source_gate)?;
-                Err(SqlGreetingError::Timeout)
-            }
-        }
+            Err(_elapsed) => match self.connector.fence(source_gate) {
+                Ok(()) => Err(SqlGreetingError::Timeout),
+                Err(error) => Err(error.into()),
+            },
+        };
+        (dial, greeting)
     }
 
     /// Go `pnet.CheckSqlPort`'s minimal criterion: the complete four-byte header,

@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use control_external::GenerationGate;
 use control_plane::OwnerToken;
+use control_plane::permit::PermitHolder;
 
 use crate::backend_health::BackendHealth;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
@@ -95,6 +96,23 @@ pub struct HealthSnapshot {
 }
 
 impl HealthSnapshot {
+    /// The authorities this overlay's currency depends on.
+    ///
+    /// Returned together so a caller committing under them cannot take a
+    /// subset by accident: the round gate, the feed gate and the owner all
+    /// have to hold for this overlay to mean anything.
+    ///
+    /// `None` once the owner lease is gone. That is terminal rather than
+    /// a missing permit -- there is no authority left to commit under, so
+    /// the caller refuses instead of substituting something.
+    pub(crate) fn authorities(&self) -> Option<[PermitHolder; 3]> {
+        Some([
+            self.gate.permit().holder(),
+            self.feed_gate.permit().holder(),
+            self.owner.permit()?,
+        ])
+    }
+
     /// A failed observer result blocks new selection without erasing the last
     /// backend inventory or preventing existing connections from settling.
     #[must_use]
@@ -125,6 +143,7 @@ impl HealthSnapshot {
                 healthy: false,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             })
     }
 }
@@ -547,6 +566,7 @@ mod tests {
                         healthy: true,
                         server_version: Some("v8".to_owned()),
                         local: false,
+                        sql_dial: None,
                     },
                 )
             })

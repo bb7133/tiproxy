@@ -49,7 +49,10 @@ use tokio::task::JoinHandle;
 use crate::backend_health::{ClusterHealthNetwork, PreparedClusterHealthNetwork};
 use crate::discovery_publish::EpochResult;
 use crate::health_config::HealthRuntime;
+use control_plane::permit::PermitHolder;
+
 use crate::health_feed::HealthGenerationFeeder;
+use crate::health_history::{BackendHealthHistory, BackendRetirement, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
@@ -389,6 +392,7 @@ impl StaticBackendProducer {
     /// # Errors
     ///
     /// Returns the default network's build failure (an invalid probe timeout).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         instances: &[String],
         incarnation: NamespaceIncarnation,
@@ -397,11 +401,14 @@ impl StaticBackendProducer {
         zone: Arc<dyn ConfigNamespaceSource>,
         updates: watch::Sender<u64>,
         activate: bool,
+        health_history: &Arc<BackendHealthHistory>,
+        retirement: &Arc<BackendRetirement>,
     ) -> Result<Self, ClusterHttpConfigError> {
         let networks = match runtime.probe_policy() {
             Some(policy) => {
                 let network = PreparedClusterHealthNetwork::system_default(owner.clone(), policy)?
-                    .bind(STATIC_CLIENT_EPOCH);
+                    .bind(STATIC_CLIENT_EPOCH)
+                    .with_health_history(Arc::clone(health_history));
                 let mut map = HashMap::with_capacity(1);
                 map.insert(Arc::<str>::from(STATIC_CLUSTER_NAME), network);
                 Some(Arc::new(map))
@@ -432,6 +439,10 @@ impl StaticBackendProducer {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             zone,
+            Some(
+                ObserverHealthMetrics::new(Arc::clone(health_history))
+                    .with_retirement(Arc::clone(retirement)),
+            ),
         ));
         let mut producer = Self {
             incarnation,
@@ -529,6 +540,7 @@ impl StaticProducers {
     /// one, create a new one, and fence/join a removed producer once no retained
     /// lease remains. Independent of whether the generation's cluster material
     /// is applied.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn reconcile(
         &mut self,
         snapshot: &ConfigNamespaceSnapshot,
@@ -536,6 +548,8 @@ impl StaticProducers {
         runtime: &HealthRuntime,
         zone: &Arc<dyn ConfigNamespaceSource>,
         mode: Option<BackendSourceMode>,
+        health_history: &Arc<BackendHealthHistory>,
+        retirement: &Arc<BackendRetirement>,
     ) {
         self.retire_unused().await;
         let activate = mode == Some(BackendSourceMode::Static);
@@ -568,6 +582,8 @@ impl StaticProducers {
                 Arc::clone(zone),
                 self.registry.updates.clone(),
                 activate,
+                health_history,
+                retirement,
             ) {
                 self.registry.insert(name.to_owned(), producer.registered());
                 self.producers.insert(name.to_owned(), producer);
@@ -818,12 +834,103 @@ impl BackendSourceHandle {
         self.still_current(&snapshot).then_some(snapshot)
     }
 
+    /// Runs `effect` only while `snapshot` is still authoritative through
+    /// this handle, holding every authority that currency depends on for
+    /// its duration.
+    ///
+    /// [`Self::still_current`] answers the same question and then returns,
+    /// which leaves a revocation free to land before the caller acts. This
+    /// closes that: the identity conditions are checked first, and the
+    /// effect then runs under the mode epoch's, routing's, health round's,
+    /// health feed's and owner's permits at once. A revocation of any of
+    /// them either precedes the commit, which refuses it, or waits for it.
+    ///
+    /// Every watch borrow is released before the commit begins. Holding
+    /// one across it would let a consumer wait on a permit while pinning a
+    /// slot a revoker needs, which is a cycle the permits themselves
+    /// cannot see.
+    ///
+    /// `effect` carries [`control_plane::permit::CommitPermit::commit`]'s
+    /// contract: short, synchronous, and reaching for no lock a revoker
+    /// takes first.
+    pub fn commit_current<T>(
+        &self,
+        snapshot: &BackendSourceSnapshot,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let authorities = self.authorities_for(snapshot)?;
+        let borrowed: Vec<&PermitHolder> = authorities.iter().collect();
+        PermitHolder::commit_all(&borrowed, effect)
+    }
+
+    /// The authorities `snapshot` is current under, or `None` if it is not.
+    ///
+    /// Separate from [`Self::commit_current`] so a caller with authorities
+    /// of its own can take them all in **one** `commit_all`. Committing
+    /// here and then again outside would nest, and neither `commit` nor
+    /// `commit_all` is reentrant -- the inner call would block on a permit
+    /// the outer one already holds.
+    ///
+    /// Every identity condition is checked here and every watch borrow is
+    /// released before returning, so the caller receives permits and no
+    /// guards.
+    #[must_use]
+    pub fn authorities_for(&self, snapshot: &BackendSourceSnapshot) -> Option<Vec<PermitHolder>> {
+        // The handle identity is genuinely not revocable, so it is checked
+        // outside the commit.
+        if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) {
+            return None;
+        }
+        // The namespace is a different matter, and calling it identity was
+        // wrong: for a plain handle it is read from the current
+        // configuration and a publication can retire it. It is bound here
+        // to the configuration snapshot this call captured -- one read,
+        // used for both the check and the permit -- so the namespace
+        // cannot be retired between them.
+        //
+        // Deliberately the per-namespace permit and not the snapshot's:
+        // every publication revokes the snapshot-wide one, which would
+        // refuse an effect on an untouched namespace after any unrelated
+        // change. A retained handle takes neither, keeping its explicit
+        // continuation contract, which does not consult the configuration
+        // at all.
+        let namespace_permit = if self.retained.is_some() {
+            None
+        } else {
+            let config = self.config.current();
+            if !self
+                .origin
+                .same_namespace_incarnation(&config, &self.namespace)
+            {
+                return None;
+            }
+            Some(config.namespace_permit(&self.namespace)?)
+        };
+        // Scoped so the watch borrow is gone before the caller commits.
+        let current = self.mode.borrow();
+        if !Arc::ptr_eq(&snapshot.epoch, &current) {
+            return None;
+        }
+        let (routing, health) = self.side(&snapshot.epoch);
+        if !health.still_current_for(&snapshot.health, &snapshot.routing, routing) {
+            return None;
+        }
+        let mut permits = vec![
+            snapshot.epoch.gate.permit().holder(),
+            snapshot.routing.source_gate().permit().holder(),
+        ];
+        permits.extend(snapshot.health.authorities()?);
+        permits.extend(namespace_permit);
+        drop(current);
+        Some(permits)
+    }
+
+    #[must_use]
     /// Whether `snapshot` is still authoritative through THIS handle: same
     /// handle, namespace incarnation still current at the source, the very same
     /// mode epoch still live and current (a mode value equal to the current one
     /// is never enough), and the selected side's exact routing/health pair still
     /// published and gated.
-    #[must_use]
     pub fn still_current(&self, snapshot: &BackendSourceSnapshot) -> bool {
         if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) || !self.namespace_current() {
             return false;

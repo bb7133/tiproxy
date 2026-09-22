@@ -87,6 +87,73 @@ func run(input, nativeList string) error {
 	for range fixedTimeJumps {
 		metrics.TimeJumpBackCounter.Inc()
 	}
+	// Session migration: the reason label is frozen when the redirect is
+	// issued, so the pending gauge is incremented with that same reason and
+	// decremented again when the migration settles. One succeeded and one
+	// failed pair settle back to zero; a third stays in flight so the gauge
+	// carries a non-zero series too.
+	for _, m := range fixedMigrations {
+		metrics.PendingMigrateGuage.WithLabelValues(m.from, m.to, m.reason).Inc()
+		if !m.settled {
+			continue
+		}
+		metrics.MigrateCounter.WithLabelValues(m.from, m.to, m.reason, m.result).Inc()
+		metrics.PendingMigrateGuage.WithLabelValues(m.from, m.to, m.reason).Dec()
+		metrics.MigrateDurationHistogram.WithLabelValues(m.from, m.to, m.result).Observe(m.seconds)
+	}
+
+	// Backend connection counts. Go sets this per namespace router, so the
+	// fixture uses distinct addresses; the overlapping-address difference is
+	// pinned by the comparator case, not here.
+	for _, b := range fixedBackendConns {
+		metrics.BackendConnGauge.WithLabelValues(b.addr).Set(float64(b.conns))
+	}
+
+	// Backend health. The three families are written straight to the Go
+	// collectors because the observer helpers that drive them in production
+	// are unexported. The fixture pins the semantics that distinguish them:
+	// b_status has a child only for an address that has been healthy at least
+	// once, while ping_duration_seconds has one for every address dialled.
+	for _, b := range fixedBackendHealth {
+		metrics.PingBackendGauge.WithLabelValues(b.addr).Set(b.pingSeconds)
+		if !b.everHealthy {
+			continue
+		}
+		value := 0.0
+		if b.healthy {
+			value = 1
+		}
+		metrics.BackendStatusGauge.WithLabelValues(b.addr).Set(value)
+	}
+	metrics.HealthCheckCycleGauge.Set(fixedHealthCheckCycleSeconds)
+
+	// Elections this process holds. Go sets 1 on election and deletes the
+	// child on retirement, so an election that was won and then lost leaves
+	// nothing behind -- the fixture exercises that by doing exactly this to
+	// the third entry rather than trusting the absence.
+	for _, job := range fixedOwnedElections {
+		metrics.OwnerGauge.WithLabelValues(job).Set(1)
+	}
+	metrics.OwnerGauge.WithLabelValues(fixedRetiredElection).Set(1)
+	metrics.OwnerGauge.MetricVec.DeletePartialMatch(
+		map[string]string{metrics.LblType: fixedRetiredElection})
+
+	// Per-factor backend scores. Go writes these from updateScore, one
+	// Set per (backend, factor), and only every updateMetricInterval; the
+	// cadence is covered by the Rust clock test, so the fixture just pins
+	// the label pairs and values.
+	for _, score := range fixedBackendScores {
+		metrics.BackendScoreGauge.WithLabelValues(score.addr, score.factor).Set(float64(score.score))
+	}
+
+	// Raw backend observations. Two of the six are derived rather than
+	// sampled -- memory is calcMemUsage's latest and cpu is calcAvgUsage's
+	// average -- but the fixture only pins the label pairs and values, so
+	// it writes them the same way.
+	for _, observation := range fixedBackendMetrics {
+		metrics.BackendMetricGauge.WithLabelValues(observation.addr, observation.metric).
+			Set(observation.value)
+	}
 
 	native, err := readNativeFamilies(nativeList)
 	if err != nil {
@@ -128,6 +195,89 @@ const (
 	fixedKeepAlives = 3
 	fixedTimeJumps  = 2
 )
+
+// Backend connection counts, mirrored by the Rust golden test.
+var fixedBackendConns = []struct {
+	addr  string
+	conns int
+}{
+	{addr: "10.0.0.1:4000", conns: 2},
+	{addr: "10.0.0.2:4000", conns: 1},
+}
+
+// The migration fixture, mirrored exactly by the Rust golden test.
+var fixedMigrations = []struct {
+	from    string
+	to      string
+	reason  string
+	result  string
+	seconds float64
+	settled bool
+}{
+	{from: "10.0.0.1:4000", to: "10.0.0.2:4000", reason: "conn", result: "succeed", seconds: 0.25, settled: true},
+	{from: "10.0.0.1:4000", to: "10.0.0.2:4000", reason: "conn", result: "fail", seconds: 0.5, settled: true},
+	{from: "10.0.0.1:4000", to: "10.0.0.3:4000", reason: "status", settled: false},
+}
+
+// Backend health, mirrored exactly by the Rust golden test.
+//
+// `10.0.0.3:4000` has never been healthy, so it is dialled -- and reports a
+// ping -- without ever creating a `b_status` child. That asymmetry is the
+// point of the case: Go only creates the status child on a transition into
+// healthy, so a backend that has only ever failed is absent from b_status
+// rather than present at zero.
+var fixedBackendHealth = []struct {
+	addr        string
+	everHealthy bool
+	healthy     bool
+	pingSeconds float64
+}{
+	{addr: "10.0.0.1:4000", everHealthy: true, healthy: true, pingSeconds: 0.004},
+	{addr: "10.0.0.2:4000", everHealthy: true, healthy: false, pingSeconds: 0.012},
+	{addr: "10.0.0.3:4000", everHealthy: false, healthy: false, pingSeconds: 0.25},
+}
+
+// One health check cycle's duration.
+const fixedHealthCheckCycleSeconds = 1.5
+
+// Elections held, mirrored exactly by the Rust golden test. The labels are
+// Go's trimmed etcd keys, so "/tiproxy/metric_reader/z1/owner" is
+// "metric_reader/z1".
+var fixedOwnedElections = []string{"metric_reader", "metric_reader/z1"}
+
+// Won and then lost: Go deletes the child, so this must leave no series.
+const fixedRetiredElection = "metric_reader/z2"
+
+// Per-factor scores, mirrored exactly by the Rust golden test. A backend
+// need not carry every factor: Go writes whatever the configured factor set
+// produced, so a partial row is a real shape.
+var fixedBackendScores = []struct {
+	addr   string
+	factor string
+	score  int
+}{
+	{addr: "10.0.0.1:4000", factor: "conn", score: 3},
+	{addr: "10.0.0.1:4000", factor: "cpu", score: 1},
+	{addr: "10.0.0.2:4000", factor: "conn", score: 7},
+	{addr: "10.0.0.3:4000", factor: "status", score: 0},
+}
+
+// Raw backend observations, mirrored exactly by the Rust golden test. A
+// backend carries only the metrics its factors accepted, so a partial row
+// is a real shape: 10.0.0.2:4000 has health indicators and no resource
+// samples.
+var fixedBackendMetrics = []struct {
+	addr   string
+	metric string
+	value  float64
+}{
+	{addr: "10.0.0.1:4000", metric: "cpu", value: 0.25},
+	{addr: "10.0.0.1:4000", metric: "memory", value: 0.5},
+	{addr: "10.0.0.2:4000", metric: "failure_pd", value: 2},
+	{addr: "10.0.0.2:4000", metric: "total_pd", value: 100},
+	{addr: "10.0.0.2:4000", metric: "failure_tikv", value: 0},
+	{addr: "10.0.0.2:4000", metric: "total_tikv", value: 40},
+}
 
 type nativeFamilies struct {
 	Families []string `json:"families"`

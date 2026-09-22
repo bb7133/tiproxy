@@ -20,6 +20,13 @@ use std::time::{Duration, Instant};
 
 use control_routing::RouteAssignment;
 
+#[cfg(test)]
+use crate::factors::Factor;
+use crate::factors::RedirectReason;
+use crate::migration_history::MigrationHistory;
+#[cfg(test)]
+use crate::migration_history::{DurationKey, MAX_RETAINED_LABEL_SETS, TerminalKey};
+
 /// Live connection accounting for one backend owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Accounting {
@@ -192,6 +199,7 @@ pub struct Redirect {
     from: RouteAssignment,
     to: RouteAssignment,
     issued_at: Instant,
+    reason: RedirectReason,
 }
 
 impl Redirect {
@@ -208,6 +216,20 @@ impl Redirect {
     #[must_use]
     pub const fn to(&self) -> &RouteAssignment {
         &self.to
+    }
+
+    /// Why this migration was issued, frozen at acceptance. Settlement reads
+    /// it back rather than recomputing, exactly as Go reads
+    /// `connWrapper.redirectReason`.
+    #[must_use]
+    pub const fn reason(&self) -> RedirectReason {
+        self.reason
+    }
+
+    /// When this migration was issued; the start of its Go-observed duration.
+    #[must_use]
+    pub const fn issued_at(&self) -> Instant {
+        self.issued_at
     }
 
     /// Whether `other` is the same exact migration operation.
@@ -271,6 +293,42 @@ pub enum Settlement {
     Ignored,
 }
 
+/// One settled migration, as Go observes it at `addMigrateMetrics`.
+///
+/// Go reads `from`, `to` and `reason` off the connection wrapper and the
+/// elapsed time from `connWrapper.lastRedirect`, all captured when the
+/// redirect was issued. This record carries the same frozen values so the
+/// natively served `migrate_total`, `migrate_duration_seconds` and
+/// `pending_migrate` series are label-identical to the retired Go ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationObservation {
+    /// Physical source backend address at issue time. Go labels these series
+    /// with `backend.addr`, the dial address, not the opaque routing id.
+    pub from: String,
+    /// Captured destination backend address at issue time.
+    pub to: String,
+    /// The frozen reason label.
+    pub reason: RedirectReason,
+    /// Which end of the migration this record reports.
+    pub outcome: MigrationOutcome,
+}
+
+/// The two points at which Go touches the migration metrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MigrationOutcome {
+    /// The offer was accepted and the migration is in flight. Go increments
+    /// `pending_migrate` here, and only for an accepted offer.
+    Issued,
+    /// The migration reached its terminal state. Go decrements
+    /// `pending_migrate`, counts the result, and observes the elapsed time.
+    Settled {
+        /// Whether the migration succeeded.
+        success: bool,
+        /// Issue-to-settlement elapsed time, Go's `time.Since(lastRedirect)`.
+        elapsed: Duration,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LedgerError {
     ForeignSession,
@@ -302,6 +360,37 @@ struct Account {
     physical: Vec<u64>,
 }
 
+/// One migration label set, exactly Go's `(from, to, reason)`.
+///
+/// Held as owned strings because the backend addresses are captured when the
+/// redirect is issued and must survive the routing state that produced them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MigrationLabels {
+    /// Source backend address.
+    pub from: String,
+    /// Destination backend address.
+    pub to: String,
+    /// Reason frozen at issue.
+    pub reason: RedirectReason,
+}
+
+/// The authoritative per-label-set migration state this ledger owns.
+///
+/// This is the truth the exposition reads, rather than a running total
+/// accumulated from notifications: a lost notification leaves the reader
+/// briefly stale, never permanently wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MigrationTotals {
+    /// Migrations accepted and not yet settled.
+    pub pending: u64,
+    /// Settled successfully, cumulative.
+    pub succeeded: u64,
+    /// Settled unsuccessfully, cumulative.
+    pub failed: u64,
+    /// Summed settlement latency in nanoseconds, cumulative.
+    pub elapsed_nanos: u128,
+}
+
 pub(crate) struct Ledger {
     identity: Arc<()>,
     next_session: u64,
@@ -312,10 +401,26 @@ pub(crate) struct Ledger {
     max_sessions: usize,
     sessions: BTreeMap<u64, Stage>,
     accounts: BTreeMap<u64, Account>,
+    /// Settled migrations awaiting publication. The ledger records; it never
+    /// touches a metric registry itself.
+    migrations: Vec<MigrationObservation>,
+    /// Migrations accepted here and not yet settled, per label set.
+    ///
+    /// Only the in-flight count lives on the router. Cumulative history does
+    /// not: destroying an incarnation would take it with them, and a
+    /// cumulative series must never fall.
+    pending_migrations: BTreeMap<MigrationLabels, u64>,
+    /// Process-level cumulative history, shared with every other router.
+    history: Arc<MigrationHistory>,
 }
 
 impl Ledger {
     pub(crate) fn new(max_sessions: usize) -> Self {
+        Self::with_history(max_sessions, Arc::new(MigrationHistory::default()))
+    }
+
+    /// Builds a ledger that shares one process-level cumulative history.
+    pub(crate) fn with_history(max_sessions: usize, history: Arc<MigrationHistory>) -> Self {
         Self {
             identity: Arc::new(()),
             next_session: 1,
@@ -326,7 +431,99 @@ impl Ledger {
             max_sessions,
             sessions: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            migrations: Vec::new(),
+            pending_migrations: BTreeMap::new(),
+            history,
         }
+    }
+
+    /// Physically owned connections per backend address, Go's `b_conn`.
+    ///
+    /// Go sets this from the backend's `connList` length, and that list only
+    /// moves when a migration succeeds. The active assignment behaves the same
+    /// way here -- it is rewritten on a successful settlement and left alone
+    /// on a failed one -- so an accepted migration keeps counting against its
+    /// source until it actually lands.
+    ///
+    /// Only established sessions count: a reservation that has not completed
+    /// is not a physical connection, and neither is an incoming redirect that
+    /// has not settled. Each session contributes exactly once.
+    pub(crate) fn physical_connections(&self) -> BTreeMap<String, u64> {
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for stage in self.sessions.values() {
+            if let Stage::Active(active) = stage {
+                let address = &active.assignment.backend_address;
+                if address.is_empty() {
+                    continue;
+                }
+                // A refused address is not exposed. Admission happened when
+                // the connection landed; counting it here anyway would let
+                // the aggregation reinsert a series past the ceiling, so the
+                // drop would be recorded and the series published regardless.
+                if !self.history.knows_backend(address) {
+                    continue;
+                }
+                *counts.entry(address.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// Migrations in flight on this router, per label set.
+    pub(crate) const fn pending_migrations(&self) -> &BTreeMap<MigrationLabels, u64> {
+        &self.pending_migrations
+    }
+
+    /// The process-level cumulative history this ledger writes to.
+    pub(crate) const fn history(&self) -> &Arc<MigrationHistory> {
+        &self.history
+    }
+
+    /// Notes an accepted migration: in flight here, and its label set
+    /// remembered process-wide so the series keeps reporting zero later.
+    fn issue_migration(&mut self, labels: &MigrationLabels) {
+        // One admission decision governs both halves of the metric. Tracking
+        // pending under a separate per-ledger ceiling would let this ledger
+        // fill up with sets the history never retained, and then refuse a set
+        // the history did retain -- losing the real pending count of a series
+        // still being exposed. A refusal costs the series, never the
+        // migration: the redirect proceeds either way.
+        if !self
+            .history
+            .remember(&labels.from, &labels.to, labels.reason)
+        {
+            return;
+        }
+        *self.pending_migrations.entry(labels.clone()).or_default() += 1;
+    }
+
+    /// Records a settlement. The in-flight count falls here; the cumulative
+    /// terminal goes to the process-level history, which no router teardown
+    /// can roll back. `pending` saturates at zero so an unmatched settlement
+    /// cannot underflow.
+    fn settle_migration(&mut self, labels: &MigrationLabels, success: bool, elapsed: Duration) {
+        if let Some(pending) = self.pending_migrations.get_mut(labels) {
+            *pending = pending.saturating_sub(1);
+        }
+        // Go settles through `PendingMigrateGuage.Dec()`, which recreates the
+        // child if it was deleted, so a label set retired mid-flight comes
+        // back when its migration lands. Re-admitting here keeps the one
+        // admission decision in the one place the exposition reads.
+        //
+        // The value differs from Go in that case and deliberately so: Go's
+        // `Dec()` on a recreated child reports -1, because it accumulates
+        // decrements, while this pending count is read from the ledger and
+        // cannot go below zero. A negative in-flight count is a Go artefact
+        // of the delete, not a state the router can be in.
+        self.history
+            .remember(&labels.from, &labels.to, labels.reason);
+        self.history
+            .settle(&labels.from, &labels.to, labels.reason, success, elapsed);
+    }
+
+    /// Takes the migrations settled since the last drain.
+    pub(crate) fn drain_migrations(&mut self) -> Vec<MigrationObservation> {
+        std::mem::take(&mut self.migrations)
     }
 
     pub(crate) const fn set_max_sessions(&mut self, max_sessions: usize) {
@@ -490,6 +687,11 @@ impl Ledger {
         let stage = if connected {
             account.counts.active += 1;
             account.physical.push(reservation.session.sequence);
+            // Registered here, not when the exposition reads: a connection
+            // that opens and closes between two scrapes must still leave its
+            // address reporting zero.
+            self.history
+                .remember_backend(&reservation.assignment.backend_address);
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
@@ -535,6 +737,7 @@ impl Ledger {
         target: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
         now: Instant,
+        reason: RedirectReason,
     ) -> Result<Redirect, LedgerError> {
         let Stage::Active(active) = self.stage(session)? else {
             return Err(LedgerError::NotActive);
@@ -585,6 +788,7 @@ impl Ledger {
             from: active.assignment.clone(),
             to: assignment,
             issued_at: now,
+            reason,
         })
     }
 
@@ -652,6 +856,7 @@ impl Ledger {
             from: active.assignment.clone(),
             to: assignment,
             issued_at: now,
+            reason: RedirectReason::Test,
         })
     }
 
@@ -670,6 +875,23 @@ impl Ledger {
                 .counts
                 .incoming += 1;
         }
+        if admitted {
+            // Go increments the pending gauge only once the offer is accepted.
+            // Recorded before the session borrow so the authoritative update
+            // and the notification stay together in one place.
+            let labels = MigrationLabels {
+                from: redirect.from.backend_address.clone(),
+                to: redirect.to.backend_address.clone(),
+                reason: redirect.reason,
+            };
+            self.issue_migration(&labels);
+            self.migrations.push(MigrationObservation {
+                from: labels.from,
+                to: labels.to,
+                reason: labels.reason,
+                outcome: MigrationOutcome::Issued,
+            });
+        }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("prepared active session")
         };
@@ -684,7 +906,7 @@ impl Ledger {
         &mut self,
         redirect: &Redirect,
         success: bool,
-        _now: Instant,
+        now: Instant,
     ) -> Settlement {
         let Ok(Stage::Active(active)) = self.stage(&redirect.session) else {
             return Settlement::Ignored;
@@ -714,6 +936,16 @@ impl Ledger {
                 .unwrap_or_else(|| unreachable!("retained target"));
             target.counts.active += 1;
             target.physical.push(redirect.session.sequence);
+            // The connection is now physically the target's; register the
+            // address at the moment it lands, for the same reason.
+            self.history.remember_backend(&redirect.to.backend_address);
+            // Go moves the connection with `removeConn(from)` + `addConn(to)`
+            // and both call `setBackendConnMetrics`, so the source's series is
+            // rewritten too. Ordinarily a no-op here; it matters after a
+            // retention purge, where dropping the source's write would leave
+            // the address Go shows at its new count silently absent.
+            self.history
+                .remember_backend(&redirect.from.backend_address);
         }
         let Some(Stage::Active(active)) = self.sessions.get_mut(&redirect.session.sequence) else {
             unreachable!("matching active session")
@@ -727,6 +959,21 @@ impl Ledger {
             // Go's cooldown starts at issuance, not when the failure arrives.
             active.failed_at = Some(redirect.issued_at);
         }
+        // Saturating: a settlement can never predate its own issuance, and a
+        // non-monotonic reading must not panic a routing settlement.
+        let elapsed = now.saturating_duration_since(redirect.issued_at);
+        let labels = MigrationLabels {
+            from: redirect.from.backend_address.clone(),
+            to: redirect.to.backend_address.clone(),
+            reason: redirect.reason,
+        };
+        self.settle_migration(&labels, success, elapsed);
+        self.migrations.push(MigrationObservation {
+            from: labels.from,
+            to: labels.to,
+            reason: labels.reason,
+            outcome: MigrationOutcome::Settled { success, elapsed },
+        });
         Settlement::Applied
     }
 
@@ -848,10 +1095,10 @@ impl Ledger {
         {
             return Settlement::Ignored;
         }
-        self.close(&close.session)
+        self.close(&close.session, Instant::now())
     }
 
-    pub(crate) fn close(&mut self, session: &Session) -> Settlement {
+    pub(crate) fn close(&mut self, session: &Session, now: Instant) -> Settlement {
         if self.stage(session).is_err() {
             return Settlement::Ignored;
         }
@@ -868,11 +1115,40 @@ impl Ledger {
             Stage::Active(active) => {
                 if let Some(redirect) = active.redirect {
                     self.release_redirect(&redirect);
+                    // Go counts a migration interrupted by a close as a failed
+                    // one, with its elapsed time. Releasing the accounting
+                    // without recording it would leave `pending_migrate`
+                    // permanently holding a migration that can never settle.
+                    let elapsed = now.saturating_duration_since(redirect.issued_at);
+                    let labels = MigrationLabels {
+                        from: redirect.from.backend_address.clone(),
+                        to: redirect.to.backend_address.clone(),
+                        reason: redirect.reason,
+                    };
+                    self.settle_migration(&labels, false, elapsed);
+                    self.migrations.push(MigrationObservation {
+                        from: labels.from,
+                        to: labels.to,
+                        reason: labels.reason,
+                        outcome: MigrationOutcome::Settled {
+                            success: false,
+                            elapsed,
+                        },
+                    });
                 }
                 if let Some(account) = self.accounts.get_mut(&active.account.sequence) {
                     account.counts.active -= 1;
                     account.physical.retain(|id| *id != session.sequence);
                 }
+                // Go's `removeConn` calls `setBackendConnMetrics` just as
+                // `addConn` does, so a close recreates the child if the
+                // address was deleted in between. Ordinarily a no-op -- the
+                // address was admitted when the connection landed -- this
+                // only matters after a retention purge, where Go would show
+                // the address again at its new count and dropping the write
+                // would leave it silently absent.
+                self.history
+                    .remember_backend(&active.assignment.backend_address);
             }
         }
         Settlement::Applied
@@ -914,8 +1190,13 @@ mod tests {
         assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
         assert_eq!(ledger.evidence().active, 1);
 
-        let redirect =
-            must(ledger.prepare_redirect(&session, &target, assignment("b"), Instant::now()));
+        let redirect = must(ledger.prepare_redirect(
+            &session,
+            &target,
+            assignment("b"),
+            Instant::now(),
+            RedirectReason::Balance(Factor::Connection),
+        ));
         ledger.admit_redirect(redirect.clone(), true, Instant::now());
         let evidence = ledger.evidence();
         assert_eq!(
@@ -923,7 +1204,7 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(evidence.unsettled_redirects, 1);
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert_eq!(
             ledger.evidence(),
             RouteLedgerEvidence {
@@ -1005,7 +1286,13 @@ mod tests {
         );
         assert_eq!(
             ledger
-                .prepare_redirect(&second, &account, assignment("a"), Instant::now())
+                .prepare_redirect(
+                    &second,
+                    &account,
+                    assignment("a"),
+                    Instant::now(),
+                    RedirectReason::Balance(Factor::Connection)
+                )
                 .err(),
             Some(LedgerError::CoolingDown),
             "the ordinary path keeps its cooldown and same-account refusal"
@@ -1049,8 +1336,8 @@ mod tests {
                 ..Accounting::default()
             })
         );
-        assert_eq!(ledger.close(&session), Settlement::Applied);
-        assert_eq!(ledger.close(&session), Settlement::Ignored);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Ignored);
         assert_eq!(ledger.finish(&first, true), Settlement::Ignored);
         assert_eq!(ledger.counts(&account), Some(Accounting::default()));
         assert!(matches!(
@@ -1080,7 +1367,7 @@ mod tests {
             })
         );
         assert_eq!(ledger.finish(&second, true), Settlement::Applied);
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert_eq!(ledger.counts(&new), Some(Accounting::default()));
     }
 
@@ -1091,13 +1378,13 @@ mod tests {
         let session = must(ledger.open());
         let first = must(ledger.reserve(&session, &old, assignment("a")));
         assert!(!ledger.prune(&old));
-        assert_eq!(ledger.close(&session), Settlement::Applied);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Applied);
         assert!(ledger.prune(&old));
         let new = must(ledger.add_account());
         let replacement = must(ledger.open());
         let next = must(ledger.reserve(&replacement, &new, assignment("a")));
         assert_eq!(ledger.finish(&first, true), Settlement::Ignored);
-        assert_eq!(ledger.close(&session), Settlement::Ignored);
+        assert_eq!(ledger.close(&session, Instant::now()), Settlement::Ignored);
         assert_eq!(
             ledger.counts(&new),
             Some(Accounting {
@@ -1120,7 +1407,10 @@ mod tests {
         let reservation = must(left.reserve(&session_left, &account_left, assignment("a")));
         let _ = must(right.reserve(&session_right, &account_right, assignment("a")));
         assert_eq!(right.finish(&reservation, true), Settlement::Ignored);
-        assert_eq!(right.close(&session_left), Settlement::Ignored);
+        assert_eq!(
+            right.close(&session_left, Instant::now()),
+            Settlement::Ignored
+        );
         assert!(right.counts(&account_left).is_none());
         assert!(!right.prune(&account_left));
         assert_eq!(
@@ -1146,7 +1436,7 @@ mod tests {
         ));
         assert_eq!(ledger.counts(&account), Some(Accounting::default()));
         assert!(must(ledger.pending(&session)).is_none());
-        ledger.close(&session);
+        ledger.close(&session, Instant::now());
         assert!(ledger.sessions.is_empty());
         ledger.next_session = u64::MAX;
         assert!(matches!(ledger.open(), Err(LedgerError::Exhausted)));
@@ -1169,7 +1459,7 @@ mod tests {
             ledger.counts(&account).map(Accounting::connection_score),
             Some(2)
         );
-        ledger.close(&first);
+        ledger.close(&first, Instant::now());
         assert_eq!(
             ledger.counts(&account),
             Some(Accounting {
@@ -1228,7 +1518,10 @@ mod tests {
                     );
                 }
                 "close" => {
-                    ledger.close(session.as_ref().unwrap_or_else(|| unreachable!()));
+                    ledger.close(
+                        session.as_ref().unwrap_or_else(|| unreachable!()),
+                        Instant::now(),
+                    );
                 }
                 "old_commit" | "old_fail" => {
                     ledger.finish(

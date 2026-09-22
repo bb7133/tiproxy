@@ -67,6 +67,8 @@ const HANDSHAKE_BUCKETS: [f64; 29] = QUERY_BUCKETS;
 const QUERY_AGE_BUCKETS: [f64; 21] = exponential_buckets(1.0, 2.0);
 const CONN_LIFETIME_BUCKETS: [f64; 25] = exponential_buckets(0.1, 2.0);
 const GET_BACKEND_BUCKETS: [f64; 26] = exponential_buckets(0.000_001, 2.0);
+/// Go `MigrateDurationHistogram`: ExponentialBuckets(0.0001, 2, 26), 0.1ms ~ 1h.
+const MIGRATE_BUCKETS: [f64; 26] = exponential_buckets(0.000_1, 2.0);
 
 const fn exponential_buckets<const N: usize>(start: f64, factor: f64) -> [f64; N] {
     let mut buckets = [0.0; N];
@@ -123,7 +125,21 @@ pub struct MetricSpec {
 }
 
 /// The closed metric catalog, sorted by name (the order the Go gatherer uses).
-pub const METRIC_SPECS: [MetricSpec; 22] = [
+pub const METRIC_SPECS: [MetricSpec; 32] = [
+    MetricSpec {
+        name: "tiproxy_backend_b_status",
+        help: "Gauge of backend status.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_backend_metric",
+        help: "The backend metric.",
+        kind: MetricKind::Gauge,
+        labels: &["backend", "metric"],
+        buckets: &[],
+    },
     MetricSpec {
         name: "tiproxy_backend_dial_backend_fail",
         help: "Counter of failing to dial backends.",
@@ -146,10 +162,59 @@ pub const METRIC_SPECS: [MetricSpec; 22] = [
         buckets: &GET_BACKEND_BUCKETS,
     },
     MetricSpec {
+        name: "tiproxy_backend_health_check_seconds",
+        help: "Time (s) of each health check cycle.",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        buckets: &[],
+    },
+    MetricSpec {
         name: "tiproxy_backend_keepalive_update_total",
         help: "Counter of health-driven backend keepalive policy updates.",
         kind: MetricKind::Counter,
         labels: &["backend", "health", "result"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_backend_ping_duration_seconds",
+        help: "Time (s) of pinging the SQL port of each backend.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_b_conn",
+        help: "Number of backend connections.",
+        kind: MetricKind::Gauge,
+        labels: &["backend"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_b_score",
+        help: "Gauge of backend scores.",
+        kind: MetricKind::Gauge,
+        labels: &["backend", "factor"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_migrate_duration_seconds",
+        help: "Bucketed histogram of migrating time (s) of sessions.",
+        kind: MetricKind::Histogram,
+        labels: &["from", "migrate_res", "to"],
+        buckets: &MIGRATE_BUCKETS,
+    },
+    MetricSpec {
+        name: "tiproxy_balance_migrate_total",
+        help: "Number and result of session migration.",
+        kind: MetricKind::Counter,
+        labels: &["from", "migrate_res", "reason", "to"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_balance_pending_migrate",
+        help: "Number of pending session migration.",
+        kind: MetricKind::Gauge,
+        labels: &["from", "reason", "to"],
         buckets: &[],
     },
     MetricSpec {
@@ -198,6 +263,13 @@ pub const METRIC_SPECS: [MetricSpec; 22] = [
         name: "tiproxy_server_event",
         help: "Counter of TiProxy event.",
         kind: MetricKind::Counter,
+        labels: &["type"],
+        buckets: &[],
+    },
+    MetricSpec {
+        name: "tiproxy_server_owner",
+        help: "The TiProxy owner of each job type.",
+        kind: MetricKind::Gauge,
         labels: &["type"],
         buckets: &[],
     },
@@ -369,15 +441,119 @@ impl RegistryState {
     }
 }
 
+/// Supplies the authoritative migration state at render time.
+///
+/// The three session-migration families are not accumulated from
+/// notifications: a bounded queue drops observations by design, and a lost one
+/// would make a delta permanently wrong. They are read from router and
+/// process state instead, so a missed notification costs at most staleness.
+///
+/// Implementations take router locks, so this is called with **no** registry
+/// lock held: the settlement path runs router lock then registry, and
+/// inverting that here would deadlock against it.
+pub trait MigrationStateSource: Send + Sync {
+    /// In-flight counts summed over live incarnations, plus the process-level
+    /// cumulative history.
+    fn migration_state(&self) -> control_router::MigrationSnapshot;
+}
+
+/// Authoritative source for the three backend health families.
+///
+/// Separate from [`MigrationStateSource`] because the state has a different
+/// owner: these values are written by the topology health child and by the
+/// SQL probes, not by any router. Like the migration source it is read
+/// without the registry lock, and for the same reason -- the provider takes
+/// the history's own lock, and a scrape must never be able to hold a health
+/// round up behind the exposition.
+pub trait HealthStateSource: Send + Sync {
+    /// The current value of every backend health series.
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot;
+}
+
+/// The history itself is the source: it already holds exactly the values the
+/// three families expose, so an adapter would only forward `snapshot`.
+impl HealthStateSource for control_topology::BackendHealthHistory {
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+        self.snapshot()
+    }
+}
+
+/// Authoritative source for `backend_metric`.
+pub trait BackendMetricStateSource: Send + Sync {
+    /// The retained raw backend observations.
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl BackendMetricStateSource for control_router::BackendMetricHistory {
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+        self.snapshot()
+    }
+}
+
+/// Authoritative source for `b_score`.
+///
+/// Held separately again because the writer is the balance round and the
+/// retention rule is its own: the family survives a backend leaving the
+/// topology and is cleared only by a configuration change.
+pub trait ScoreStateSource: Send + Sync {
+    /// The retained per-factor scores.
+    fn score_state(&self) -> control_router::ScoreSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl ScoreStateSource for control_router::ScoreHistory {
+    fn score_state(&self) -> control_router::ScoreSnapshot {
+        self.snapshot()
+    }
+}
+
+/// Authoritative source for `server_owner`.
+///
+/// Separate again from the health families: the writers are the election
+/// workers, and the state is a set of held elections rather than a map of
+/// values, because Go deletes the child on retirement instead of zeroing it.
+pub trait OwnerStateSource: Send + Sync {
+    /// The elections this process holds right now.
+    fn owner_state(&self) -> control_topology::OwnerSnapshot;
+}
+
+/// The history itself is the source; an adapter would only forward.
+impl OwnerStateSource for control_topology::ElectionOwnerHistory {
+    fn owner_state(&self) -> control_topology::OwnerSnapshot {
+        self.snapshot()
+    }
+}
+
 /// Process-local cumulative store behind the native Prometheus exposition.
 ///
-/// The exporter feeds it through the same [`Aggregator`] mapping that produces
-/// the bridge deltas, so the `/metrics` text rendered here and the Go-side
-/// merge of those deltas describe the same series. Counters and histograms
-/// reset with the process, which is ordinary Prometheus counter semantics.
-#[derive(Debug, Default)]
+/// Counters and histograms reset with the process, which is ordinary
+/// Prometheus counter semantics. The three session-migration families are the
+/// exception: nothing about them is stored here, they are read from
+/// authoritative state when the exposition renders.
+#[derive(Default)]
 pub struct MetricsRegistry {
     state: Mutex<RegistryState>,
+    /// Deliberately not inside `state`: reading it must not need the lock
+    /// that rendering takes, so the snapshot can be fetched before it.
+    migrations: Mutex<Option<Arc<dyn MigrationStateSource>>>,
+    /// The backend health families' source, held for the same reason.
+    health: Mutex<Option<Arc<dyn HealthStateSource>>>,
+    /// `server_owner`'s source, held for the same reason.
+    owner: Mutex<Option<Arc<dyn OwnerStateSource>>>,
+    /// `b_score`'s source, held for the same reason.
+    scores: Mutex<Option<Arc<dyn ScoreStateSource>>>,
+    /// `backend_metric`'s source, held for the same reason.
+    backend_metrics: Mutex<Option<Arc<dyn BackendMetricStateSource>>>,
+}
+
+impl std::fmt::Debug for MetricsRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetricsRegistry")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MetricsRegistry {
@@ -385,6 +561,141 @@ impl MetricsRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs the authoritative source for the migration families.
+    pub fn set_migration_state_source(&self, source: Arc<dyn MigrationStateSource>) {
+        *self
+            .migrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Installs the authoritative source for the backend health families.
+    pub fn set_health_state_source(&self, source: Arc<dyn HealthStateSource>) {
+        *self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads health state while holding no registry lock, as for migrations.
+    fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+        let source = self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.health_state())
+            .unwrap_or_default()
+    }
+
+    /// Installs the authoritative source for `backend_metric`.
+    pub fn set_backend_metric_state_source(&self, source: Arc<dyn BackendMetricStateSource>) {
+        *self
+            .backend_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads the observations while holding no registry lock, as for the rest.
+    fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+        let source = self
+            .backend_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.backend_metric_state())
+            .unwrap_or_default()
+    }
+
+    /// Label pairs the observation retention refused.
+    #[must_use]
+    pub fn backend_metric_labels_dropped(&self) -> u64 {
+        self.backend_metric_state().labels_dropped
+    }
+
+    /// Installs the authoritative source for `b_score`.
+    pub fn set_score_state_source(&self, source: Arc<dyn ScoreStateSource>) {
+        *self
+            .scores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads score state while holding no registry lock, as for the rest.
+    fn score_state(&self) -> control_router::ScoreSnapshot {
+        let source = self
+            .scores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.score_state())
+            .unwrap_or_default()
+    }
+
+    /// Label pairs the score retention refused, folded into the same counter.
+    #[must_use]
+    pub fn score_labels_dropped(&self) -> u64 {
+        self.score_state().labels_dropped
+    }
+
+    /// Installs the authoritative source for `server_owner`.
+    pub fn set_owner_state_source(&self, source: Arc<dyn OwnerStateSource>) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// Reads election state while holding no registry lock, as for the rest.
+    fn owner_state(&self) -> control_topology::OwnerSnapshot {
+        let source = self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.owner_state())
+            .unwrap_or_default()
+    }
+
+    /// Elections the retained set refused, folded into the same counter.
+    #[must_use]
+    pub fn owner_labels_dropped(&self) -> u64 {
+        self.owner_state().labels_dropped
+    }
+
+    /// Addresses the health retention refused, folded into the same visible
+    /// dropped-observation counter as every other shed signal.
+    #[must_use]
+    pub fn health_labels_dropped(&self) -> u64 {
+        self.health_state().labels_dropped
+    }
+
+    /// Label sets the migration retention refused, for the same visible
+    /// dropped-observation counter every other shed signal reports through.
+    /// A silent overflow would be worse here than before, since this path
+    /// replaced one that was already counted.
+    #[must_use]
+    pub fn migration_labels_dropped(&self) -> u64 {
+        self.migration_state().history.labels_dropped
+    }
+
+    /// Reads migration state while holding no registry lock: the source is
+    /// cloned out and its guard dropped before the provider runs.
+    fn migration_state(&self) -> control_router::MigrationSnapshot {
+        let source = self
+            .migrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        source
+            .map(|source| source.migration_state())
+            .unwrap_or_default()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
@@ -454,9 +765,42 @@ impl MetricsRegistry {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn render_prometheus_text(&self) -> String {
+        // Fetched first, holding nothing: the provider takes router locks and
+        // the settlement path already runs router lock then registry.
+        let migrations = self.migration_state();
+        let health = self.health_state();
+        let owner = self.owner_state();
+        let scores = self.score_state();
+        let observations = self.backend_metric_state();
         let state = self.lock();
         let mut out = String::new();
         for spec in &METRIC_SPECS {
+            if let Some(rendered) = render_backend_metric_family(spec, &observations) {
+                // Owned by the resource and health factors.
+                out.push_str(&rendered);
+                continue;
+            }
+            if let Some(rendered) = render_score_family(spec, &scores) {
+                // Owned by the balance round, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
+            if let Some(rendered) = render_owner_family(spec, &owner) {
+                // Owned by the election workers, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
+            if let Some(rendered) = render_health_family(spec, &health) {
+                // Owned by the topology health path, never accumulated here.
+                out.push_str(&rendered);
+                continue;
+            }
+            if let Some(rendered) = render_migration_family(spec, &migrations) {
+                // Served from authoritative state, never from anything this
+                // registry accumulated.
+                out.push_str(&rendered);
+                continue;
+            }
             let mut lines = String::new();
             match spec.kind {
                 MetricKind::Counter => {
@@ -537,6 +881,319 @@ fn push_histogram(
     );
     push_sample(out, spec.name, "_sum", labels, None, value.sum);
     push_sample(out, spec.name, "_count", labels, None, value.count as f64);
+}
+
+/// Renders one of the three session-migration families from authoritative
+/// state, or `None` for any other family.
+///
+/// Label order matches Go's exposition, which sorts label pairs by name.
+fn render_migration_family(
+    spec: &MetricSpec,
+    state: &control_router::MigrationSnapshot,
+) -> Option<String> {
+    let mut lines = String::new();
+    match spec.name {
+        "tiproxy_balance_b_conn" => render_backend_connections(spec, state, &mut lines),
+        "tiproxy_balance_pending_migrate" => {
+            // Every label set ever seen is emitted, so a series that has
+            // returned to zero keeps reporting instead of disappearing.
+            for (from, to, reason) in &state.history.known_pending {
+                let labels = control_router::MigrationLabels {
+                    from: from.clone(),
+                    to: to.clone(),
+                    reason: *reason,
+                };
+                let value = state.pending.get(&labels).copied().unwrap_or(0);
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[
+                        ("from", from.clone()),
+                        ("reason", reason.metric_name().to_owned()),
+                        ("to", to.clone()),
+                    ],
+                    None,
+                    counter_as_f64(value),
+                );
+            }
+        }
+        "tiproxy_balance_migrate_total" => {
+            for (key, count) in &state.history.terminals {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[
+                        ("from", key.from.clone()),
+                        ("migrate_res", migrate_result(key.succeeded).to_owned()),
+                        ("reason", key.reason.metric_name().to_owned()),
+                        ("to", key.to.clone()),
+                    ],
+                    None,
+                    counter_as_f64(*count),
+                );
+            }
+        }
+        "tiproxy_balance_migrate_duration_seconds" => {
+            for (key, series) in &state.history.durations {
+                let labels = [
+                    ("from", key.from.clone()),
+                    ("migrate_res", migrate_result(key.succeeded).to_owned()),
+                    ("to", key.to.clone()),
+                ];
+                for (count, bound) in series
+                    .buckets
+                    .iter()
+                    .zip(control_router::MIGRATE_DURATION_BUCKETS)
+                {
+                    push_sample(
+                        &mut lines,
+                        spec.name,
+                        "_bucket",
+                        &labels,
+                        Some(bound),
+                        counter_as_f64(*count),
+                    );
+                }
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "_bucket",
+                    &labels,
+                    Some(f64::INFINITY),
+                    counter_as_f64(series.count),
+                );
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a summed latency never approaches 2^53 nanoseconds"
+                )]
+                let sum = series.sum_nanos as f64 / 1e9;
+                push_sample(&mut lines, spec.name, "_sum", &labels, None, sum);
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "_count",
+                    &labels,
+                    None,
+                    counter_as_f64(series.count),
+                );
+            }
+        }
+        _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// The three families whose values the topology health path owns.
+///
+/// `b_status` and `ping_duration_seconds` are `GaugeVec`s in Go, so they have
+/// no children until something sets one and are absent from the exposition
+/// until then. `health_check_seconds` is a plain `Gauge`, registered at
+/// startup, so it reports `0` before the first cycle completes rather than
+/// being absent.
+fn render_health_family(
+    spec: &MetricSpec,
+    state: &control_topology::HealthMetricsSnapshot,
+) -> Option<String> {
+    let mut lines = String::new();
+    match spec.name {
+        "tiproxy_backend_b_status" => {
+            for (address, healthy) in &state.status {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[("backend", address.clone())],
+                    None,
+                    if *healthy { 1.0 } else { 0.0 },
+                );
+            }
+        }
+        "tiproxy_backend_ping_duration_seconds" => {
+            for (address, sample) in &state.ping {
+                push_sample(
+                    &mut lines,
+                    spec.name,
+                    "",
+                    &[("backend", address.clone())],
+                    None,
+                    sample.seconds,
+                );
+            }
+        }
+        "tiproxy_backend_health_check_seconds" => {
+            push_sample(
+                &mut lines,
+                spec.name,
+                "",
+                &[],
+                None,
+                state.cycle_seconds.unwrap_or(0.0),
+            );
+        }
+        _ => return None,
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `backend_metric`: one sample per retained `(backend, metric)` pair.
+fn render_backend_metric_family(
+    spec: &MetricSpec,
+    state: &control_router::BackendMetricSnapshot,
+) -> Option<String> {
+    if spec.name != "tiproxy_backend_backend_metric" {
+        return None;
+    }
+    let mut lines = String::new();
+    // Ordered by the rendered label, for the same reason `b_score` is: the
+    // enum's order is not the label's.
+    let mut rows: Vec<(&str, &'static str, f64)> = state
+        .values
+        .iter()
+        .map(|((address, metric), value)| (address.as_str(), metric.label(), *value))
+        .collect();
+    rows.sort_unstable_by_key(|(address, metric, _)| (*address, *metric));
+    for (address, metric, value) in rows {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[
+                ("backend", address.to_owned()),
+                ("metric", metric.to_owned()),
+            ],
+            None,
+            value,
+        );
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `b_score`: one sample per retained `(backend, factor)` pair.
+fn render_score_family(spec: &MetricSpec, state: &control_router::ScoreSnapshot) -> Option<String> {
+    if spec.name != "tiproxy_balance_b_score" {
+        return None;
+    }
+    let mut lines = String::new();
+    // Ordered by the rendered label, not by the `Factor` discriminant: the
+    // Go gatherer sorts label values, and the enum's declaration order is
+    // policy priority, which puts `cpu` before `conn` where Go puts `conn`
+    // first.
+    let mut rows: Vec<(&str, &'static str, u64)> = state
+        .scores
+        .iter()
+        .map(|((address, factor), score)| (address.as_str(), factor.metric_name(), *score))
+        .collect();
+    rows.sort_unstable_by_key(|(address, factor, _)| (*address, *factor));
+    for (address, factor, score) in rows {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[
+                ("backend", address.to_owned()),
+                ("factor", factor.to_owned()),
+            ],
+            None,
+            counter_as_f64(score),
+        );
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// `server_owner`: one sample at `1` per held election, and no series at all
+/// for an election this process does not hold.
+///
+/// Go deletes the child on retirement rather than setting it to zero, so a
+/// rendering that emitted `0` for a lost election would be making a claim Go
+/// deliberately does not make on the dashboard.
+fn render_owner_family(
+    spec: &MetricSpec,
+    state: &control_topology::OwnerSnapshot,
+) -> Option<String> {
+    if spec.name != "tiproxy_server_owner" {
+        return None;
+    }
+    let mut lines = String::new();
+    for job in &state.owned {
+        push_sample(
+            &mut lines,
+            spec.name,
+            "",
+            &[("type", job.clone())],
+            None,
+            1.0,
+        );
+    }
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "# HELP {} {}", spec.name, escape_help(spec.help));
+    let _ = writeln!(out, "# TYPE {} {}", spec.name, spec.kind.exposition_type());
+    out.push_str(&lines);
+    Some(out)
+}
+
+/// Counters are rendered as floats, as Prometheus text exposition requires.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a migration counter never approaches 2^53"
+)]
+const fn counter_as_f64(value: u64) -> f64 {
+    value as f64
+}
+
+/// Connections per backend address, summed across incarnations.
+fn render_backend_connections(
+    spec: &MetricSpec,
+    state: &control_router::MigrationSnapshot,
+    lines: &mut String,
+) {
+    for (address, active) in &state.backend_connections {
+        push_sample(
+            lines,
+            spec.name,
+            "",
+            &[("backend", address.clone())],
+            None,
+            counter_as_f64(*active),
+        );
+    }
+}
+
+/// Go `succeedToLabel`.
+const fn migrate_result(succeeded: bool) -> &'static str {
+    if succeeded { "succeed" } else { "fail" }
 }
 
 fn push_sample(
@@ -636,6 +1293,30 @@ pub enum Observation {
         /// Whether the backend is in the proxy's local location.
         local: bool,
     },
+    /// A session migration was accepted and is now in flight. Go increments
+    /// `pending_migrate` at this point, only for an accepted offer.
+    MigrationIssued {
+        /// Source backend address.
+        from: String,
+        /// Destination backend address.
+        to: String,
+        /// Reason label frozen when the redirect was issued.
+        reason: &'static str,
+    },
+    /// A session migration reached its terminal state. Go decrements
+    /// `pending_migrate`, counts the result, and observes the elapsed time.
+    MigrationSettled {
+        /// Source backend address.
+        from: String,
+        /// Destination backend address.
+        to: String,
+        /// The same frozen reason the issue carried.
+        reason: &'static str,
+        /// Whether the migration succeeded.
+        succeeded: bool,
+        /// Issue-to-settlement elapsed time.
+        elapsed: Duration,
+    },
     /// One admitted session closed.
     SessionClosed {
         /// Exact Go-compatible quit source.
@@ -654,8 +1335,72 @@ impl Observation {
             | Self::BackendKeepaliveUpdated { backend, .. }
             | Self::HandshakeCompleted { backend, .. }
             | Self::CommandCompleted { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
+            // Both endpoints are label values, so both are bounded.
+            Self::MigrationIssued { from, to, .. } | Self::MigrationSettled { from, to, .. } => {
+                from.len() <= MAX_LABEL_BYTES && to.len() <= MAX_LABEL_BYTES
+            }
             Self::GetBackend { .. } | Self::SessionClosed { .. } => true,
         }
+    }
+}
+
+/// Publishes router migration observations onto the metrics path.
+///
+/// `control-router` records migrations but owns no registry, and it cannot
+/// depend on this crate, so the composition root installs this adapter. The
+/// recorder is non-blocking: a full queue drops the sample rather than stalling
+/// a routing settlement.
+pub struct MigrationMetrics {
+    recorder: MetricsRecorder,
+}
+
+impl MigrationMetrics {
+    /// Wraps the process recorder as a router migration sink.
+    #[must_use]
+    pub const fn new(recorder: MetricsRecorder) -> Self {
+        Self { recorder }
+    }
+}
+
+/// Reads migration state from the route plane for the exposition.
+pub struct PlaneMigrationState {
+    handle: control_router::RoutePlaneHandle,
+}
+
+impl PlaneMigrationState {
+    /// Wraps the route-plane handle as the exposition's state source.
+    #[must_use]
+    pub const fn new(handle: control_router::RoutePlaneHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl MigrationStateSource for PlaneMigrationState {
+    fn migration_state(&self) -> control_router::MigrationSnapshot {
+        self.handle.migration_snapshot()
+    }
+}
+
+impl control_router::MigrationSink for MigrationMetrics {
+    fn record(&self, observation: control_router::MigrationObservation) {
+        let reason = observation.reason.metric_name();
+        let sample = match observation.outcome {
+            control_router::MigrationOutcome::Issued => Observation::MigrationIssued {
+                from: observation.from,
+                to: observation.to,
+                reason,
+            },
+            control_router::MigrationOutcome::Settled { success, elapsed } => {
+                Observation::MigrationSettled {
+                    from: observation.from,
+                    to: observation.to,
+                    reason,
+                    succeeded: success,
+                    elapsed,
+                }
+            }
+        };
+        self.recorder.try_record(sample);
     }
 }
 
@@ -759,6 +1504,21 @@ impl Aggregator {
         }
     }
 
+    fn get_backend(&mut self, duration: Duration, succeeded: bool) {
+        self.histogram(
+            MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
+            duration.as_secs_f64(),
+            &GET_BACKEND_BUCKETS,
+        );
+        self.counter(
+            MetricKey::new(
+                "tiproxy_backend_get_backend",
+                vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
+            ),
+            1,
+        );
+    }
+
     fn counter(&mut self, key: MetricKey, delta: u64) {
         if delta == 0 {
             return;
@@ -821,20 +1581,11 @@ impl Aggregator {
             Observation::GetBackend {
                 duration,
                 succeeded,
-            } => {
-                self.histogram(
-                    MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
-                    duration.as_secs_f64(),
-                    &GET_BACKEND_BUCKETS,
-                );
-                self.counter(
-                    MetricKey::new(
-                        "tiproxy_backend_get_backend",
-                        vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
-                    ),
-                    1,
-                );
-            }
+            } => self.get_backend(duration, succeeded),
+            // The three migration families render from authoritative router
+            // and process state, so accumulating them here would double
+            // count. These observations remain a notification path only.
+            Observation::MigrationIssued { .. } | Observation::MigrationSettled { .. } => {}
             Observation::DialBackendFailed { backend } => self.counter(
                 MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
@@ -1225,14 +1976,20 @@ async fn run_exporter(
             _ = ticker.tick() => {
                 let server = serving.metrics().await;
                 // Every shed observation is one external signal: the SQL-path
-                // queue, the per-batch series bound, and the registry's
-                // cumulative series bound all count as dropped observations.
+                // queue, the per-batch series bound, the registry's cumulative
+                // series bound, and the migration retention ceiling all count
+                // as dropped observations.
                 let (current, active_connections) = ExportTotals::sample(
                     server,
                     dropped
                         .load(Ordering::Relaxed)
                         .saturating_add(aggregator.overflow_dropped)
-                        .saturating_add(registry.series_dropped()),
+                        .saturating_add(registry.series_dropped())
+                        .saturating_add(registry.migration_labels_dropped())
+                        .saturating_add(registry.health_labels_dropped())
+                        .saturating_add(registry.owner_labels_dropped())
+                        .saturating_add(registry.score_labels_dropped())
+                        .saturating_add(registry.backend_metric_labels_dropped()),
                     &client,
                     &dispatch,
                 );
@@ -1664,6 +2421,342 @@ mod tests {
     /// batch. Must equal the generator's constants.
     const FIXED_KEEP_ALIVES: u32 = 3;
     const FIXED_TIME_JUMPS: u32 = 2;
+    /// `CodexM5`'s full-queue regression, restated for the pull design. Its
+    /// point is unchanged: once the terminal notification is lost and no
+    /// further event will arrive, the exposition must still be right.
+    #[test]
+    fn review_full_queue_cannot_leave_settled_migration_pending() {
+        struct Settled;
+        impl MigrationStateSource for Settled {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let mut snapshot = control_router::MigrationSnapshot::default();
+                // The migration finished; nothing is in flight.
+                snapshot.history.known_pending.insert((
+                    "127.0.0.1:4000".to_owned(),
+                    "127.0.0.1:4001".to_owned(),
+                    control_router::RedirectReason::Test,
+                ));
+                snapshot.history.terminals.insert(
+                    control_router::TerminalKey {
+                        from: "127.0.0.1:4000".to_owned(),
+                        to: "127.0.0.1:4001".to_owned(),
+                        reason: control_router::RedirectReason::Test,
+                        succeeded: true,
+                    },
+                    1,
+                );
+                snapshot
+            }
+        }
+
+        // Reproduce the real loss: a capacity-one queue cannot carry both
+        // ends, so one of them is genuinely dropped.
+        let (recorder, _receiver) = MetricsRecorder::channel(1);
+        let sink = MigrationMetrics::new(recorder.clone());
+        let event = |outcome| control_router::MigrationObservation {
+            from: "127.0.0.1:4000".to_owned(),
+            to: "127.0.0.1:4001".to_owned(),
+            reason: control_router::RedirectReason::Test,
+            outcome,
+        };
+        control_router::MigrationSink::record(
+            &sink,
+            event(control_router::MigrationOutcome::Issued),
+        );
+        control_router::MigrationSink::record(
+            &sink,
+            event(control_router::MigrationOutcome::Settled {
+                success: true,
+                elapsed: Duration::from_millis(2),
+            }),
+        );
+        assert_eq!(
+            recorder.dropped(),
+            1,
+            "fixture must reach real bounded queue loss"
+        );
+
+        let registry = MetricsRegistry::new();
+        registry.set_migration_state_source(Arc::new(Settled));
+        let rendered = registry.render_prometheus_text();
+        assert!(
+            rendered.contains(
+                "tiproxy_balance_pending_migrate{from=\"127.0.0.1:4000\",reason=\"test\",to=\"127.0.0.1:4001\"} 0"
+            ),
+            "a dropped terminal must not leave a phantom pending:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("tiproxy_balance_migrate_total{") && rendered.contains("} 1"),
+            "and the terminal must still be counted:\n{rendered}"
+        );
+    }
+
+    /// A refused label set must reach the same visible counter as every other
+    /// shed signal. It replaced a path that was already counted, so leaving it
+    /// only in the snapshot would make overflow quieter than before.
+    #[test]
+    fn refused_label_sets_reach_the_visible_dropped_counter() {
+        struct Flood;
+        impl MigrationStateSource for Flood {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let history = control_router::MigrationHistory::default();
+                for index in 0..(control_router::MAX_RETAINED_LABEL_SETS + 5) {
+                    history.remember(
+                        &format!("10.0.0.1:{index}"),
+                        "10.0.0.2:4000",
+                        control_router::RedirectReason::Test,
+                    );
+                }
+                control_router::MigrationSnapshot {
+                    pending: BTreeMap::new(),
+                    backend_connections: BTreeMap::new(),
+                    history: history.snapshot(),
+                }
+            }
+        }
+        let registry = MetricsRegistry::new();
+        assert_eq!(
+            registry.migration_labels_dropped(),
+            0,
+            "nothing refused before a source is installed"
+        );
+        registry.set_migration_state_source(Arc::new(Flood));
+        assert_eq!(registry.migration_labels_dropped(), 5);
+    }
+
+    /// `CodexM5`'s capacity regression, restated: the bound has to hold on the
+    /// structures that actually grow, and be visible at the render entry.
+    #[test]
+    fn review_migration_state_is_bounded_with_registry() {
+        struct Flood;
+        impl MigrationStateSource for Flood {
+            fn migration_state(&self) -> control_router::MigrationSnapshot {
+                let history = control_router::MigrationHistory::default();
+                for index in 0..(control_router::MAX_RETAINED_LABEL_SETS + 64) {
+                    history.remember(
+                        &format!("10.0.0.1:{index}"),
+                        "10.0.0.2:4000",
+                        control_router::RedirectReason::Test,
+                    );
+                }
+                control_router::MigrationSnapshot {
+                    pending: BTreeMap::new(),
+                    backend_connections: BTreeMap::new(),
+                    history: history.snapshot(),
+                }
+            }
+        }
+
+        let state = Flood.migration_state();
+        assert_eq!(
+            state.history.known_pending.len(),
+            control_router::MAX_RETAINED_LABEL_SETS,
+            "retention is bounded on the structure that grows"
+        );
+        assert_eq!(state.history.labels_dropped, 64);
+        let registry = MetricsRegistry::new();
+        registry.set_migration_state_source(Arc::new(Flood));
+        let rendered = registry.render_prometheus_text();
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("tiproxy_balance_pending_migrate{"))
+                .count(),
+            control_router::MAX_RETAINED_LABEL_SETS,
+            "the exposition cannot emit more series than are retained"
+        );
+    }
+
+    /// The duration bounds exist in two crates: the router buckets a
+    /// settlement when it records it, and this catalogue declares the same
+    /// bounds for the exposition. They must stay identical or the rendered
+    /// histogram would not match the counts behind it.
+    #[test]
+    fn migrate_buckets_match_the_router_that_fills_them() {
+        assert_eq!(
+            MIGRATE_BUCKETS.as_slice(),
+            control_router::MIGRATE_DURATION_BUCKETS.as_slice()
+        );
+    }
+
+    /// Mirrors `fixedBackendMetrics` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// `10.0.0.2:4000` carries health indicators and no resource samples:
+    /// Go writes only what each factor accepted, so a backend with a
+    /// partial row is the ordinary case, not a fixture shortcut.
+    struct FixedBackendMetrics;
+
+    impl BackendMetricStateSource for FixedBackendMetrics {
+        fn backend_metric_state(&self) -> control_router::BackendMetricSnapshot {
+            use control_router::BackendMetric;
+            control_router::BackendMetricSnapshot {
+                values: [
+                    (("10.0.0.1:4000".to_owned(), BackendMetric::Cpu), 0.25),
+                    (("10.0.0.1:4000".to_owned(), BackendMetric::Memory), 0.5),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::FailurePd), 2.0),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::TotalPd), 100.0),
+                    (
+                        ("10.0.0.2:4000".to_owned(), BackendMetric::FailureTikv),
+                        0.0,
+                    ),
+                    (("10.0.0.2:4000".to_owned(), BackendMetric::TotalTikv), 40.0),
+                ]
+                .into_iter()
+                .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
+    /// Mirrors `fixedBackendScores` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// A backend need not carry every factor: Go writes whatever the
+    /// configured factor set produced, so a partial row is a real shape and
+    /// not a fixture shortcut.
+    struct FixedScores;
+
+    impl ScoreStateSource for FixedScores {
+        fn score_state(&self) -> control_router::ScoreSnapshot {
+            use control_router::Factor;
+            control_router::ScoreSnapshot {
+                scores: [
+                    (("10.0.0.1:4000".to_owned(), Factor::Connection), 3),
+                    (("10.0.0.1:4000".to_owned(), Factor::Cpu), 1),
+                    (("10.0.0.2:4000".to_owned(), Factor::Connection), 7),
+                    (("10.0.0.3:4000".to_owned(), Factor::Status), 0),
+                ]
+                .into_iter()
+                .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
+    /// Mirrors `fixedOwnedElections` and `fixedRetiredElection` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// The Go fixture wins `metric_reader/z2` and then retires it, which
+    /// deletes the child. Nothing here represents it, because a retired
+    /// election has no series -- not a series at zero.
+    struct FixedOwner;
+
+    impl OwnerStateSource for FixedOwner {
+        fn owner_state(&self) -> control_topology::OwnerSnapshot {
+            control_topology::OwnerSnapshot {
+                owned: ["metric_reader".to_owned(), "metric_reader/z1".to_owned()]
+                    .into_iter()
+                    .collect(),
+                labels_dropped: 0,
+            }
+        }
+    }
+
+    /// Mirrors `fixedBackendHealth` and `fixedHealthCheckCycleSeconds` in
+    /// `tests/dataplane/metrics/gen/main.go`.
+    ///
+    /// `10.0.0.3:4000` reports a ping and no status: it has been dialled but
+    /// never been healthy, so Go never created its `b_status` child. A
+    /// rendering that emitted it at zero would look harmless and be wrong.
+    struct FixedHealth;
+
+    impl HealthStateSource for FixedHealth {
+        fn health_state(&self) -> control_topology::HealthMetricsSnapshot {
+            let mut snapshot = control_topology::HealthMetricsSnapshot::default();
+            snapshot.status.insert("10.0.0.1:4000".to_owned(), true);
+            snapshot.status.insert("10.0.0.2:4000".to_owned(), false);
+            for (address, seconds) in [
+                ("10.0.0.1:4000", 0.004),
+                ("10.0.0.2:4000", 0.012),
+                ("10.0.0.3:4000", 0.25),
+            ] {
+                snapshot.ping.insert(
+                    address.to_owned(),
+                    control_topology::PingSample {
+                        seconds,
+                        sequence: 0,
+                    },
+                );
+            }
+            snapshot.cycle_seconds = Some(1.5);
+            snapshot
+        }
+    }
+
+    /// Mirrors `fixedMigrations` in `tests/dataplane/metrics/gen/main.go`:
+    /// one succeeded and one failed migration whose pending series return to
+    /// zero, and a third still in flight.
+    struct FixedMigrations;
+
+    impl MigrationStateSource for FixedMigrations {
+        fn migration_state(&self) -> control_router::MigrationSnapshot {
+            let (from, to) = ("10.0.0.1:4000".to_owned(), "10.0.0.2:4000".to_owned());
+            let settled_reason =
+                control_router::RedirectReason::Balance(control_router::Factor::Connection);
+            let flight_reason =
+                control_router::RedirectReason::Balance(control_router::Factor::Status);
+            let flight_to = "10.0.0.3:4000".to_owned();
+            let mut snapshot = control_router::MigrationSnapshot::default();
+            // Mirrors `fixedBackendConns` in the Go oracle.
+            snapshot
+                .backend_connections
+                .insert("10.0.0.1:4000".to_owned(), 2);
+            snapshot
+                .backend_connections
+                .insert("10.0.0.2:4000".to_owned(), 1);
+            snapshot.pending.insert(
+                control_router::MigrationLabels {
+                    from: from.clone(),
+                    to: flight_to.clone(),
+                    reason: flight_reason,
+                },
+                1,
+            );
+            snapshot
+                .history
+                .known_pending
+                .insert((from.clone(), to.clone(), settled_reason));
+            snapshot
+                .history
+                .known_pending
+                .insert((from.clone(), flight_to, flight_reason));
+            for (succeeded, seconds) in [(true, 0.25_f64), (false, 0.5_f64)] {
+                snapshot.history.terminals.insert(
+                    control_router::TerminalKey {
+                        from: from.clone(),
+                        to: to.clone(),
+                        reason: settled_reason,
+                        succeeded,
+                    },
+                    1,
+                );
+                let mut series = control_router::DurationSeries {
+                    count: 1,
+                    sum_nanos: Duration::from_secs_f64(seconds).as_nanos(),
+                    buckets: [0; 26],
+                };
+                for (count, bound) in series
+                    .buckets
+                    .iter_mut()
+                    .zip(control_router::MIGRATE_DURATION_BUCKETS)
+                {
+                    if seconds <= bound {
+                        *count = 1;
+                    }
+                }
+                snapshot.history.durations.insert(
+                    control_router::DurationKey {
+                        from: from.clone(),
+                        to: to.clone(),
+                        succeeded,
+                    },
+                    series,
+                );
+            }
+            snapshot
+        }
+    }
 
     /// Go's monitor counts a jump only when the clock reads earlier after the
     /// wait than before it, calls back every tenth tick, and the keepalive
@@ -1993,6 +3086,26 @@ mod tests {
                 1,
             );
         }
+        // The same migration fixture the Go oracle applies. These families are
+        // rendered from authoritative state, so the fixture is installed as
+        // that state rather than pushed through the observation path.
+        aggregator
+            .registry
+            .set_migration_state_source(Arc::new(FixedMigrations));
+        // Likewise for the backend health families, which the topology path
+        // owns rather than this registry.
+        aggregator
+            .registry
+            .set_health_state_source(Arc::new(FixedHealth));
+        aggregator
+            .registry
+            .set_owner_state_source(Arc::new(FixedOwner));
+        aggregator
+            .registry
+            .set_score_state_source(Arc::new(FixedScores));
+        aggregator
+            .registry
+            .set_backend_metric_state_source(Arc::new(FixedBackendMetrics));
         let rendered = aggregator.registry.render_prometheus_text();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/dataplane/metrics");

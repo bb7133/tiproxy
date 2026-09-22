@@ -30,8 +30,41 @@ pub(crate) fn stopped(stop: &watch::Receiver<bool>) -> bool {
     *stop.borrow() || stop.has_changed().is_err()
 }
 impl Router {
+    /// Migrations in flight on this router, copied out under its own lock and
+    /// returned with that lock released. Cumulative history is deliberately
+    /// not here: it lives process-wide, so destroying this incarnation cannot
+    /// roll a cumulative series backwards.
+    ///
+    /// Must not be called while a metrics-registry lock is held: the
+    /// settlement path runs router lock then registry, and inverting that
+    /// would deadlock against it.
+    #[must_use]
+    pub fn pending_migrations(&self) -> BTreeMap<crate::MigrationLabels, u64> {
+        self.lock().ledger.pending_migrations().clone()
+    }
+
+    /// Physically owned connections per backend address on this router.
+    ///
+    /// Same lock rule as the other snapshot readers: no registry lock may be
+    /// held, since the settlement path runs router lock then registry.
+    #[must_use]
+    pub fn physical_connections(&self) -> BTreeMap<String, u64> {
+        self.lock().ledger.physical_connections()
+    }
+
+    /// The process-level cumulative history this router writes to.
+    #[must_use]
+    pub fn migration_history(&self) -> Arc<crate::MigrationHistory> {
+        Arc::clone(self.lock().ledger.history())
+    }
+
     pub(crate) fn observe_close(&self, close: &crate::ForceClose) -> crate::Settlement {
-        self.lock().ledger.observe_close(close)
+        // A force-close terminal settles any redirect still pending on that
+        // session, so it has to publish like every other terminal path.
+        let mut state = self.lock();
+        let settlement = state.ledger.observe_close(close);
+        self.publish_migrations(state.ledger.drain_migrations());
+        settlement
     }
     pub(crate) fn migration_updates(
         &self,
@@ -124,7 +157,7 @@ impl Router {
         let mut rejected = Vec::new();
         let result = {
             let mut state = self.lock();
-            (|| {
+            let outcome = (|| {
                 self.sources.validate(candidate)?;
                 state.refresh(candidate)?;
                 self.sources.validate(candidate)?;
@@ -203,7 +236,15 @@ impl Router {
                     }
                 }
                 self.close_timed_out(&mut state, candidate, sender, stop, clock, &mut rejected)
-            })()
+            })();
+            // The scheduler reaches the ledger through `offer_redirect_locked`
+            // and `close_timed_out`, both of which bypass the public router
+            // entry points that publish. This sits outside the closure on
+            // purpose: the closure has `?` and early `return Err` paths that
+            // can abort a round which already admitted some redirects, and a
+            // drain on its last line would be skipped for exactly those.
+            self.publish_migrations(state.ledger.drain_migrations());
+            outcome
         };
         // Rejected envelopes were disarmed while the router still serialized
         // cooldown state, but their values leave the router lock before drop.
@@ -455,6 +496,7 @@ impl Router {
                 source,
                 target: Arc::clone(&target.account),
                 target_id: Arc::clone(&target.source.backend_id),
+                reason: crate::RedirectReason::Test,
             };
             self.offer_redirect_locked(&mut state, &prepared, sender, now, &mut rejected)
         };

@@ -1,0 +1,108 @@
+diff --git a/rust/crates/control-router/src/ledger_redirect_tests.rs b/rust/crates/control-router/src/ledger_redirect_tests.rs
+index ce8c4cd8..2b4e6ed8 100644
+--- a/rust/crates/control-router/src/ledger_redirect_tests.rs
++++ b/rust/crates/control-router/src/ledger_redirect_tests.rs
+@@ -14,6 +14,23 @@
+ 
+ use super::*;
+ 
++#[test]
++fn review_close_settles_accepted_migration_once() {
++    let mut ledger = Ledger::new(8);
++    let a = must(ledger.add_account());
++    let b = must(ledger.add_account());
++    let session = active(&mut ledger, &a);
++    let now = Instant::now();
++    let op = must(redirect(&ledger, &session, &b, assignment("b"), now));
++    ledger.admit_redirect(op.clone(), true, now);
++    assert_eq!(ledger.drain_migrations().len(), 1);
++    assert_eq!(ledger.close(&session), Settlement::Applied);
++    assert_eq!(ledger.finish_redirect(&op, true, Instant::now()), Settlement::Ignored);
++    let events = ledger.drain_migrations();
++    assert_eq!(events.len(), 1, "accepted migration closed early must emit a terminal");
++    assert!(matches!(events[0].outcome, MigrationOutcome::Settled { success: false, .. }));
++}
++
+ fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+     result.unwrap_or_else(|error| unreachable!("fixture: {error:?}"))
+ }
+diff --git a/rust/crates/control-router/src/tests/migration.rs b/rust/crates/control-router/src/tests/migration.rs
+index 60292e9c..9b1516c7 100644
+--- a/rust/crates/control-router/src/tests/migration.rs
++++ b/rust/crates/control-router/src/tests/migration.rs
+@@ -18,6 +18,31 @@ use std::time::Instant;
+ 
+ const A: &str = "default/127.0.0.1:4000";
+ const B: &str = "default/127.0.0.1:4001";
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn review_automatic_round_publishes_before_terminal() -> TestResult {
++    #[derive(Default)]
++    struct Recording(Mutex<Vec<crate::MigrationObservation>>);
++    impl crate::MigrationSink for Recording {
++        fn record(&self, event: crate::MigrationObservation) {
++            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(event);
++        }
++    }
++    let h = Harness::with_backends("", "connection", &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])]).await?;
++    let sim = simulation(&h, 16);
++    let sink = Arc::new(Recording::default());
++    sim.router().set_migration_sink(sink.clone());
++    let c = ready(&sim).await;
++    let _sessions: Vec<_> = (0..8).map(|_| active(&sim, &c)).collect();
++    let (_stop_tx, stop) = watch::channel(false);
++    let now = Instant::now();
++    must(sim.round_at(&c, true, &stop, now, now, 1));
++    assert!(matches!(sim.take_command(), Some(crate::MigrationCommand::Redirect(_))), "fixture must admit a migration");
++    let events = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
++    assert!(!events.is_empty(), "automatic round must publish admission before any terminal");
++    assert!(events.iter().all(|e| matches!(e.outcome, crate::MigrationOutcome::Issued)));
++    Ok(())
++}
+ fn simulation(h: &Harness, capacity: usize) -> MigrationSimulation {
+     must(MigrationSimulation::new(
+         Arc::new(h.source.clone()),
+diff --git a/rust/crates/dataplane/src/observability.rs b/rust/crates/dataplane/src/observability.rs
+index f9f851d4..5e553d98 100644
+--- a/rust/crates/dataplane/src/observability.rs
++++ b/rust/crates/dataplane/src/observability.rs
+@@ -86,6 +86,39 @@ const fn exponential_buckets<const N: usize>(start: f64, factor: f64) -> [f64; N
+ /// consumer's `maxRustMetricSeries`. Beyond it new series are shed and counted.
+ const MAX_REGISTRY_SERIES: usize = 4_096;
+ 
++#[cfg(test)]
++mod review_regressions {
++    use super::*;
++    use control_router::{MigrationObservation, MigrationOutcome, MigrationSink, RedirectReason};
++
++    #[test]
++    fn review_full_queue_cannot_leave_settled_migration_pending() {
++        let (recorder, mut rx) = MetricsRecorder::channel(1);
++        let sink = MigrationMetrics::new(recorder.clone());
++        let event = |outcome| MigrationObservation {
++            from: "127.0.0.1:4000".into(), to: "127.0.0.1:4001".into(),
++            reason: RedirectReason::Test, outcome,
++        };
++        sink.record(event(MigrationOutcome::Issued));
++        sink.record(event(MigrationOutcome::Settled { success: true, elapsed: Duration::from_millis(2) }));
++        let mut aggregator = Aggregator::default();
++        while let Ok(observation) = rx.try_recv() { aggregator.observe(observation); }
++        assert_eq!(recorder.dropped(), 1, "fixture reaches real bounded queue loss");
++        assert_eq!(aggregator.migrations_in_flight.values().sum::<i64>(), 0,
++            "terminal already happened; no future event can repair phantom pending");
++    }
++
++    #[test]
++    fn review_migration_state_is_bounded_with_registry() {
++        let mut aggregator = Aggregator::default();
++        for index in 0..=MAX_REGISTRY_SERIES {
++            aggregator.migration_in_flight(&format!("backend-{index}"), "target", "conn", 1);
++        }
++        assert!(aggregator.migrations_in_flight.len() <= MAX_REGISTRY_SERIES,
++            "migration map retained {} keys despite registry bound {}", aggregator.migrations_in_flight.len(), MAX_REGISTRY_SERIES);
++    }
++}
++
+ /// Prometheus metric kind of one catalog entry.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum MetricKind {

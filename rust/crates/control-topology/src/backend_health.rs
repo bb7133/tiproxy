@@ -62,12 +62,13 @@ use std::time::Duration;
 
 use control_external::{
     ClusterHttpClient, ClusterHttpConfigError, EtcdClientConfig, HttpProbePolicy,
-    SqlGreetingConfigError, SqlGreetingProbe,
+    SqlDialObservation, SqlGreetingConfigError, SqlGreetingProbe,
 };
 use control_plane::OwnerToken;
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 
+use crate::health_history::BackendHealthHistory;
 use crate::merge::MergedBackend;
 use crate::routing_snapshot::{RoutingSnapshot, RoutingSnapshotHandle};
 
@@ -86,7 +87,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Only `server_version` (Go `ServerVersion`) is carried here; `connections` and
 /// `git_hash` are parsed for Go typed-decode parity but do not participate in the
 /// health decision and are not surfaced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendHealth {
     /// Whether the backend passed the `/status` probe this stage.
     pub healthy: bool,
@@ -98,6 +99,18 @@ pub struct BackendHealth {
     /// round uses Go's `setLocal` rule (no proxy zone → `true`; equal `zone`
     /// labels → `true`; otherwise `false`), a disabled round leaves it `false`.
     pub local: bool,
+    /// The last SQL-port dial this stage observed: Go's
+    /// `ping_duration_seconds`.
+    ///
+    /// Go times only `DialContext`, inside its retry loop, and sets the gauge
+    /// on every attempt including failures. The value is therefore the last
+    /// attempt alone -- not the whole health check, and not the retries plus
+    /// their backoff. It carries its completion instant because publication
+    /// order is dial-completion order; ordering by when the surrounding
+    /// probes finish would let a slow greeting reverse two dials. `None` when
+    /// this stage dialled the SQL port not at all, which must never be taken
+    /// as a reason to zero a value already published.
+    pub sql_dial: Option<SqlDialObservation>,
 }
 
 impl BackendHealth {
@@ -107,6 +120,7 @@ impl BackendHealth {
             healthy: false,
             server_version: None,
             local: false,
+            sql_dial: None,
         }
     }
 }
@@ -198,6 +212,11 @@ pub struct ClusterHealthNetwork {
     client_epoch: u64,
     /// The backend cluster this network's DNS/TLS material belongs to.
     cluster_name: Arc<str>,
+    /// Where a completed SQL dial publishes `ping_duration_seconds`, or
+    /// `None` for a network whose dials are not exposed (tests, and any
+    /// wiring that has not opted in). A missing history suppresses the
+    /// metric; it never changes the probe verdict.
+    health_history: Option<Arc<BackendHealthHistory>>,
 }
 
 /// A cluster health network whose fallible transport is already built but whose
@@ -276,6 +295,7 @@ impl PreparedClusterHealthNetwork {
             sql: self.sql,
             client_epoch,
             cluster_name: self.cluster_name,
+            health_history: None,
         }
     }
 }
@@ -308,6 +328,19 @@ impl ClusterHealthNetwork {
         )
     }
 
+    /// Publishes every SQL dial this network makes into the process-level
+    /// backend health gauges.
+    ///
+    /// Opt-in so that a probe built for a test exposes nothing by default. The
+    /// history is shared, not owned: all of a process's clusters write the one
+    /// `ping_duration_seconds` family, as Go's package-level `GaugeVec` is
+    /// shared by all of its observers.
+    #[must_use]
+    pub fn with_health_history(mut self, history: Arc<BackendHealthHistory>) -> Self {
+        self.health_history = Some(history);
+        self
+    }
+
     /// Probes one backend and returns its combined health verdict, mirroring Go
     /// `DefaultHealthCheck.Check`: the `/status` stage
     /// ([`Self::probe_status_port`]) first — an unhealthy status verdict is
@@ -333,16 +366,17 @@ impl ClusterHealthNetwork {
         if !status.healthy {
             return status;
         }
-        if self
+        let (reachable, sql_dial) = self
             .probe_sql_port(handle, source, backend, max_retries, retry_interval)
-            .await
-        {
-            status
+            .await;
+        if reachable {
+            BackendHealth { sql_dial, ..status }
         } else {
             BackendHealth {
                 healthy: false,
                 server_version: status.server_version,
                 local: false,
+                sql_dial,
             }
         }
     }
@@ -398,6 +432,7 @@ impl ClusterHealthNetwork {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             };
         }
         // Guard the u64 -> u16 port narrowing rather than silently truncating.
@@ -428,6 +463,7 @@ impl ClusterHealthNetwork {
                         healthy: true,
                         server_version: Some(version),
                         local: false,
+                        sql_dial: None,
                     };
                 }
                 Err(error) => {
@@ -475,42 +511,88 @@ impl ClusterHealthNetwork {
         backend: &MergedBackend,
         max_retries: u32,
         retry_interval: Duration,
-    ) -> bool {
+    ) -> (bool, Option<SqlDialObservation>) {
         if !handle.still_current(source) {
-            return false;
+            return (false, None);
         }
         if source.client_epoch != self.client_epoch
             || backend.cluster_name.as_ref() != self.cluster_name.as_ref()
         {
-            return false;
+            return (false, None);
         }
         let Some((host, port)) = split_host_port(&backend.backend.addr) else {
-            return false;
+            return (false, None);
         };
 
         let mut retries_remaining = max_retries;
+        // Go sets the gauge on every attempt, so the value it exposes is the
+        // last dial -- failures included -- not the sum of the retries.
+        let mut last_dial = None;
+        // Publishing from `last_dial` after the call would be a greeting too
+        // late: `check_once_timed` freezes the observation at the connect but
+        // only returns once the greeting read finishes. This hook runs at the
+        // freeze point instead, which is where Go calls
+        // `setPingBackendMetrics`.
+        //
+        // Lock order is gate then history, and the two checks are in that
+        // order for a reason.
+        //
+        // The identity check comes first and is the cheap one: a stale
+        // source may no longer map this address to this cluster, and a
+        // dial's sequence orders observations without authorising them, so
+        // a later dial from a retired source must not overwrite a live one.
+        //
+        // The write then happens inside the gate's commit lock, which
+        // revocation also takes. That is what makes the fence a guarantee
+        // rather than a narrowing: a revocation ordered first refuses this
+        // write, and one ordered second waits for it to finish. Checking
+        // liveness and then writing outside such a lock would leave the
+        // flip free to land between them.
+        //
+        // The closure is short and synchronous, and reaches for nothing but
+        // the history's own lock -- no await, no I/O, and in particular no
+        // publisher or watch lock, which revocation paths already hold.
+        let publish_dial = |dial: &SqlDialObservation| {
+            let Some(history) = self.health_history.as_ref() else {
+                return;
+            };
+            if !handle.still_current(source) {
+                return;
+            }
+            source.source_gate().try_commit(|| {
+                history.observe_dial(&backend.backend.addr, dial);
+            });
+        };
         loop {
             if !handle.still_current(source) {
-                return false;
+                return (false, last_dial);
             }
-            match self.sql.check_once(host, port, source.source_gate()).await {
+            // Timed inside the probe, around the connect alone: Go updates the
+            // gauge as soon as `DialContext` returns and before it reads the
+            // greeting, so a slow greeting must not land in this value.
+            let (dial, attempt) = self
+                .sql
+                .check_once_timed(host, port, source.source_gate(), &publish_dial)
+                .await;
+            last_dial = Some(dial);
+            match attempt {
                 // Never accept a live result from a superseded source.
-                Ok(()) => return handle.still_current(source),
+                Ok(()) => return (handle.still_current(source), last_dial),
                 Err(error) => {
                     // Fence-first: a stale source is terminal and wins over the
                     // failure class, so a retired source is never retried.
                     if !handle.still_current(source) {
-                        return false;
+                        return (false, last_dial);
                     }
                     if error.is_retryable() && retries_remaining > 0 {
                         retries_remaining -= 1;
                         tokio::time::sleep(retry_interval).await;
                         if !handle.still_current(source) {
-                            return false;
+                            return (false, last_dial);
                         }
                         continue;
                     }
-                    return false;
+                    return (false, last_dial);
                 }
             }
         }
@@ -585,6 +667,7 @@ mod tests {
         BackendHealth, ClusterHealthNetwork, MAX_RETRIES, RETRY_INTERVAL, decode_status_version,
     };
     use crate::discovery_publish::EpochResult;
+    use crate::health_history::BackendHealthHistory;
     use crate::merge::{MergedBackend, MergedTopology};
     use crate::model::BackendInfo;
     use crate::routing_snapshot::{
@@ -775,11 +858,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: None,
                 local: false,
+                sql_dial: None,
             },
             "a static backend (empty ip) skips the status stage (no version) and is \
              healthy through its SQL greeting"
@@ -840,11 +927,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             }
         );
         assert_eq!(
@@ -973,11 +1064,15 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: true,
                 server_version: Some("v9".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "the probe recovers on the third attempt"
         );
@@ -1352,6 +1447,8 @@ mod tests {
         source: &Arc<RoutingSnapshot>,
         addr: &str,
     ) -> bool {
+        // The fixtures assert reachability; the dial duration is covered by
+        // its own test.
         network
             .probe_sql_port(
                 handle,
@@ -1361,6 +1458,7 @@ mod tests {
                 SQL_RETRY_INTERVAL,
             )
             .await
+            .0
     }
 
     #[tokio::test]
@@ -1374,6 +1472,56 @@ mod tests {
             "a V10 first byte is a live SQL layer"
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "one attempt, no retry");
+    }
+
+    /// Go times `DialContext` alone and sets the gauge on every attempt,
+    /// failures included, so the value it exposes is the last dial rather
+    /// than the whole stage. Timing the stage instead would add the retry
+    /// backoff, which is orders of magnitude larger than the dial.
+    #[tokio::test]
+    async fn the_sql_stage_records_its_last_dial_not_the_retry_budget() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+
+        // A live greeting: one attempt, and its duration is recorded.
+        let (port, _accepted, _first) = bind_greeter(Greeting::V10).await;
+        let (live, dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                MAX_RETRIES,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        assert!(live);
+        let dial = dial.unwrap_or_else(|| unreachable!("a dial happened"));
+
+        // An ERR greeting retried across the whole budget: Go still reports
+        // the last attempt, so the recorded value must stay in the range of a
+        // single loopback dial rather than growing with the retries.
+        let (err_port, accepted, _first) = bind_greeter(Greeting::Err).await;
+        let (err_live, err_dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{err_port}")),
+                MAX_RETRIES,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        assert!(!err_live);
+        let err_dial = err_dial.unwrap_or_else(|| unreachable!("a failed dial is still timed"));
+        assert!(
+            accepted.load(Ordering::SeqCst) > 1,
+            "the fixture must actually retry for this to mean anything"
+        );
+        assert!(
+            err_dial.duration < SQL_RETRY_INTERVAL,
+            "the recorded dial is one attempt ({err_dial:?}), not the retries plus backoff"
+        );
+        let _ = dial;
     }
 
     #[tokio::test]
@@ -1417,7 +1565,7 @@ mod tests {
             )
             .await;
         let elapsed = started.elapsed();
-        assert!(!live, "a refused SQL dial is unhealthy");
+        assert!(!live.0, "a refused SQL dial is unhealthy");
         assert!(
             elapsed < Duration::from_millis(900),
             "connection-refused is terminal, so no 1s backoff ran (took {elapsed:?})"
@@ -1455,6 +1603,126 @@ mod tests {
         assert!(
             started.elapsed() >= dial * (MAX_RETRIES + 1),
             "each attempt spent its own fresh read budget"
+        );
+    }
+
+    /// Go updates the ping gauge as soon as `DialContext` returns, before it
+    /// reads the greeting. A backend that accepts instantly and then never
+    /// writes must therefore report a fast dial, even though the check itself
+    /// spends the whole read budget. Timing the check rather than the connect
+    /// would report the read timeout as if it were the dial.
+    #[tokio::test]
+    async fn a_slow_greeting_is_not_counted_as_dial_time() {
+        let (_registry, lease) = owner_lease();
+        let dial_budget = Duration::from_millis(200);
+        let network = ClusterHealthNetwork::from_cluster_material(
+            &plaintext_config(),
+            lease.token(),
+            HttpProbePolicy {
+                attempt_timeout: dial_budget,
+                max_response_bytes: 64 * 1024,
+            },
+            NETWORK_EPOCH,
+            Arc::from(CLUSTER),
+        )
+        .unwrap_or_else(|error| unreachable!("network: {error}"));
+        let (_publisher, handle, source) = published_source();
+        // Accepts at once, then never writes a greeting.
+        let (port, _accepted, _first) = bind_greeter(Greeting::Hang).await;
+
+        let started = Instant::now();
+        let (live, recorded) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let whole_check = started.elapsed();
+        assert!(!live, "a hung greeting is unhealthy");
+        let recorded = recorded.unwrap_or_else(|| unreachable!("the connect happened"));
+
+        assert!(
+            whole_check >= dial_budget,
+            "the fixture must actually spend the read budget ({whole_check:?})"
+        );
+        assert!(
+            recorded.duration < dial_budget / 4,
+            "the recorded dial is the connect alone ({recorded:?}), not the greeting read \
+             that took {whole_check:?}"
+        );
+    }
+
+    /// The dial is exposed when it completes, not when the probe returns.
+    ///
+    /// `check_once_timed` freezes the observation at the connect but only
+    /// returns once the greeting read has finished, so publishing from its
+    /// return value would hide every dial for the length of that read -- for
+    /// this backend, the entire budget. Go has already called
+    /// `setPingBackendMetrics` by then, so a late publication is a real
+    /// divergence and not merely a scrape sampling an older value.
+    #[tokio::test]
+    async fn a_dial_is_exposed_before_the_greeting_is_read() {
+        let (_registry, lease) = owner_lease();
+        let dial_budget = Duration::from_millis(200);
+        let history = Arc::new(BackendHealthHistory::new());
+        let network = ClusterHealthNetwork::from_cluster_material(
+            &plaintext_config(),
+            lease.token(),
+            HttpProbePolicy {
+                attempt_timeout: dial_budget,
+                max_response_bytes: 64 * 1024,
+            },
+            NETWORK_EPOCH,
+            Arc::from(CLUSTER),
+        )
+        .unwrap_or_else(|error| unreachable!("network: {error}"))
+        .with_health_history(Arc::clone(&history));
+        let (_publisher, handle, source) = published_source();
+        // Accepts at once, then never writes a greeting: the connect is
+        // immediate and the probe then stalls for the whole read budget.
+        let (port, _accepted, _first) = bind_greeter(Greeting::Hang).await;
+        let address = format!("127.0.0.1:{port}");
+        let backend = merged_backend_at(CLUSTER, &address);
+
+        let started = Instant::now();
+        // Give up looking well before the probe can possibly return, so a
+        // sighting proves the publication beat the greeting rather than
+        // merely racing it.
+        let watch_until = dial_budget / 2;
+        let probe = network.probe_sql_port(&handle, &source, &backend, 0, SQL_RETRY_INTERVAL);
+        let watch = async {
+            let deadline = Instant::now() + watch_until;
+            loop {
+                if let Some(sample) = history.snapshot().ping.get(&address) {
+                    return Some(*sample);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let ((live, recorded), seen_early) = tokio::join!(probe, watch);
+        let whole_check = started.elapsed();
+
+        assert!(!live, "a hung greeting is unhealthy");
+        assert!(recorded.is_some(), "the connect happened");
+        // Premise: the probe really was still running when the gauge was read.
+        assert!(
+            whole_check >= dial_budget,
+            "the fixture must spend the whole read budget ({whole_check:?}), otherwise the              probe could have returned before the gauge was sampled"
+        );
+        let seen_early = seen_early.unwrap_or_else(|| {
+            unreachable!(
+                "the dial was not exposed within {watch_until:?}, while the probe ran for                  {whole_check:?}: it was published from the probe's return instead of from                  the connect"
+            )
+        });
+        assert!(
+            seen_early.seconds < dial_budget.as_secs_f64() / 4.0,
+            "the exposed value is the connect alone ({seen_early:?}), not the greeting read"
         );
     }
 
@@ -1553,7 +1821,7 @@ mod tests {
         let live = task
             .await
             .unwrap_or_else(|error| unreachable!("probe task: {error}"));
-        assert!(!live, "a source superseded mid-probe is never live");
+        assert!(!live.0, "a source superseded mid-probe is never live");
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             1,
@@ -1628,11 +1896,15 @@ mod tests {
             .probe_backend(&handle, &source, &backend, MAX_RETRIES, SQL_RETRY_INTERVAL)
             .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: false,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "an ERR greeting fails the backend but the status stage's version is retained (Go)"
         );
@@ -1698,17 +1970,165 @@ mod tests {
         )
         .await;
         assert_eq!(
-            health,
+            BackendHealth {
+                sql_dial: None,
+                ..health.clone()
+            },
             BackendHealth {
                 healthy: false,
                 server_version: Some("v8.1.0".to_owned()),
                 local: false,
+                sql_dial: None,
             },
             "a refused SQL port fails the backend, version retained"
         );
         assert!(
             started.elapsed() < Duration::from_millis(900),
             "refused is terminal in the SQL stage too: no 1s backoff"
+        );
+    }
+
+    /// Ordering must follow dial completion, not probe completion.
+    ///
+    /// The two probes have to overlap for this to mean anything. The slow
+    /// backend accepts first -- so its dial completes first -- then holds its
+    /// greeting until the fast probe has finished entirely. Probe-completion
+    /// order is therefore the reverse of dial-completion order, and ordering
+    /// by the wrong one would put the fast dial first.
+    #[tokio::test]
+    async fn a_slow_greeting_does_not_reorder_the_dials() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+
+        let slow = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let slow_addr = slow
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("address: {e}"));
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_accepted = Arc::clone(&accepted);
+        let server_release = Arc::clone(&release);
+        let slow_server = tokio::spawn(async move {
+            let (mut stream, _) = slow
+                .accept()
+                .await
+                .unwrap_or_else(|e| unreachable!("accept: {e}"));
+            // The dial is done; tell the test, then stall the greeting.
+            server_accepted.notify_one();
+            server_release.notified().await;
+            let _ = stream.write_all(&[3, 0, 0, 0, 0x0a, b'8', 0]).await;
+        });
+
+        let probe_network = Arc::new(network);
+        let network = Arc::clone(&probe_network);
+        let probe_handle = handle.clone();
+        let probe_source = Arc::clone(&source);
+        let slow_probe = tokio::spawn(async move {
+            probe_network
+                .probe_sql_port(
+                    &probe_handle,
+                    &probe_source,
+                    &merged_backend_at(CLUSTER, &slow_addr.to_string()),
+                    0,
+                    SQL_RETRY_INTERVAL,
+                )
+                .await
+        });
+
+        // The slow dial has completed and is now stuck on its greeting.
+        accepted.notified().await;
+
+        // Dial the fast backend afterwards: later dial, earlier probe finish.
+        let (port, _accepted, _first) = bind_greeter(Greeting::V10).await;
+        let (fast_live, fast) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &format!("127.0.0.1:{port}")),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        assert!(fast_live, "the fast backend greeted");
+        let fast = fast.unwrap_or_else(|| unreachable!("the fast backend was dialled"));
+        // Falsifiable premise: the slow probe must still be running. If a
+        // change ever serialises the probes -- as an earlier version of this
+        // test did, making the ordering claim hold trivially -- this fails
+        // instead of passing for the wrong reason.
+        assert!(
+            !slow_probe.is_finished(),
+            "the probes must overlap for this to test ordering at all"
+        );
+
+        // Only now let the slow probe finish, so it finishes last.
+        release.notify_one();
+        let (_, slow_observed) = slow_probe
+            .await
+            .unwrap_or_else(|e| unreachable!("slow probe: {e}"));
+        let slow_observed =
+            slow_observed.unwrap_or_else(|| unreachable!("the slow backend was dialled"));
+
+        assert!(
+            slow_observed.completed_at <= fast.completed_at,
+            "the slow backend's dial completed first even though its probe finished last"
+        );
+        assert!(
+            slow_observed.sequence < fast.sequence,
+            "so it must order first; ordering by probe completion would reverse them"
+        );
+        let _ = slow_server.await;
+    }
+
+    /// Dial timing excludes waiting for the `MySQL` greeting after TCP accepts.
+    #[tokio::test]
+    async fn review_sql_dial_excludes_delayed_greeting() {
+        let (_registry, lease) = owner_lease();
+        let network = network(&lease);
+        let (_publisher, handle, source) = published_source();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| unreachable!("bind: {e}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|e| unreachable!("address: {e}"));
+        let delay = Duration::from_millis(400);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|e| unreachable!("accept: {e}"));
+            tokio::time::sleep(delay).await;
+            stream
+                .write_all(&[3, 0, 0, 0, 0x0a, b'8', 0])
+                .await
+                .unwrap_or_else(|e| unreachable!("greeting: {e}"));
+        });
+        let started = Instant::now();
+        let (healthy, sql_dial) = network
+            .probe_sql_port(
+                &handle,
+                &source,
+                &merged_backend_at(CLUSTER, &address.to_string()),
+                0,
+                SQL_RETRY_INTERVAL,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        server
+            .await
+            .unwrap_or_else(|e| unreachable!("server join: {e}"));
+        assert!(healthy);
+        let sql_dial = sql_dial.unwrap_or_else(|| unreachable!("a dial occurred"));
+        eprintln!(
+            "healthy={healthy}, sql_dial={sql_dial:?}, stage={elapsed:?}, scripted_greeting_delay={delay:?}"
+        );
+        assert!(elapsed >= delay, "fixture must await the delayed greeting");
+        assert!(
+            sql_dial.duration < delay / 2,
+            "SQL dial metric must exclude the scripted 400ms greeting wait: {sql_dial:?}"
         );
     }
 }

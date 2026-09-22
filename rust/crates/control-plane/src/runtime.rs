@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
+
+use crate::permit::{CommitPermit, PermitHolder};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::{Id, JoinSet};
@@ -96,8 +98,36 @@ impl ShutdownReason {
     }
 }
 
+/// Moves a snapshot to `next`, minting or revoking its readiness authority.
+///
+/// The only place `phase` is assigned, so the permit cannot drift from it.
+/// Entering `Ready` mints a fresh authority; leaving it revokes the old
+/// one, which excludes any commit already running and refuses every later
+/// one. Both happen while the runtime's state lock is held.
+///
+/// Be exact about what that guarantees, because the obvious stronger
+/// claim is false. A **newly published** state corresponds to the permit
+/// it carries, and a **revoked** permit refuses every later commit. It is
+/// *not* true that a reader never sees `Ready` beside a revoked permit: a
+/// snapshot retained from before the exit keeps its own now-revoked
+/// permit, and the revocation lands before the next snapshot is
+/// published, so that pairing is expected. What matters is that such a
+/// permit commits nothing — the reader's authority is gone, whatever the
+/// phase field of the value it happens to be holding says.
+fn set_phase(state: &mut LifecycleSnapshot, next: LifecyclePhase) {
+    if state.phase == next {
+        return;
+    }
+    if next == LifecyclePhase::Ready {
+        state.ready = Some(CommitPermit::new());
+    } else if let Some(permit) = state.ready.take() {
+        permit.revoke();
+    }
+    state.phase = next;
+}
+
 /// Immutable runtime state published to every in-process module.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LifecycleSnapshot {
     /// Current phase.
     pub phase: LifecyclePhase,
@@ -109,6 +139,69 @@ pub struct LifecycleSnapshot {
     pub config_generation: u64,
     /// First shutdown reason, if shutdown has started.
     pub shutdown_reason: Option<ShutdownReason>,
+    /// The authority to act while this process is `Ready`, or `None` in
+    /// every other phase.
+    ///
+    /// Carried here rather than on a channel of its own so that a reader
+    /// takes the phase and the authority from the same value. Two channels
+    /// would let a consumer pair a `Ready` it read from one with a permit
+    /// from a different generation of the other, which is the confusion
+    /// the whole mechanism exists to remove.
+    ///
+    /// Private: [`Self::ready_permit`] hands out a holder. Revoking the
+    /// process's readiness belongs to the runtime, and a consumer able to
+    /// revoke could end a readiness it does not own.
+    ready: Option<CommitPermit>,
+}
+
+/// Equality over the observable state.
+///
+/// `ready` is authority, not a value: two snapshots describing the same
+/// phase of the same owner are the same state whether or not one of them
+/// still carries a live permit. Nothing in the workspace compares these
+/// today; the impl is written out so that if something starts to, it
+/// compares what a reader means by "the same state".
+impl PartialEq for LifecycleSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.phase == other.phase
+            && self.owner_id == other.owner_id
+            && self.owner_generation == other.owner_generation
+            && self.config_generation == other.config_generation
+            && self.shutdown_reason == other.shutdown_reason
+    }
+}
+impl Eq for LifecycleSnapshot {}
+
+impl LifecycleSnapshot {
+    /// The authority to act while the process is `Ready`.
+    ///
+    /// `None` in any other phase. An effect that must not outlive
+    /// readiness runs inside this holder's `commit`; reading the phase and
+    /// then acting leaves the transition free to land in between.
+    #[must_use]
+    pub fn ready_permit(&self) -> Option<PermitHolder> {
+        self.ready.as_ref().map(CommitPermit::holder)
+    }
+
+    /// A snapshot in `phase` with no readiness authority, for a consumer
+    /// building one to compare or to drive a test.
+    #[must_use]
+    pub fn for_phase(
+        phase: LifecyclePhase,
+        owner_id: Arc<str>,
+        owner_generation: u64,
+        config_generation: u64,
+        shutdown_reason: Option<ShutdownReason>,
+    ) -> Self {
+        Self {
+            phase,
+            owner_id,
+            owner_generation,
+            config_generation,
+            shutdown_reason,
+            ready: None,
+        }
+    }
 }
 
 /// Stable event kinds emitted by the process foundation.
@@ -495,6 +588,26 @@ pub struct ControlRuntime {
     metrics: Arc<RuntimeMetrics>,
 }
 
+impl Drop for ControlRuntime {
+    /// Ends readiness when the publisher does.
+    ///
+    /// `Sources::live` treats a closed lifecycle channel as loss of
+    /// authority (`lifecycle.has_changed()` fails once the sender is
+    /// gone), so dropping the runtime already strips it -- but the permit
+    /// a consumer is holding would stay valid and keep committing. An
+    /// orderly shutdown revokes it through `set_phase` on the way out;
+    /// this covers the drop that never got there.
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(permit) = state.ready.take() {
+            permit.revoke();
+        }
+    }
+}
+
 impl ControlRuntime {
     /// Claims the unique process owner and installs the initial foundations.
     ///
@@ -516,6 +629,8 @@ impl ControlRuntime {
             owner_generation: lease.generation(),
             config_generation: config.current().generation(),
             shutdown_reason: None,
+            // Starting is not Ready; the permit is minted on the way in.
+            ready: None,
         };
         let (lifecycle, _) = watch::channel(snapshot.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
@@ -599,7 +714,7 @@ impl ControlRuntime {
             state.phase,
             LifecyclePhase::Draining | LifecyclePhase::Stopping
         ) {
-            state.phase = LifecyclePhase::Failed;
+            set_phase(&mut state, LifecyclePhase::Failed);
         }
         state
             .shutdown_reason
@@ -694,7 +809,7 @@ impl ControlRuntime {
                 to: next,
             });
         }
-        state.phase = next;
+        set_phase(&mut state, next);
         if state.shutdown_reason.is_none() {
             state.shutdown_reason = reason;
         }
@@ -733,5 +848,75 @@ impl ControlRuntime {
             module,
             error_class,
         });
+    }
+}
+
+#[cfg(test)]
+mod readiness_permit_tests {
+    use super::{LifecyclePhase, LifecycleSnapshot, set_phase};
+    use std::sync::Arc;
+
+    fn starting() -> LifecycleSnapshot {
+        LifecycleSnapshot::for_phase(LifecyclePhase::Starting, Arc::from("owner"), 1, 1, None)
+    }
+
+    /// The authority exists exactly while the process is `Ready`, and the
+    /// phase and the permit always travel in the same value -- a reader
+    /// cannot pair a `Ready` with a permit from another generation,
+    /// because there is only one place `phase` is assigned.
+    #[test]
+    fn readiness_authority_tracks_the_phase() {
+        let mut state = starting();
+        assert!(
+            state.ready_permit().is_none(),
+            "Starting is not Ready, so there is nothing to act under"
+        );
+
+        set_phase(&mut state, LifecyclePhase::Ready);
+        let permit = state
+            .ready_permit()
+            .unwrap_or_else(|| unreachable!("Ready carries its authority"));
+        assert_eq!(permit.commit(|| 1), Some(1));
+        assert_eq!(state.phase, LifecyclePhase::Ready);
+
+        // Leaving Ready revokes the permit a consumer may still be holding.
+        set_phase(&mut state, LifecyclePhase::Draining);
+        assert!(state.ready_permit().is_none());
+        assert_eq!(
+            permit.commit(|| 1),
+            None,
+            "an authority held across the exit no longer commits"
+        );
+    }
+
+    /// A repeated assignment of the same phase is not a new generation: it
+    /// must not mint a second authority and orphan the one consumers hold.
+    #[test]
+    fn re_entering_the_same_phase_keeps_the_same_authority() {
+        let mut state = starting();
+        set_phase(&mut state, LifecyclePhase::Ready);
+        let permit = state
+            .ready_permit()
+            .unwrap_or_else(|| unreachable!("Ready carries its authority"));
+
+        set_phase(&mut state, LifecyclePhase::Ready);
+        assert_eq!(
+            permit.commit(|| 1),
+            Some(1),
+            "the authority handed out earlier is still the current one"
+        );
+    }
+
+    /// Equality is over observable state; the authority is not part of it.
+    #[test]
+    fn snapshots_compare_by_observable_state() {
+        let mut ready = starting();
+        set_phase(&mut ready, LifecyclePhase::Ready);
+        let plain =
+            LifecycleSnapshot::for_phase(LifecyclePhase::Ready, Arc::from("owner"), 1, 1, None);
+        assert_eq!(
+            ready, plain,
+            "the same phase of the same owner is the same state"
+        );
     }
 }

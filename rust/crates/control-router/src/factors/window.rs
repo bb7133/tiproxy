@@ -133,6 +133,14 @@ impl Count {
 
 pub(crate) trait Backend {
     fn key(&self) -> &str;
+    /// The backend's dial address: the `backend` label Go writes
+    /// `backend_metric` with.
+    ///
+    /// Distinct from [`Self::key`], which is the opaque routing identity,
+    /// and from [`Self::instance`], which is the Prometheus instance label
+    /// derived from the address and IP. Using either of those would label
+    /// the series with something Go never writes.
+    fn address(&self) -> &str;
     fn touch_address(&self) {}
     fn instance(&self) -> Cow<'_, str>;
     fn cluster(&self) -> Cow<'_, str>;
@@ -182,7 +190,7 @@ impl<T> Default for Snapshot<T> {
         }
     }
 }
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct History<Q: Query> {
     pub cache: BTreeMap<Arc<str>, Snapshot<Q::Time>>,
     pub cpu_time: Option<Q::Time>,
@@ -192,7 +200,43 @@ pub(crate) struct History<Q: Query> {
     pub usage_per_conn: f64,
     pub zero: Q::Time,
     pub go_arch: GoArch,
+    /// Where accepted observations publish `backend_metric`, or `None` when
+    /// nothing exposes them.
+    ///
+    /// Published from inside the factors rather than from their results,
+    /// because Go writes the value it just accepted and skips the backends
+    /// it rejected -- a skip leaves the previous value exposed, which a
+    /// pass over the finished cache could not distinguish from a fresh one.
+    pub backend_metrics: Option<Arc<crate::BackendMetricHistory>>,
+    /// Observations accepted this round, not yet published.
+    ///
+    /// Go writes each value inline as it accepts it. We record at exactly
+    /// the same points -- past exactly the same guards -- but hold the
+    /// values until the caller can take the routing authority, so a round
+    /// whose sources were revoked mid-evaluation publishes nothing. The
+    /// buffer never outlives the round: `publish_backend_metrics` drains
+    /// it, and `evaluate` clears it before filling it again.
+    pending_metrics: Vec<(String, crate::BackendMetric, f64)>,
 }
+/// Equality over the observed state alone.
+///
+/// `backend_metrics` is a publication sink, not state: two histories that
+/// have seen the same samples are the same history whether or not one of
+/// them is wired to the exposition. Including it would make the
+/// differential comparison depend on whether metrics are being served.
+impl<Q: Query + PartialEq> PartialEq for History<Q> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cache == other.cache
+            && self.cpu_time == other.cpu_time
+            && self.memory_time == other.memory_time
+            && self.health_queries == other.health_queries
+            && self.health_dirty == other.health_dirty
+            && self.usage_per_conn == other.usage_per_conn
+            && self.zero == other.zero
+            && self.go_arch == other.go_arch
+    }
+}
+
 impl<Q: Query> History<Q> {
     pub(crate) fn new(zero: Q::Time) -> Self {
         Self {
@@ -204,9 +248,45 @@ impl<Q: Query> History<Q> {
             usage_per_conn: 0.0,
             // Preserve the preexisting staged API's saturating conversion.
             go_arch: GoArch::Arm64,
+            backend_metrics: None,
+            pending_metrics: Vec::new(),
             zero,
         }
     }
+    /// Records an accepted observation for publication at commit time.
+    ///
+    /// Skipped entirely when nothing serves `backend_metric`, so an
+    /// unexposed process does not accumulate a buffer it will only drop.
+    fn record_metric(&mut self, address: &str, metric: crate::BackendMetric, value: f64) {
+        if self.backend_metrics.is_some() {
+            self.pending_metrics
+                .push((address.to_owned(), metric, value));
+        }
+    }
+
+    /// Discards observations recorded but never published.
+    ///
+    /// Called at the start of a round: a previous round that was refused
+    /// the authority must not leak its values into this one.
+    pub(crate) fn discard_pending_metrics(&mut self) {
+        self.pending_metrics.clear();
+    }
+
+    /// Publishes this round's accepted observations.
+    ///
+    /// The caller runs this inside the combined commit, so the values
+    /// land only while the sources that produced them are still
+    /// authoritative.
+    pub(crate) fn publish_backend_metrics(&mut self) {
+        let Some(metrics) = self.backend_metrics.clone() else {
+            self.pending_metrics.clear();
+            return;
+        };
+        for (address, metric, value) in self.pending_metrics.drain(..) {
+            metrics.observe(&address, metric, value);
+        }
+    }
+
     pub(crate) fn clear_resources(&mut self) {
         for cache in self.cache.values_mut() {
             cache.cpu = None;
@@ -281,6 +361,13 @@ impl<Q: Query> History<Q> {
                     latest,
                     connections: input.physical(),
                 });
+                // Go publishes `calcAvgUsage`'s average here, past the same
+                // freshness and negative-usage guards. The latest sample is
+                // a different number and is not what the `cpu` label means.
+                // Recorded after the cache write only to end its borrow;
+                // recording buffers, so the order between the two is not
+                // observable.
+                self.record_metric(input.address(), crate::BackendMetric::Cpu, avg);
             }
             for cache in self.cache.values_mut() {
                 if cache.cpu.is_some_and(|v| v.time.expired(now, 120)) {
@@ -381,6 +468,11 @@ impl<Q: Query> History<Q> {
                     risk,
                     balance,
                 });
+                // Go publishes `calcMemUsage`'s latest usage here, past the
+                // same guards. Recorded after the cache write only to end
+                // its borrow; recording buffers, so the order is not
+                // observable.
+                self.record_metric(input.address(), crate::BackendMetric::Memory, usage);
             }
             for cache in self.cache.values_mut() {
                 if cache.memory.is_some_and(|v| v.time.expired(now, 60)) {
@@ -460,7 +552,16 @@ impl<Q: Query> History<Q> {
                     };
                     updated =
                         Some(updated.map_or(time, |old| if old.before(time) { time } else { old }));
-                    risk = risk.max(health_risk(value(fq, input), value(tq, input), threshold));
+                    let (failure_value, total_value) = (value(fq, input), value(tq, input));
+                    // Go writes both raw samples here, and only when both
+                    // are present -- its `failureSample == nil ||
+                    // totalSample == nil` skips the pair together, so one
+                    // half is never published alone.
+                    if let (Some(failure_value), Some(total_value)) = (failure_value, total_value) {
+                        self.record_metric(input.address(), failure.into(), failure_value);
+                        self.record_metric(input.address(), total.into(), total_value);
+                    }
+                    risk = risk.max(health_risk(failure_value, total_value, threshold));
                 }
                 let Some(time) = updated.filter(|time| !time.is_zero()) else {
                     continue;

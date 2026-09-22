@@ -71,11 +71,13 @@ use crate::discovery_publish::{
 };
 use crate::health_config::{HealthConfigError, HealthRuntime};
 use crate::health_feed::{HealthGenerationFeed, HealthGenerationFeeder};
+use crate::health_history::{BackendHealthHistory, BackendRetirement, ObserverHealthMetrics};
 use crate::health_loop::{
     HEALTH_CONCURRENCY, HealthGeneration, probe_backend_in_generation, run_health_loop,
 };
 use crate::health_overlay::{HealthOverlayHandle, HealthOverlayPublisher, ObserverError};
 use crate::metric_source::{MetricConfigError, MetricPublication, MetricSourceHandle};
+use crate::owner_metrics::ElectionOwnerHistory;
 use crate::registrar::RegistrarError;
 use crate::resolver::AdvertiseEndpointResolver;
 use crate::routing_snapshot::{RoutingSnapshotHandle, RoutingSnapshotPublisher};
@@ -263,6 +265,16 @@ pub struct TopologyModule {
     mode: ModePublisher,
     /// The readers' registry of live static producers, by namespace.
     statics: Arc<StaticRegistry>,
+    /// The process-level values behind `b_status`, `ping_duration_seconds`
+    /// and `health_check_seconds`. Shared with the health child (which owns
+    /// the per-observer edges) and with the exposition through
+    /// [`TopologyModuleHandle::health_history`], so both see one set of
+    /// series the way Go's package-level collectors are one set.
+    health_history: Arc<BackendHealthHistory>,
+    /// The owners of the other backend-keyed metric families, retired
+    /// together with the health ones when a backend has been down past the
+    /// retention window (Go `DelBackend`).
+    backend_retirement: Arc<BackendRetirement>,
     #[cfg(test)]
     refresh_override: Option<RefreshFactory>,
     #[cfg(test)]
@@ -349,6 +361,9 @@ pub struct TopologyModuleHandle {
     source: Arc<dyn ConfigNamespaceSource>,
     mode: watch::Receiver<Arc<ModeEpoch>>,
     statics: Arc<StaticRegistry>,
+    health_history: Arc<BackendHealthHistory>,
+    backend_retirement: Arc<BackendRetirement>,
+    owner_history: Arc<ElectionOwnerHistory>,
     #[cfg(test)]
     mode_hook: crate::static_source::PublishHook,
 }
@@ -381,6 +396,30 @@ impl TopologyUpdateObserver {
 }
 
 impl TopologyModuleHandle {
+    /// The process-level backend health gauge values, for the exposition.
+    ///
+    /// Read-only in practice: the writers are the health child and the SQL
+    /// probes. A reader takes a snapshot per scrape rather than holding the
+    /// lock, so a slow exposition never delays a health round.
+    #[must_use]
+    pub fn health_history(&self) -> Arc<BackendHealthHistory> {
+        Arc::clone(&self.health_history)
+    }
+
+    /// The registry an owner of backend-keyed metric families registers with,
+    /// so the health child's retention purge reaches its series too.
+    #[must_use]
+    pub fn backend_retirement(&self) -> Arc<BackendRetirement> {
+        Arc::clone(&self.backend_retirement)
+    }
+
+    /// The elections this process holds, for the exposition and for the
+    /// metric collector's election workers to report into.
+    #[must_use]
+    pub fn owner_history(&self) -> Arc<ElectionOwnerHistory> {
+        Arc::clone(&self.owner_history)
+    }
+
     /// Creates a wake-only observer for consumers that must rebuild a derived
     /// serving view after routing or health publication.
     #[must_use]
@@ -710,6 +749,12 @@ impl TopologyModule {
         #[cfg(test)]
         let mode_hook = mode.publish_hook();
         let statics = Arc::new(StaticRegistry::default());
+        let health_history = Arc::new(BackendHealthHistory::new());
+        let backend_retirement = Arc::new(BackendRetirement::new());
+        // Created here and handed to the handle alone: the module itself
+        // never reads it, the collector's election workers and the
+        // exposition do.
+        let owner_history = Arc::new(ElectionOwnerHistory::new());
         let (metrics, metric_source) = MetricPublication::new(Arc::clone(&source), health);
         Ok((
             Self {
@@ -733,6 +778,8 @@ impl TopologyModule {
                 mode,
                 metrics,
                 statics: Arc::clone(&statics),
+                health_history: Arc::clone(&health_history),
+                backend_retirement: Arc::clone(&backend_retirement),
                 #[cfg(test)]
                 refresh_override: None,
                 #[cfg(test)]
@@ -748,6 +795,9 @@ impl TopologyModule {
                 source,
                 mode: mode_reader,
                 statics,
+                health_history,
+                backend_retirement,
+                owner_history,
                 #[cfg(test)]
                 mode_hook,
             },
@@ -973,6 +1023,10 @@ impl TopologyModule {
             HEALTH_CONCURRENCY,
             probe_backend_in_generation,
             Arc::clone(&self.source),
+            Some(
+                ObserverHealthMetrics::new(Arc::clone(&self.health_history))
+                    .with_retirement(Arc::clone(&self.backend_retirement)),
+            ),
         ))
     }
 
@@ -1124,7 +1178,14 @@ impl TopologyModule {
                         Arc::new(
                             networks
                                 .into_iter()
-                                .map(|(name, prepared)| (name, prepared.bind(client_epoch)))
+                                .map(|(name, prepared)| {
+                                    (
+                                        name,
+                                        prepared
+                                            .bind(client_epoch)
+                                            .with_health_history(Arc::clone(&self.health_history)),
+                                    )
+                                })
                                 .collect(),
                         )
                     }),
@@ -1260,6 +1321,8 @@ impl TopologyModule {
                 &self.health_runtime,
                 &self.source,
                 self.mode.applied(),
+                &self.health_history,
+                &self.backend_retirement,
             )
             .await;
         let outcome = self
@@ -2377,13 +2440,7 @@ pub(crate) mod tests {
             "routing_refresh_failed",
             "health_loop_failed",
         ];
-        let snapshot = |phase| LifecycleSnapshot {
-            phase,
-            owner_id: Arc::from("owner"),
-            owner_generation: 1,
-            config_generation: 1,
-            shutdown_reason: None,
-        };
+        let snapshot = |phase| LifecycleSnapshot::for_phase(phase, Arc::from("owner"), 1, 1, None);
         let fatal = [
             LifecyclePhase::Starting,
             LifecyclePhase::Ready,

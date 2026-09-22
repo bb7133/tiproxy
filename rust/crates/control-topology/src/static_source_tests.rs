@@ -997,6 +997,7 @@ impl ModeHandleFixture {
                         healthy: true,
                         server_version: None,
                         local: true,
+                        sql_dial: None,
                     },
                 )
             })
@@ -1334,5 +1335,122 @@ async fn a_dynamic_snapshot_is_refused_inside_the_commit_window_before_static_pu
         "the Dynamic snapshot stays refused"
     );
     drop(module);
+    Ok(())
+}
+
+/// `commit_current` runs an effect only while the whole composite
+/// authority holds, and a revocation of **any** member refuses it.
+///
+/// `still_current` answers and returns, so a revocation can land between
+/// the answer and the caller acting on it. This holds every authority the
+/// answer depended on for the effect's duration, which is the difference.
+#[tokio::test]
+async fn commit_current_runs_only_under_the_whole_authority() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    fixture.mode.publish(BackendSourceMode::Static);
+    let snapshot = fixture.handle.current().ok_or("static snapshot")?;
+    assert!(fixture.handle.still_current(&snapshot));
+
+    assert_eq!(
+        fixture.handle.commit_current(&snapshot, || 1),
+        Some(1),
+        "a fully current snapshot commits"
+    );
+
+    // Revoking the mode epoch alone is enough: the conjunction is only as
+    // valid as its weakest member.
+    fixture.mode.revoke();
+    assert_eq!(
+        fixture.handle.commit_current(&snapshot, || 1),
+        None,
+        "one revoked authority refuses the whole commit"
+    );
+    Ok(())
+}
+
+/// An effect can re-read the sources it committed under.
+///
+/// Scope, because the obvious stronger reading is wrong: this does **not**
+/// prove that `commit_current` released its watch borrows. A `watch`
+/// borrow is a read guard and taking a second one on the same thread is
+/// legal, so a control that holds the mode borrow across the commit still
+/// passes here. The borrow release rests on the scoped block in
+/// `commit_current` -- the guard is dropped before the first permit is
+/// taken -- and not on this test.
+///
+/// What it does establish is that committing does not leave the sources
+/// unreadable to the effect itself, which is the property a caller
+/// writing an effect actually depends on.
+#[tokio::test]
+async fn an_effect_can_re_read_the_sources_it_committed_under() -> TestResult {
+    let fixture = ModeHandleFixture::build()?;
+    fixture.publish_static_round();
+    fixture.mode.publish(BackendSourceMode::Static);
+    let snapshot = fixture.handle.current().ok_or("static snapshot")?;
+
+    // Inside the effect the mode slot must still be readable. A failure
+    // here is an assertion failure, not a hang: see the scope note above.
+    let observed = fixture
+        .handle
+        .commit_current(&snapshot, || fixture.handle.still_current(&snapshot));
+    assert_eq!(
+        observed,
+        Some(true),
+        "the effect can re-read the sources it committed under"
+    );
+    Ok(())
+}
+
+// M5 basic smoke: actual ConfigNamespaceStore and TopologyModule; no gate injection.
+#[tokio::test]
+async fn review_namespace_removal_cannot_land_inside_an_admitted_commit() -> TestResult {
+    let store = store_with(
+        &zero_cluster_config(),
+        vec![namespace("default", &["127.0.0.1:44001"])],
+    )?;
+    let observed = store.clone();
+    // No network probe is needed for the configuration authority boundary.
+    let module = spawn_module(store, health(false)).await?;
+    let handle = wait_handle(&module, "default").await?;
+    let snapshot = wait_snapshot(&handle, |_| true).await?;
+    assert!(handle.still_current(&snapshot));
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        start_rx
+            .recv()
+            .unwrap_or_else(|e| unreachable!("start: {e}"));
+        apply(&observed, &zero_cluster_config(), vec![], 3)
+            .unwrap_or_else(|e| unreachable!("remove namespace: {e}"));
+        done_tx
+            .send(observed.current().generation())
+            .unwrap_or_else(|e| unreachable!("done: {e}"));
+    });
+    let value = AtomicUsize::new(0);
+    let mut published_during_commit = None;
+    let result = handle.commit_current(&snapshot, || {
+        start_tx
+            .send(())
+            .unwrap_or_else(|e| unreachable!("start: {e}"));
+        published_during_commit = done_rx.recv_timeout(Duration::from_millis(500)).ok();
+        // No store re-read or nested permit acquisition in the effect.
+        value.store(1, Ordering::SeqCst);
+    });
+    writer
+        .join()
+        .unwrap_or_else(|_| unreachable!("writer panicked"));
+    let current_after = handle.still_current(&snapshot);
+    let written = value.load(Ordering::SeqCst);
+    drop(module);
+    assert_eq!(result, Some(()), "the starting source was authoritative");
+    assert!(
+        !current_after,
+        "the actual source must observe namespace retirement"
+    );
+    assert!(
+        published_during_commit.is_none(),
+        "namespace retired at generation {published_during_commit:?} while effect was admitted; written={written}"
+    );
     Ok(())
 }

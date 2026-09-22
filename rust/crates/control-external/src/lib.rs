@@ -61,7 +61,9 @@ pub use etcd::{
 pub use http::{BoundedHttpClient, HttpClientConfig, HttpConfigError, HttpError, HttpTlsConfig};
 pub use io_fence::{CombinedFence, IoFence};
 pub use retry::{RetryDecision, RetryError, RetryPolicy, RetryPolicyError, retry_bounded};
-pub use sql_greeting::{SqlGreetingConfigError, SqlGreetingError, SqlGreetingProbe};
+pub use sql_greeting::{
+    SqlDialObservation, SqlGreetingConfigError, SqlGreetingError, SqlGreetingProbe,
+};
 
 /// The sole direct `kvproto` service binding needed by the current Go server.
 pub const DIRECT_KVPROTO_BINDINGS: &[&str] = &["diagnosticspb.Diagnostics"];

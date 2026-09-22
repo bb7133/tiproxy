@@ -36,6 +36,17 @@ pub struct PreparedRedirect {
     pub(crate) source: Arc<AccountIdentity>,
     pub(crate) target: Arc<AccountIdentity>,
     pub(crate) target_id: Arc<str>,
+    /// Frozen here, at preparation, because the scores that chose this pair
+    /// have already moved on by the time the migration settles.
+    pub(crate) reason: crate::RedirectReason,
+}
+
+impl PreparedRedirect {
+    /// Why this migration is being offered.
+    #[must_use]
+    pub const fn reason(&self) -> crate::RedirectReason {
+        self.reason
+    }
 }
 
 /// A factor-selected pair and its source sessions in physical arrival order.

@@ -1779,3 +1779,781 @@ async fn label_fail_list_and_retry_preserve_exact_attempts_and_current_policy() 
     assert_eq!(harness.router.finish(&next, true), Settlement::Ignored);
     Ok(())
 }
+
+/// Pending migrations summed over every incarnation the plane still holds.
+fn pending_total(handle: &crate::RoutePlaneHandle) -> u64 {
+    handle.migration_snapshot().pending.values().sum()
+}
+
+/// Replaces the `default` namespace so the current incarnation is retired,
+/// while any live admission lease keeps the old one alive.
+fn retire_namespace(harness: &Harness, file_revision: u64) -> TestResult {
+    let current = harness.source.store.current();
+    let mut replacement = NamespaceConfig {
+        namespace: "default".to_owned(),
+        ..NamespaceConfig::default()
+    };
+    replacement.frontend.user = "replacement".to_owned();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        vec![replacement],
+        SourceRevision {
+            file_revision,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+    Ok(())
+}
+
+/// Two incarnations migrating between the same backends for the same reason
+/// share one `(from, to, reason)` label set. The exposition has to add them
+/// up; a per-router write would have one silently replace the other.
+///
+/// The first incarnation is retired by configuration while its migration is
+/// still in flight, and is kept alive only by its admission lease. That is the
+/// case enumerating the plane's current routing table would miss, and it is
+/// also why the migration has to be started before the retirement: a retired
+/// incarnation no longer runs balance rounds, so it can hold an unsettled
+/// migration but cannot begin a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_snapshot_sums_shared_labels_across_a_retired_incarnation() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut first = must(handle.admit(""));
+    let reservation = must(first.selector_mut().next(ClientInfo::default(), ""));
+    let old_address = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        first.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (first_registration, mut first_commands) = must(first.register_commands(13101, 2));
+
+    let failed = format!(
+        "[proxy]\nfail-backend-list=[\"{old_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+    );
+    harness.patch(&failed, 3);
+    harness.source.deliver();
+    let first_command = tokio::time::timeout(Duration::from_secs(5), first_commands.recv())
+        .await?
+        .ok_or("first incarnation issued no redirect")?;
+    assert!(matches!(
+        first_command.command(),
+        crate::MigrationCommand::Redirect(_)
+    ));
+    // Deliberately unsettled: this migration must still be counted after its
+    // router stops being the routed one.
+    assert_eq!(pending_total(&handle), 1);
+
+    // Fail the OTHER backend instead, so the next incarnation is forced to
+    // start on the same one the first did and therefore shares its label set.
+    // Which backend a reservation lands on is not fixed by the fixture, so the
+    // pairing has to be forced rather than assumed.
+    let other_address = if old_address == "127.0.0.1:4000" {
+        "127.0.0.1:4001"
+    } else {
+        "127.0.0.1:4000"
+    };
+    let other_failed = format!(
+        "[proxy]\nfail-backend-list=[\"{other_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+    );
+    harness.patch(&other_failed, 4);
+    harness.source.deliver();
+
+    // Retire the first incarnation; its admission lease keeps it alive.
+    retire_namespace(&harness, 5)?;
+    let mut second = must(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.admit_within("replacement", Duration::from_secs(5)),
+        )
+        .await?,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    assert_eq!(
+        pending_total(&handle),
+        1,
+        "a retired incarnation still holding an unsettled migration must keep counting"
+    );
+
+    let reservation = must(second.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(
+        reservation.assignment().backend_address,
+        old_address,
+        "the replacement must start on the same backend to share the label set"
+    );
+    assert_eq!(
+        second.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (second_registration, mut second_commands) = must(second.register_commands(13102, 2));
+
+    harness.patch(&failed, 6);
+    harness.source.deliver();
+    let second_command = tokio::time::timeout(Duration::from_secs(5), second_commands.recv())
+        .await?
+        .ok_or("replacement incarnation issued no redirect")?;
+    assert!(matches!(
+        second_command.command(),
+        crate::MigrationCommand::Redirect(_)
+    ));
+
+    let snapshot = handle.migration_snapshot();
+    assert_eq!(
+        snapshot.pending.len(),
+        1,
+        "one shared label set, not one series per router"
+    );
+    assert_eq!(
+        snapshot.pending.values().sum::<u64>(),
+        2,
+        "both incarnations are in flight; a per-router write would report 1"
+    );
+
+    drop(first_command);
+    drop(second_command);
+    drop(first_registration);
+    drop(second_registration);
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
+
+/// Cumulative history must be readable when no incarnation is alive at all.
+/// Reaching it through a live router made every counter vanish the moment the
+/// last one was dropped -- the same disappearance the process-level store
+/// exists to prevent, reintroduced one layer up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_history_survives_every_incarnation_being_dropped() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut admission = must(handle.admit(""));
+    let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+    let old_address = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        admission.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+    let (registration, mut commands) = must(admission.register_commands(13201, 2));
+    harness.patch(
+        &format!(
+            "[proxy]\nfail-backend-list=[\"{old_address}\"]\nfailover-timeout=60\n[balance.status]\nmigrations-per-second=100"
+        ),
+        3,
+    );
+    harness.source.deliver();
+    let envelope = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+        .await?
+        .ok_or("no redirect issued")?;
+    assert_eq!(envelope.finish_redirect(true), Settlement::Applied);
+    let settled: u64 = handle.migration_snapshot().history.terminals.values().sum();
+    assert_eq!(settled, 1);
+
+    // Drop everything that could hold an incarnation alive.
+    drop(registration);
+    drop(admission);
+    drop(commands);
+    plane_task.abort();
+    let _ = plane_task.await;
+
+    assert_eq!(
+        handle
+            .migration_snapshot()
+            .history
+            .terminals
+            .values()
+            .sum::<u64>(),
+        1,
+        "the cumulative series must not disappear with the last router"
+    );
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_pull_history_survives_zero_live_routers() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let admission = must(handle.admit(""));
+    admission.test_router().review_seed_settled_migrations(0, 1);
+    assert_eq!(
+        handle
+            .migration_snapshot()
+            .history
+            .terminals
+            .values()
+            .sum::<u64>(),
+        1
+    );
+    drop(admission);
+    let current = harness.source.store.current();
+    harness.source.store.apply(
+        (**current.effective()).clone(),
+        Vec::new(),
+        SourceRevision {
+            file_revision: 3,
+            etcd_revision: 0,
+        },
+        Path::new("/tmp"),
+    )?;
+    harness.source.deliver();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.route_ledger_evidence().router_incarnations != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let after = handle.migration_snapshot();
+    plane_task.abort();
+    let _ = plane_task.await;
+    assert_eq!(
+        after.history.terminals.values().sum::<u64>(),
+        1,
+        "the actual scrape source must retain cumulative terminals with zero live routers"
+    );
+    assert_eq!(
+        after
+            .history
+            .durations
+            .values()
+            .map(|v| v.count)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(after.history.known_pending.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_pull_pending_union_is_globally_bounded() -> TestResult {
+    let harness = Harness::new("", "connection").await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+    let first = must(handle.admit(""));
+    first
+        .test_router()
+        .review_seed_settled_migrations(0, crate::MAX_RETAINED_LABEL_SETS);
+    retire_namespace(&harness, 3)?;
+    let second = must(
+        handle
+            .admit_within("replacement", Duration::from_secs(5))
+            .await,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    second
+        .test_router()
+        .review_seed_settled_migrations(crate::MAX_RETAINED_LABEL_SETS, 1);
+    assert_eq!(handle.route_ledger_evidence().router_incarnations, 2);
+    let state = handle.migration_snapshot();
+    let entries = state.pending.len();
+    assert_eq!(
+        state.history.known_pending.len(),
+        crate::MAX_RETAINED_LABEL_SETS
+    );
+    assert!(state.history.labels_dropped > 0);
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    assert!(
+        entries <= crate::MAX_RETAINED_LABEL_SETS,
+        "actual pull-side aggregate has {entries} entries, beyond global {} bound",
+        crate::MAX_RETAINED_LABEL_SETS
+    );
+    Ok(())
+}
+
+/// The Rust side of the `b_conn` deviation recorded as MTR-007.
+///
+/// Two incarnations each holding one connection to the same backend address
+/// report 2 here, because the address label is meant to say how many
+/// connections this process holds. Go reports 1 for the same situation: it
+/// writes the gauge with Set from each namespace's own router, so the last
+/// writer decides. `pkg/metrics` `TestBackendConnGaugeOverwritesAcrossNamespaces`
+/// pins that side. The difference is declared, so it is asserted on both
+/// sides rather than left to the manifest text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_snapshot_sums_shared_backend_address() -> TestResult {
+    let harness = Harness::with_backends(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(
+        Arc::new(harness.source.clone()),
+        harness.topology.clone(),
+        None,
+    );
+    let context = harness.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let mut first = must(handle.admit(""));
+    let reservation = must(first.selector_mut().next(ClientInfo::default(), ""));
+    let shared = reservation.assignment().backend_address.clone();
+    assert_eq!(
+        first.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+
+    // Force the second incarnation onto the same backend by failing the other
+    // one. Which backend a reservation lands on is not fixed by the fixture,
+    // and the balancer will otherwise steer the second away from the one the
+    // first is already using -- so the shared case has to be arranged, never
+    // assumed.
+    let other = if shared == "127.0.0.1:4000" {
+        "127.0.0.1:4001"
+    } else {
+        "127.0.0.1:4000"
+    };
+    harness.patch(
+        &format!("[proxy]\nfail-backend-list=[\"{other}\"]\nfailover-timeout=60"),
+        3,
+    );
+    harness.source.deliver();
+
+    // Retire the namespace; `first` keeps its incarnation alive.
+    retire_namespace(&harness, 4)?;
+    let mut second = must(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.admit_within("replacement", Duration::from_secs(5)),
+        )
+        .await?,
+    );
+    assert!(!first.same_router_incarnation(&second));
+    let reservation = must(second.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(
+        reservation.assignment().backend_address,
+        shared,
+        "both incarnations must hold the same address for this to be the shared case"
+    );
+    assert_eq!(
+        second.selector().finish(&reservation, true),
+        Settlement::Applied
+    );
+
+    let snapshot = handle.migration_snapshot();
+    assert_eq!(
+        snapshot.backend_connections.get(&shared).copied(),
+        Some(2),
+        "Rust reports the process total; Go would report 1 here (MTR-007)"
+    );
+
+    drop(first);
+    drop(second);
+    plane_task.abort();
+    let _ = plane_task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let resolved = crate::ResolvedNamespace::named(h.source.current(), "default")
+        .map_err(|e| format!("{e:?}"))?;
+    let scores = Arc::new(crate::ScoreHistory::new());
+    let router = Router::new_resolved(
+        Arc::new(h.source.clone()),
+        &h.topology,
+        &h.runtime.handle().module_context(),
+        &resolved,
+        16,
+        None,
+        crate::selector::RouterShared {
+            scores: Arc::clone(&scores),
+            backend_metrics: Arc::new(crate::BackendMetricHistory::new()),
+            input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
+            history: Arc::new(crate::MigrationHistory::default()),
+        },
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    router.set_replay_wall(1_000_000_000_000);
+    let candidate = router.capture().map_err(|e| format!("{e:?}"))?;
+    let session = router.open().map_err(|e| format!("{e:?}"))?;
+    let reservation = router
+        .reserve_with_ticket(&session, &candidate, ClientInfo::default(), "", &[], 0)
+        .map_err(|e| format!("{e:?}"))?;
+    let _ = router.finish(&reservation, false);
+    let _ = router.close(&session);
+    let published = scores.snapshot().scores;
+    println!("scores after successful real route evaluation: {published:?}");
+    assert!(
+        published.contains_key(&(
+            "127.0.0.1:4000".to_owned(),
+            crate::factors::Factor::Connection,
+        )),
+        "Go BackendToRoute calls updateScore; the first real route scoring must publish"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_bscore_real_plane_config_reset_without_further_scoring() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(Arc::new(h.source.clone()), h.topology.clone(), None);
+    let context = h.runtime.handle().module_context();
+    let task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    let observed = async {
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+        let mut admission = must(handle.admit(""));
+        let mut updates = admission.subscribe_updates();
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let scores = handle.score_history();
+        let initial = scores.snapshot().scores;
+        assert!(!initial.is_empty(), "real route must have produced scores before reset");
+        updates.borrow_and_update();
+        let old = h.source.current().generation();
+        h.patch("[balance]\npolicy=\"resource\"", 2);
+        let new = h.source.current().generation();
+        assert_ne!(old, new);
+        h.source.deliver();
+        tokio::time::timeout(Duration::from_secs(5), updates.changed()).await??;
+        let after = scores.snapshot().scores;
+        println!("real config reconciliation completed generation {old}->{new}, before={initial:?}, after={after:?}");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(after)
+    }.await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        observed?.is_empty(),
+        "Go SetConfig resets b_score on configuration, without requiring another updateScore"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_bscore_real_plane_reset_preserves_cadence() -> TestResult {
+    let h = Harness::with_health(
+        "",
+        "connection",
+        &[("127.0.0.1:4000", &[])],
+        HealthCheckConfig {
+            enabled: false,
+            interval_nanos: 3_600_000_000_000,
+            ..HealthCheckConfig::default()
+        },
+        "",
+    )
+    .await?;
+    let (plane, mut handle) = RoutePlane::new(Arc::new(h.source.clone()), h.topology.clone(), None);
+    let context = h.runtime.handle().module_context();
+    let task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    let observed = async {
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+        let mut admission = must(handle.admit(""));
+        let mut updates = admission.subscribe_updates();
+        let router = admission.test_router();
+        router.set_replay_wall(1_000_000_000_000);
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let scores = handle.score_history();
+        let initial = scores.snapshot().scores;
+        assert!(!initial.is_empty(), "real route must have produced scores before reset");
+        updates.borrow_and_update();
+        let old = h.source.current().generation();
+        h.patch("[balance]\npolicy=\"connection\"\nrouting-policy=\"random\"", 2);
+        let new = h.source.current().generation();
+        assert_ne!(old, new);
+        h.source.deliver();
+        tokio::time::timeout(Duration::from_secs(5), updates.changed()).await??;
+        let after = scores.snapshot().scores;
+        println!("real config reconciliation completed generation {old}->{new}, before={initial:?}, after={after:?}");
+        assert!(after.is_empty(), "configuration reset must already be visible");
+        let mut admission = must(handle.admit(""));
+        router.set_replay_wall(1_000_000_000_001);
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        assert!(scores.snapshot().scores.is_empty(), "reset must not grant an early write");
+        router.set_replay_wall(1_010_000_000_001);
+        let mut admission = must(handle.admit(""));
+        let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+        let _ = admission.selector().finish(&reservation, false);
+        drop(admission);
+        let resumed = scores.snapshot().scores;
+        println!("after reset: T+1ns remains empty; T+10s+1ns publishes {resumed:?}");
+        assert!(!resumed.is_empty(), "normal original cadence must resume");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(after)
+    }.await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        observed?.is_empty(),
+        "Go SetConfig resets b_score on configuration, without requiring another updateScore"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // Two real paths end to end; splitting would hide the ordering.
+async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle() -> TestResult {
+    for balance in [false, true] {
+        let h = Harness::with_health(
+            "",
+            "resource",
+            &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+            HealthCheckConfig {
+                enabled: false,
+                interval_nanos: 3_600_000_000_000,
+                ..HealthCheckConfig::default()
+            },
+            "",
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.topology.routing_handle().current().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let mut metrics = h
+            .topology
+            .replay_metric_input(h.runtime.handle().module_context().owner().clone())
+            .await?;
+        let sample = |now: i64, value: &str| {
+            serde_json::json!({
+                "cpu": {"kind":"matrix", "updated_nanos":now, "series":[{
+                    "labels":{"instance":"127.0.0.1:0"}, "samples":[
+                        {"timestamp_ms":now/1_000_000-1000, "value":value},
+                        {"timestamp_ms":now/1_000_000, "value":value}]}]},
+                "memory":null,"failure_pd":null,"total_pd":null,"failure_tikv":null,"total_tikv":null
+            })
+        };
+        let t0 = 1_000_000_000_000_i64;
+        metrics.deliver(sample(t0, "0.4"))?;
+        let scores = Arc::new(crate::ScoreHistory::new());
+        let observations = Arc::new(crate::BackendMetricHistory::new());
+        let resolved = must(crate::ResolvedNamespace::named(
+            h.source.current(),
+            "default",
+        ));
+        let router = Arc::new(must(Router::new_resolved(
+            Arc::new(h.source.clone()),
+            &h.topology,
+            &h.runtime.handle().module_context(),
+            &resolved,
+            16,
+            Some(metrics.handle()),
+            crate::selector::RouterShared {
+                scores: Arc::clone(&scores),
+                backend_metrics: Arc::clone(&observations),
+                input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
+                history: Arc::new(crate::MigrationHistory::default()),
+            },
+        )));
+        let score_round = |router: &Router, candidate: &Candidate| -> Result<(), RouteError> {
+            if balance {
+                router
+                    .prepare_balance(candidate, ClientInfo::default(), "")
+                    .map(|_| ())
+            } else {
+                let session = router.open()?;
+                let reserved = router.reserve_with_ticket(
+                    &session,
+                    candidate,
+                    ClientInfo::default(),
+                    "",
+                    &[],
+                    0,
+                );
+                if let Ok(ref reservation) = reserved {
+                    router.finish(reservation, false);
+                }
+                router.close(&session);
+                reserved.map(|_| ())
+            }
+        };
+        router.set_replay_wall(t0);
+        // A published routing snapshot is not this fixture's precondition.
+        // `BackendSourceHandle::current` also requires a valid namespace and
+        // mode plus the health overlay published for that exact R, and
+        // `Sources::live` additionally requires the owner current and the
+        // lifecycle Ready; returning unavailable while any of those lags is
+        // designed behaviour, not a race -- production callers treat it as a
+        // retryable boundary (`RouteAdmission::subscribe_updates`,
+        // `LocalRouteChannel::next_assignment`). This test builds a Router by
+        // hand and so bypasses that retry layer, and it is about revocation
+        // refusing both metric commits, not initial availability. So wait for
+        // the real precondition. Unfixed this failed 2 of 12 whole-suite runs
+        // while passing 5 of 5 alone.
+        let mut last_error = None;
+        let Ok(first) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match router.capture() {
+                    Ok(candidate) => break candidate,
+                    Err(error) => {
+                        last_error = Some(error);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        })
+        .await
+        else {
+            // Surface why it never became available rather than a bare
+            // timeout: the last RouteError names which input was missing.
+            unreachable!("router never became capturable: {last_error:?}")
+        };
+        assert!(matches!(
+            first.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        must(score_round(&router, &first));
+        let key = ("127.0.0.1:4000".to_owned(), crate::BackendMetric::Cpu);
+        assert_eq!(observations.snapshot().values.get(&key).copied(), Some(0.4));
+        let before = scores.snapshot().scores;
+        assert!(!before.is_empty());
+        assert_eq!(router.review_last_score_metric(), Some(t0));
+
+        let refused_time = t0 + 11_000_000_000;
+        metrics.deliver(sample(refused_time, "0.9"))?;
+        router.set_replay_wall(refused_time);
+        let candidate = must(router.capture());
+        assert!(matches!(
+            candidate.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        let (evaluated, release) = router.review_hold_before_metric_commit();
+        let worker_router = Arc::clone(&router);
+        let worker = std::thread::spawn(move || {
+            if balance {
+                worker_router
+                    .prepare_balance(&candidate, ClientInfo::default(), "")
+                    .map(|_| ())
+            } else {
+                let session = worker_router.open()?;
+                let result = worker_router.reserve_with_ticket(
+                    &session,
+                    &candidate,
+                    ClientInfo::default(),
+                    "",
+                    &[],
+                    0,
+                );
+                if let Ok(ref reservation) = result {
+                    worker_router.finish(reservation, false);
+                }
+                worker_router.close(&session);
+                result.map(|_| ())
+            }
+        });
+        evaluated.recv_timeout(Duration::from_secs(5))?;
+        // Real accepted C publication, after evaluation but before authority acquisition.
+        // It preserves routing and resource inputs; no synthetic permit or fake source.
+        let old = h.source.current().generation();
+        h.patch("[proxy]\nfailover-timeout=61", 3);
+        assert_ne!(h.source.current().generation(), old);
+        release.send(())?;
+        let result = worker.join().map_err(|_| "review worker panicked")?;
+        assert_eq!(result, Err(RouteError::StaleCandidate));
+        println!(
+            "path={} real C revocation: result={result:?}, cpu={:?}, last_score={:?}",
+            if balance { "balance" } else { "route" },
+            observations.snapshot().values.get(&key),
+            router.review_last_score_metric()
+        );
+        assert_eq!(
+            observations.snapshot().values.get(&key).copied(),
+            Some(0.4),
+            "refused evaluated 0.9 must not publish"
+        );
+        assert_eq!(
+            scores.snapshot().scores,
+            before,
+            "refused round must not publish scores"
+        );
+        assert_eq!(
+            router.review_last_score_metric(),
+            Some(t0),
+            "refused round must not advance throttle"
+        );
+
+        let accepted_time = refused_time + 1_000_000;
+        metrics.deliver(sample(accepted_time, "0.2"))?;
+        router.set_replay_wall(accepted_time);
+        let fresh = must(router.capture());
+        assert!(matches!(
+            fresh.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        must(score_round(&router, &fresh));
+        assert_eq!(observations.snapshot().values.get(&key).copied(), Some(0.2));
+        assert_eq!(
+            router.review_last_score_metric(),
+            Some(accepted_time),
+            "accepted round 1ms later must not inherit refused throttle"
+        );
+        println!(
+            "path={} accepted next round: cpu=0.2, last_score={accepted_time}",
+            if balance { "balance" } else { "route" }
+        );
+    }
+    Ok(())
+}

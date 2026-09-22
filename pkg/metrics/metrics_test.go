@@ -89,3 +89,27 @@ func TestDelLabelValues(t *testing.T) {
 		require.Equal(t, newAddrs, getAddrs(test.coll), "%dth test failed", i)
 	}
 }
+
+// The Go side of the b_conn deviation recorded as MTR-007.
+//
+// b_conn is a single global gauge labelled by backend address, but each
+// namespace has its own router and each writes with Set. Two namespaces
+// holding one connection each to the same backend therefore do not add up:
+// the last writer decides and the series reports 1, not the 2 connections
+// the process actually holds. Rust sums instead, and
+// control-router's migration_snapshot_sums_shared_backend_address asserts
+// the 2. This test pins the Go value so the declared difference is held from
+// both sides rather than described only in the manifest.
+func TestBackendConnGaugeOverwritesAcrossNamespaces(t *testing.T) {
+	const addr = "10.0.0.7:4000"
+	BackendConnGauge.Reset()
+	// Namespace A publishes its one connection to this backend.
+	BackendConnGauge.WithLabelValues(addr).Set(1)
+	// Namespace B publishes its own one connection to the same backend.
+	BackendConnGauge.WithLabelValues(addr).Set(1)
+
+	value, err := ReadGauge(BackendConnGauge.WithLabelValues(addr))
+	require.NoError(t, err)
+	require.Equal(t, float64(1), value,
+		"Go reports the last writer, not the process total; Rust reports 2 by design (MTR-007)")
+}

@@ -1,0 +1,475 @@
+# captured 2026-09-21T17:20:59Z from http://127.0.0.1:14380/metrics
+# HELP tiproxy_backend_get_backend Counter of getting backend.
+# TYPE tiproxy_backend_get_backend counter
+tiproxy_backend_get_backend{res="succeed"} 15
+# HELP tiproxy_backend_get_backend_duration_seconds Bucketed histogram of time (s) for getting an available backend.
+# TYPE tiproxy_backend_get_backend_duration_seconds histogram
+tiproxy_backend_get_backend_duration_seconds_bucket{le="1e-06"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="2e-06"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="4e-06"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="8e-06"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="1.6e-05"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="3.2e-05"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="6.4e-05"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.000128"} 0
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.000256"} 6
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.000512"} 14
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.001024"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.002048"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.004096"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.008192"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.016384"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.032768"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.065536"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.131072"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.262144"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="0.524288"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="1.048576"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="2.097152"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="4.194304"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="8.388608"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="16.777216"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="33.554432"} 15
+tiproxy_backend_get_backend_duration_seconds_bucket{le="+Inf"} 15
+tiproxy_backend_get_backend_duration_seconds_sum 0.004517416
+tiproxy_backend_get_backend_duration_seconds_count 15
+# HELP tiproxy_backend_keepalive_update_total Counter of health-driven backend keepalive policy updates.
+# TYPE tiproxy_backend_keepalive_update_total counter
+tiproxy_backend_keepalive_update_total{backend="127.0.0.1:15300",health="healthy",result="fail"} 18
+tiproxy_backend_keepalive_update_total{backend="127.0.0.1:15301",health="healthy",result="fail"} 13
+tiproxy_backend_keepalive_update_total{backend="127.0.0.1:15400",health="healthy",result="fail"} 2
+# HELP tiproxy_balance_migrate_duration_seconds Bucketed histogram of migrating time (s) of sessions.
+# TYPE tiproxy_balance_migrate_duration_seconds histogram
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0001"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0002"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0004"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0008"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0016"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0032"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0064"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0128"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0256"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.0512"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.1024"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.2048"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.4096"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="0.8192"} 0
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="1.6384"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="3.2768"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="6.5536"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="13.1072"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="26.2144"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="52.4288"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="104.8576"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="209.7152"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="419.4304"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="838.8608"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="1677.7216"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="3355.4432"} 1
+tiproxy_balance_migrate_duration_seconds_bucket{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301",le="+Inf"} 1
+tiproxy_balance_migrate_duration_seconds_sum{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1.334333042
+tiproxy_balance_migrate_duration_seconds_count{from="127.0.0.1:15300",migrate_res="succeed",to="127.0.0.1:15301"} 1
+# HELP tiproxy_balance_migrate_total Number and result of session migration.
+# TYPE tiproxy_balance_migrate_total counter
+tiproxy_balance_migrate_total{from="127.0.0.1:15300",migrate_res="succeed",reason="status",to="127.0.0.1:15301"} 1
+# HELP tiproxy_balance_pending_migrate Number of pending session migration.
+# TYPE tiproxy_balance_pending_migrate gauge
+tiproxy_balance_pending_migrate{from="127.0.0.1:15300",reason="status",to="127.0.0.1:15301"} 0
+# HELP tiproxy_monitor_keep_alive_total Counter of proxy keep alive.
+# TYPE tiproxy_monitor_keep_alive_total counter
+tiproxy_monitor_keep_alive_total 2
+# HELP tiproxy_monitor_time_jump_back_total Counter of system time jumps backward.
+# TYPE tiproxy_monitor_time_jump_back_total counter
+tiproxy_monitor_time_jump_back_total 0
+# HELP tiproxy_server_connections Number of connections.
+# TYPE tiproxy_server_connections gauge
+tiproxy_server_connections 1
+# HELP tiproxy_server_create_connection_total Number of create connections.
+# TYPE tiproxy_server_create_connection_total counter
+tiproxy_server_create_connection_total 15
+# HELP tiproxy_server_disconnection_total Number of disconnections.
+# TYPE tiproxy_server_disconnection_total counter
+tiproxy_server_disconnection_total{type="client network break"} 1
+tiproxy_server_disconnection_total{type="success"} 14
+# HELP tiproxy_server_err Counter of server error.
+# TYPE tiproxy_server_err counter
+tiproxy_server_err{type="rust_memory_probe_failure"} 15
+# HELP tiproxy_session_conn_lifetime_seconds Bucketed histogram of connection lifetime (s).
+# TYPE tiproxy_session_conn_lifetime_seconds histogram
+tiproxy_session_conn_lifetime_seconds_bucket{le="0.1"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="0.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="0.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="0.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="1.6"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="3.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="6.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="12.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="25.6"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="51.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="102.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="204.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="409.6"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="819.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="1638.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="3276.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="6553.6"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="13107.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="26214.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="52428.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="104857.6"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="209715.2"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="419430.4"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="838860.8"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="1.6777216e+06"} 15
+tiproxy_session_conn_lifetime_seconds_bucket{le="+Inf"} 15
+tiproxy_session_conn_lifetime_seconds_sum 0.06872075
+tiproxy_session_conn_lifetime_seconds_count 15
+# HELP tiproxy_session_handshake_duration_seconds Bucketed histogram of processing time (s) of handshakes.
+# TYPE tiproxy_session_handshake_duration_seconds histogram
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.0005"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.001"} 2
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.002"} 4
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.004"} 7
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.008"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.016"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.032"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.064"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.128"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.256"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="0.512"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="1.024"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="2.048"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="4.096"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="8.192"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="16.384"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="32.768"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="65.536"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="131.072"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="262.144"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="524.288"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="1048.576"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="2097.152"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="4194.304"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="8388.608"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="16777.216"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="33554.432"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="67108.864"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="134217.728"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15300",le="+Inf"} 8
+tiproxy_session_handshake_duration_seconds_sum{backend="127.0.0.1:15300"} 0.015290124999999998
+tiproxy_session_handshake_duration_seconds_count{backend="127.0.0.1:15300"} 8
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.0005"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.001"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.002"} 4
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.004"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.008"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.016"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.032"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.064"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.128"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.256"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="0.512"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="1.024"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="2.048"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="4.096"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="8.192"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="16.384"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="32.768"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="65.536"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="131.072"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="262.144"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="524.288"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="1048.576"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="2097.152"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="4194.304"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="8388.608"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="16777.216"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="33554.432"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="67108.864"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="134217.728"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15301",le="+Inf"} 6
+tiproxy_session_handshake_duration_seconds_sum{backend="127.0.0.1:15301"} 0.011097709
+tiproxy_session_handshake_duration_seconds_count{backend="127.0.0.1:15301"} 6
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.0005"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.001"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.002"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.004"} 0
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.008"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.016"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.032"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.064"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.128"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.256"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="0.512"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="1.024"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="2.048"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="4.096"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="8.192"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="16.384"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="32.768"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="65.536"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="131.072"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="262.144"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="524.288"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="1048.576"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="2097.152"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="4194.304"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="8388.608"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="16777.216"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="33554.432"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="67108.864"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="134217.728"} 1
+tiproxy_session_handshake_duration_seconds_bucket{backend="127.0.0.1:15400",le="+Inf"} 1
+tiproxy_session_handshake_duration_seconds_sum{backend="127.0.0.1:15400"} 0.007056666
+tiproxy_session_handshake_duration_seconds_count{backend="127.0.0.1:15400"} 1
+# HELP tiproxy_session_query_duration_seconds Bucketed histogram of processing time (s) of handled queries.
+# TYPE tiproxy_session_query_duration_seconds histogram
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.0005"} 22
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.001"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.002"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.004"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.008"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.016"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.032"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.064"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.128"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.256"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="0.512"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="1.024"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="2.048"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="4.096"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="8.192"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="16.384"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="32.768"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="65.536"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="131.072"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="262.144"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="524.288"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="1048.576"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="2097.152"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="4194.304"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="8388.608"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="16777.216"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="33554.432"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="67108.864"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="134217.728"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Query",le="+Inf"} 28
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15300",cmd_type="Query"} 0.011742123000000002
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15300",cmd_type="Query"} 28
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.0005"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.001"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.002"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.004"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.008"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.016"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.032"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.064"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.128"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.256"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="0.512"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="1.024"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="2.048"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="4.096"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="8.192"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="16.384"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="32.768"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="65.536"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="131.072"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="262.144"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="524.288"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="1048.576"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="2097.152"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="4194.304"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="8388.608"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="16777.216"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="33554.432"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="67108.864"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="134217.728"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15300",cmd_type="Quit",le="+Inf"} 7
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15300",cmd_type="Quit"} 4.15e-05
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15300",cmd_type="Quit"} 7
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.0005"} 8
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.001"} 17
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.002"} 19
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.004"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.008"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.016"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.032"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.064"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.128"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.256"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="0.512"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="1.024"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="2.048"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="4.096"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="8.192"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="16.384"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="32.768"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="65.536"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="131.072"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="262.144"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="524.288"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="1048.576"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="2097.152"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="4194.304"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="8388.608"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="16777.216"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="33554.432"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="67108.864"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="134217.728"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Query",le="+Inf"} 20
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15301",cmd_type="Query"} 0.014885749
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15301",cmd_type="Query"} 20
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.0005"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.001"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.002"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.004"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.008"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.016"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.032"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.064"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.128"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.256"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="0.512"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="1.024"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="2.048"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="4.096"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="8.192"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="16.384"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="32.768"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="65.536"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="131.072"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="262.144"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="524.288"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="1048.576"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="2097.152"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="4194.304"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="8388.608"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="16777.216"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="33554.432"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="67108.864"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="134217.728"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15301",cmd_type="Quit",le="+Inf"} 6
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15301",cmd_type="Quit"} 4.6793e-05
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15301",cmd_type="Quit"} 6
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.0005"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.001"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.002"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.004"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.008"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.016"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.032"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.064"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.128"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.256"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="0.512"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="1.024"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="2.048"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="4.096"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="8.192"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="16.384"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="32.768"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="65.536"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="131.072"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="262.144"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="524.288"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="1048.576"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="2097.152"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="4194.304"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="8388.608"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="16777.216"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="33554.432"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="67108.864"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="134217.728"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Query",le="+Inf"} 3
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15400",cmd_type="Query"} 0.000900958
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15400",cmd_type="Query"} 3
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.0005"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.001"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.002"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.004"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.008"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.016"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.032"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.064"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.128"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.256"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="0.512"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="1.024"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="2.048"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="4.096"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="8.192"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="16.384"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="32.768"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="65.536"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="131.072"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="262.144"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="524.288"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="1048.576"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="2097.152"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="4194.304"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="8388.608"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="16777.216"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="33554.432"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="67108.864"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="134217.728"} 1
+tiproxy_session_query_duration_seconds_bucket{backend="127.0.0.1:15400",cmd_type="Quit",le="+Inf"} 1
+tiproxy_session_query_duration_seconds_sum{backend="127.0.0.1:15400",cmd_type="Quit"} 3.583e-06
+tiproxy_session_query_duration_seconds_count{backend="127.0.0.1:15400",cmd_type="Quit"} 1
+# HELP tiproxy_session_query_time_since_conn_creation_seconds Bucketed histogram of query start time (s) since connection creation.
+# TYPE tiproxy_session_query_time_since_conn_creation_seconds histogram
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="1"} 62
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="2"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="4"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="8"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="16"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="32"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="64"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="128"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="256"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="512"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="1024"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="2048"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="4096"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="8192"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="16384"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="32768"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="65536"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="131072"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="262144"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="524288"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="1.048576e+06"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_bucket{le="+Inf"} 65
+tiproxy_session_query_time_since_conn_creation_seconds_sum 5.561171251
+tiproxy_session_query_time_since_conn_creation_seconds_count 65
+# HELP tiproxy_session_query_total Counter of queries.
+# TYPE tiproxy_session_query_total counter
+tiproxy_session_query_total{backend="127.0.0.1:15300",cmd_type="Query"} 28
+tiproxy_session_query_total{backend="127.0.0.1:15300",cmd_type="Quit"} 7
+tiproxy_session_query_total{backend="127.0.0.1:15301",cmd_type="Query"} 20
+tiproxy_session_query_total{backend="127.0.0.1:15301",cmd_type="Quit"} 6
+tiproxy_session_query_total{backend="127.0.0.1:15400",cmd_type="Query"} 3
+tiproxy_session_query_total{backend="127.0.0.1:15400",cmd_type="Quit"} 1
+# HELP tiproxy_traffic_cross_location_bytes Counter of bytes between TiProxy and cross-location backends.
+# TYPE tiproxy_traffic_cross_location_bytes counter
+tiproxy_traffic_cross_location_bytes 0
+# HELP tiproxy_traffic_inbound_bytes Counter of bytes from backends.
+# TYPE tiproxy_traffic_inbound_bytes counter
+tiproxy_traffic_inbound_bytes{backend="127.0.0.1:15300"} 3313
+tiproxy_traffic_inbound_bytes{backend="127.0.0.1:15301"} 2554
+tiproxy_traffic_inbound_bytes{backend="127.0.0.1:15400"} 382
+# HELP tiproxy_traffic_inbound_packets Counter of packets from backends.
+# TYPE tiproxy_traffic_inbound_packets counter
+tiproxy_traffic_inbound_packets{backend="127.0.0.1:15300"} 100
+tiproxy_traffic_inbound_packets{backend="127.0.0.1:15301"} 76
+tiproxy_traffic_inbound_packets{backend="127.0.0.1:15400"} 12
+# HELP tiproxy_traffic_outbound_bytes Counter of bytes to backends.
+# TYPE tiproxy_traffic_outbound_bytes counter
+tiproxy_traffic_outbound_bytes{backend="127.0.0.1:15300"} 2231
+tiproxy_traffic_outbound_bytes{backend="127.0.0.1:15301"} 12281
+tiproxy_traffic_outbound_bytes{backend="127.0.0.1:15400"} 251
+# HELP tiproxy_traffic_outbound_packets Counter of packets to backends.
+# TYPE tiproxy_traffic_outbound_packets counter
+tiproxy_traffic_outbound_packets{backend="127.0.0.1:15300"} 44
+tiproxy_traffic_outbound_packets{backend="127.0.0.1:15301"} 31
+tiproxy_traffic_outbound_packets{backend="127.0.0.1:15400"} 5

@@ -30,6 +30,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::metrics::{MetricError, QueryId, QueryResult, ReaderState, Source};
+use crate::owner_metrics::ElectionOwnerHistory;
 use crate::{MetricCapture, MetricSourceHandle};
 
 #[cfg(feature = "api-replay")]
@@ -152,8 +153,20 @@ struct Shared {
     queries: Mutex<BTreeSet<QueryId>>,
     routing_queries: bool,
     published: Mutex<Published>,
+    /// Where an election win or retirement publishes `server_owner`.
+    ///
+    /// Installed after construction because the collector is built before
+    /// the composition root has both halves in hand, and always before the
+    /// module runs, so no worker can campaign without it.
+    owner_history: Mutex<Option<Arc<ElectionOwnerHistory>>>,
 }
 impl Shared {
+    fn owner_history(&self) -> Option<Arc<ElectionOwnerHistory>> {
+        self.owner_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
     fn lock(&self) -> MutexGuard<'_, Published> {
         self.published
             .lock()
@@ -374,6 +387,16 @@ impl MetricOverlayHandle {
         let shared = Arc::clone(&self.shared);
         Arc::new(move |cluster: &str| service::snapshot_bytes(&shared, cluster))
     }
+    /// Installs the process-level `server_owner` store the election workers
+    /// report into. Must be called before the collector module starts.
+    pub fn set_owner_history(&self, history: Arc<ElectionOwnerHistory>) {
+        *self
+            .shared
+            .owner_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(history);
+    }
+
     /// Registers an expression for a manually bound collector. Routing-bound
     /// collectors own their query set and ignore manual registration.
     pub fn add_query(&self, query: QueryId) {
@@ -532,6 +555,7 @@ impl MetricCollector {
             queries: Mutex::new(BTreeSet::new()),
             routing_queries,
             published: Mutex::new(Published::default()),
+            owner_history: Mutex::new(None),
         });
         Ok((
             Self {

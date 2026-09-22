@@ -1,0 +1,8 @@
+# Smoke provenance
+built at head : 78893da29bbadcf951ec037dca1b9c605c58d538
+binary sha256 : 721e1726a6b79c165ff50a2056df7579f03dd9755679413f654aae40b2f53047
+evidence sealed at: c1e4f826745eb6df7997098573b830f72677ee47 (later; c1e4f826 changes retention admission only, not the exposition path)
+harness       : PATH=/opt/homebrew/opt/mysql-client/bin:$PATH DATAPLANE_PORT_OFFSET=11300 DATAPLANE_T3_FOCUSED=1 ./tests/dataplane/integration/run.sh --mode rust --variant plain
+harness exit  : 0
+run dir       : tests/dataplane/integration/artifacts/tiproxy-dp-rust-plain-64340
+full response : full-metrics-78893da2.txt (475 lines, entire /metrics body, not an excerpt)

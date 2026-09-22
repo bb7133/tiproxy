@@ -28,8 +28,10 @@ use control_topology::metrics::QueryId;
 use control_topology::{HealthSnapshot, MergedBackend, RoutingSnapshot, TopologyModuleHandle};
 
 use crate::authority::{Candidate, RouteError, Sources};
+use crate::factors::RedirectReason;
 use crate::ledger::{
-    AccountIdentity, Accounting, Ledger, Redirect, Reservation, Session, Settlement,
+    AccountIdentity, Accounting, Ledger, MigrationObservation, Redirect, Reservation, Session,
+    Settlement,
 };
 use crate::policy::{RoutingIdentity, label_matches};
 
@@ -64,7 +66,83 @@ struct State {
     observed: Option<(Arc<RoutingSnapshot>, Arc<HealthSnapshot>)>,
     server_version: String,
     supports_redirection: bool,
+    /// Where this router's raw backend observations are published.
+    backend_metrics: Option<Arc<crate::BackendMetricHistory>>,
+    /// Where this router's scores are published, or `None` when nothing
+    /// exposes them.
+    score_history: Option<Arc<crate::ScoreHistory>>,
+    /// Go `FactorBasedBalance.lastMetricTime`, in the same wall nanoseconds
+    /// the scoring uses.
+    ///
+    /// Per scoring instance, not per process: Go keeps it on the balance
+    /// object, so two routers throttle independently even though they write
+    /// into one set of series. `None` until this router has scored once,
+    /// which Go reaches through a zero `lastMetricTime` that any real time
+    /// exceeds.
+    last_score_metric: Option<i64>,
 }
+
+impl State {
+    /// Go `updateScore`'s metric branch: publish every backend's per-factor
+    /// score when this instance last did so more than `SCORE_METRIC_INTERVAL`
+    /// ago.
+    ///
+    /// The check happens at a real scoring, not on a timer, so a router that
+    /// stops scoring simply stops updating -- its last values stay exposed
+    /// for as long as that takes, which is Go's behaviour and the reason the
+    /// family cannot be described as bounded-staleness.
+    /// Go `updateScore`'s metric branch. The `Reset` half lives at the
+    /// plane's configuration boundary, where Go's `SetConfig` puts it.
+    fn publish_scores(&mut self, now: i64, report: &crate::FactorReport) {
+        let Some(history) = self.score_history.clone() else {
+            return;
+        };
+        if !score_write_due(self.last_score_metric, now) {
+            return;
+        }
+        self.last_score_metric = Some(now);
+        for row in &report.rows {
+            // The row is keyed by the opaque routing id; the label is the
+            // address, resolved through the same state that produced the
+            // scores rather than derived anywhere else.
+            let Some(backend) = self.backends.get(&row.backend_id) else {
+                continue;
+            };
+            let address = backend.source.backend.addr.as_str();
+            if address.is_empty() {
+                continue;
+            }
+            for (factor, score) in &row.parts {
+                history.observe(address, *factor, *score);
+            }
+        }
+    }
+}
+
+/// Go `updateScore`'s `needUpdateMetric`, separated from the state it reads
+/// so the cadence can be exercised on a controlled clock.
+///
+/// Deliberately knows nothing about configuration. Go's `SetConfig` resets
+/// the gauge and does not touch `lastMetricTime`, so a reset neither earns
+/// a write nor excuses one: a throttled scoring after a reset still waits
+/// out the remaining interval, and the family stays empty until it does.
+const fn score_write_due(last_write: Option<i64>, now: i64) -> bool {
+    match last_write {
+        // Go compares against a zero `lastMetricTime`, which any real time
+        // exceeds, so the first scoring always writes.
+        None => true,
+        // Strictly greater, as Go's `>` is.
+        Some(last) => now.saturating_sub(last) > SCORE_METRIC_INTERVAL_NANOS,
+    }
+}
+
+/// [`crate::SCORE_METRIC_INTERVAL`] in the wall nanoseconds scoring uses.
+const SCORE_METRIC_INTERVAL_NANOS: i64 = 10_000_000_000;
+/// The two must not drift apart; the literal exists only because the cast
+/// from `Duration::as_nanos`'s `u128` is not const-checkable.
+const _: () = assert!(
+    SCORE_METRIC_INTERVAL_NANOS.unsigned_abs() as u128 == crate::SCORE_METRIC_INTERVAL.as_nanos()
+);
 
 #[cfg(test)]
 type MetricUseBarrier = (
@@ -126,11 +204,16 @@ impl SchedulerStateSnapshot {
 /// reservations can still settle their original accounting owner.
 pub struct Router {
     #[cfg(test)]
+    review_metric_commit: Mutex<Option<RedirectOfferBarrier>>,
+    #[cfg(test)]
     replay_wall: Mutex<Option<i64>>,
     factors_enabled: bool,
     metrics: Option<control_topology::MetricOverlayHandle>,
     input_diagnostics: Option<Arc<crate::plane::RouteInputDiagnostics>>,
     sources: Sources,
+    /// Where settled migration observations are published. Installed by the
+    /// composition owner; absent in tests and in any build with no exporter.
+    migrations: Mutex<Option<Arc<dyn MigrationSink>>>,
     state: Mutex<State>,
     #[cfg(test)]
     next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -142,7 +225,69 @@ pub struct Router {
     next_failover_commit: Mutex<Option<FailoverCommitBarrier>>,
 }
 
+/// Receives migration observations drained from the ledger.
+///
+/// The ledger records; publication is someone else's job. The router owns no
+/// metric registry, and the dataplane cannot be depended on from here, so the
+/// composition owner installs the sink.
+pub trait MigrationSink: Send + Sync {
+    /// Publishes one issued or settled migration.
+    ///
+    /// Called with the router state lock HELD, so an implementation must not
+    /// block and must not re-enter the router. That is deliberate: the
+    /// pending-migration gauge is a running +1/-1, so the sink has to observe
+    /// issues and settlements in ledger order. Publishing after releasing the
+    /// lock lets a settlement on one thread overtake the issue it belongs to,
+    /// which drives the gauge to -1 (clamped to 0) and then +1, leaving it
+    /// stuck at one phantom pending migration forever. The production sink is
+    /// a non-blocking channel send that drops on a full queue.
+    fn record(&self, observation: MigrationObservation);
+}
+
+/// Handles every router incarnation shares with the plane that built it.
+pub struct RouterShared {
+    /// Diagnostic counters proving live inputs were consumed.
+    pub input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
+    /// Cumulative migration history, which outlives any one incarnation.
+    pub history: Arc<crate::MigrationHistory>,
+    /// Retained `b_score` values, likewise process-level: Go's gauge is
+    /// shared by every balance instance, while the throttle that decides
+    /// when to write is per instance.
+    pub scores: Arc<crate::ScoreHistory>,
+    /// Retained `backend_metric` observations, also process-level.
+    pub backend_metrics: Arc<crate::BackendMetricHistory>,
+}
+
 impl Router {
+    /// Installs the sink that receives migration observations.
+    pub fn set_migration_sink(&self, sink: Arc<dyn MigrationSink>) {
+        *self
+            .migrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Publishes everything the ledger buffered, called with the state lock
+    /// still held so publication order is ledger order. Every ledger mutation
+    /// path funnels through here, including the terminal guard's drop, so no
+    /// settlement can escape publication.
+    fn publish_migrations(&self, drained: Vec<MigrationObservation>) {
+        if drained.is_empty() {
+            return;
+        }
+        let sink = self
+            .migrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(sink) = sink else {
+            return;
+        };
+        for observation in drained {
+            sink.record(observation);
+        }
+    }
+
     /// Builds one router from handles supplied by the same composition owner.
     /// `max_sessions` bounds live session state, including sessions awaiting a
     /// backend. A removed namespace requires a new router incarnation.
@@ -160,6 +305,7 @@ impl Router {
         Ok(Self {
             #[cfg(test)]
             replay_wall: Mutex::new(None),
+            migrations: Mutex::new(None),
             factors_enabled: false,
             metrics: None,
             input_diagnostics: None,
@@ -169,11 +315,16 @@ impl Router {
             #[cfg(test)]
             next_metric_use: Mutex::new(None),
             #[cfg(test)]
+            review_metric_commit: Mutex::new(None),
+            #[cfg(test)]
             next_redirect_offer: Mutex::new(None),
             #[cfg(test)]
             next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
                 ledger: Ledger::new(max_sessions),
+                score_history: None,
+                backend_metrics: None,
+                last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),
@@ -194,25 +345,31 @@ impl Router {
         resolved: &crate::ResolvedNamespace,
         max_sessions: usize,
         metrics: Option<control_topology::MetricOverlayHandle>,
-        input_diagnostics: Arc<crate::plane::RouteInputDiagnostics>,
+        shared: RouterShared,
     ) -> Result<Self, RouteError> {
         Ok(Self {
             #[cfg(test)]
             replay_wall: Mutex::new(None),
+            migrations: Mutex::new(None),
             factors_enabled: true,
             metrics,
-            input_diagnostics: Some(input_diagnostics),
+            input_diagnostics: Some(shared.input_diagnostics),
             sources: Sources::new_retained(source, topology, context, resolved)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
             #[cfg(test)]
             next_metric_use: Mutex::new(None),
             #[cfg(test)]
+            review_metric_commit: Mutex::new(None),
+            #[cfg(test)]
             next_redirect_offer: Mutex::new(None),
             #[cfg(test)]
             next_failover_commit: Mutex::new(None),
             state: Mutex::new(State {
-                ledger: Ledger::new(max_sessions),
+                ledger: Ledger::with_history(max_sessions, shared.history),
+                score_history: Some(shared.scores),
+                backend_metrics: Some(shared.backend_metrics),
+                last_score_metric: None,
                 factors: BTreeMap::new(),
                 schedules: BTreeMap::new(),
                 backends: BTreeMap::new(),
@@ -281,6 +438,38 @@ impl Router {
             let _ = signal.send(());
         }
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_hold_before_metric_commit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (signal, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self
+            .review_metric_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
+        (observed, release)
+    }
+    #[cfg(test)]
+    pub(crate) fn review_before_metric_commit(&self) {
+        if let Some((signal, wait)) = self
+            .review_metric_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            signal
+                .send(())
+                .unwrap_or_else(|error| unreachable!("review observer gone: {error}"));
+            wait.recv_timeout(std::time::Duration::from_secs(8))
+                .unwrap_or_else(|error| unreachable!("review release timed out: {error}"));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn review_last_score_metric(&self) -> Option<i64> {
+        self.lock().last_score_metric
     }
 
     #[cfg(test)]
@@ -533,6 +722,23 @@ impl Router {
             let report = factors
                 .core
                 .evaluate(&inputs, &candidate.policy, queries, now);
+            // Routing scores too. Go reaches `updateScore` from both
+            // `BackendToRoute` and `BackendsToBalance`, so both write the
+            // gauges behind the one shared throttle; publishing only from
+            // the balance path would leave a proxy that routes without
+            // rebalancing reporting nothing.
+            //
+            // Under the same combined authority as the balance path, and
+            // in the same commit as `backend_metric`: the two families
+            // describe one scoring round, so one of them landing while
+            // the other was refused would expose a round that never
+            // happened as one that half did.
+            #[cfg(test)]
+            self.review_before_metric_commit();
+            self.sources.commit_valid(candidate, || {
+                factors.core.publish_backend_metrics();
+                state.publish_scores(now, &report);
+            });
             self.sources.validate(candidate)?;
             // Scoring happens even when every scored backend is rejected by
             // a factor. Persist only after the source and metric fences hold.
@@ -635,6 +841,9 @@ impl Router {
                     &inputs,
                     &candidate.config.resource_incarnation(),
                 );
+                // Deliberately not published: `factor_report` is a
+                // diagnostic read with no Go counterpart, and letting it
+                // write would let an observer move a gauge by looking.
                 let report = factors
                     .core
                     .evaluate(&inputs, &candidate.policy, &queries, now);
@@ -663,6 +872,9 @@ impl Router {
             source,
             target: Arc::clone(&target.account),
             target_id: Arc::clone(&target.source.backend_id),
+            // A directly prepared redirect carries no factor decision; Go only
+            // reaches this shape from `RedirectConnections`, which labels `test`.
+            reason: RedirectReason::Test,
         })
     }
 
@@ -675,7 +887,10 @@ impl Router {
         let mut rejected = Vec::new();
         let result = {
             let mut state = self.lock();
-            self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected)
+            let result =
+                self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected);
+            self.publish_migrations(state.ledger.drain_migrations());
+            result
         };
         drop(rejected);
         result
@@ -754,6 +969,7 @@ impl Router {
             &prepared.target,
             assignment,
             now,
+            prepared.reason,
         ) {
             Ok(redirect) => redirect,
             Err(crate::ledger::LedgerError::CrossKeyspace) => {
@@ -799,6 +1015,7 @@ impl Router {
                 state.ledger.admit_redirect(redirect, accepted, now);
                 summary.accepted += u64::from(accepted);
             }
+            self.publish_migrations(state.ledger.drain_migrations());
         }
         drop(rejected);
         summary
@@ -810,7 +1027,10 @@ impl Router {
         success: bool,
         now: Instant,
     ) -> Settlement {
-        self.lock().ledger.finish_redirect(redirect, success, now)
+        let mut state = self.lock();
+        let settlement = state.ledger.finish_redirect(redirect, success, now);
+        self.publish_migrations(state.ledger.drain_migrations());
+        settlement
     }
 
     /// Settles an exact pending attempt, even after its C/R/H inputs retire.
@@ -822,7 +1042,10 @@ impl Router {
     /// Closes the exact session incarnation and returns any remaining accounting.
     /// Closing twice or closing a foreign session has no effect.
     pub fn close(&self, session: &Session) -> Settlement {
-        self.lock().ledger.close(session)
+        let mut state = self.lock();
+        let settlement = state.ledger.close(session, Instant::now());
+        self.publish_migrations(state.ledger.drain_migrations());
+        settlement
     }
 
     /// Number of currently healthy backends, independent of matching groups.
@@ -1004,6 +1227,7 @@ impl State {
                     .map(|counts| crate::factors::Input {
                         id: Arc::clone(&backend.source.backend_id),
                         owner: Arc::clone(&backend.account),
+                        address: backend.source.backend.addr.clone(),
                         instance: control_topology::metrics::instance_label(
                             &backend.source.backend.addr,
                             &backend.source.backend.ip,
@@ -1033,6 +1257,12 @@ impl State {
             .map(|(id, backend)| (Arc::clone(id), Arc::clone(&backend.account)))
             .collect();
         let mut factors = self.factors.get(&group).cloned().unwrap_or_default();
+        // A retained clone carries the previous sink; a fresh default has
+        // none. Setting it every time keeps both on the one installed sink
+        // rather than depending on which branch produced this group.
+        factors
+            .core
+            .set_backend_metrics(self.backend_metrics.clone());
         if factors
             .incarnation
             .as_ref()
@@ -1403,3 +1633,214 @@ mod tests {
 #[cfg(test)]
 #[path = "composition_tests.rs"]
 mod composition_tests;
+
+// Independent review fixture: use the real ledger transitions, never inject maps.
+#[cfg(test)]
+impl Router {
+    pub(crate) fn review_seed_settled_migrations(&self, start: usize, count: usize) {
+        let mut state = self.lock();
+        let ledger = &mut state.ledger;
+        let a = ledger
+            .add_account()
+            .unwrap_or_else(|_| unreachable!("fixture account"));
+        let b = ledger
+            .add_account()
+            .unwrap_or_else(|_| unreachable!("fixture account"));
+        for index in start..start + count {
+            let session = ledger
+                .open()
+                .unwrap_or_else(|_| unreachable!("fixture session"));
+            let source = RouteAssignment {
+                backend_id: "review-from".into(),
+                backend_address: format!("10.0.0.1:{index}"),
+                ..RouteAssignment::default()
+            };
+            let target = RouteAssignment {
+                backend_id: "review-to".into(),
+                backend_address: "10.0.0.2:4000".into(),
+                ..RouteAssignment::default()
+            };
+            let reservation = ledger
+                .reserve(&session, &a, source)
+                .unwrap_or_else(|_| unreachable!("fixture reservation"));
+            assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+            let now = Instant::now();
+            let redirect = ledger
+                .prepare_redirect(&session, &b, target, now, RedirectReason::Test)
+                .unwrap_or_else(|_| unreachable!("fixture redirect"));
+            ledger.admit_redirect(redirect.clone(), true, now);
+            assert_eq!(
+                ledger.finish_redirect(&redirect, true, now),
+                Settlement::Applied
+            );
+            assert_eq!(ledger.close(&session, now), Settlement::Applied);
+            drop(ledger.drain_migrations());
+        }
+    }
+}
+
+#[cfg(test)]
+mod score_cadence_tests {
+    use super::{SCORE_METRIC_INTERVAL_NANOS, score_write_due};
+
+    const T0: i64 = 1_000_000_000_000;
+
+    /// Go compares against a zero `lastMetricTime`, so the first scoring
+    /// always writes; there is no warm-up interval to wait out.
+    #[test]
+    fn the_first_scoring_writes() {
+        assert!(score_write_due(None, T0));
+    }
+
+    /// Go's check is `now.Sub(last) > interval`, strictly. Exactly at the
+    /// boundary it does not write.
+    #[test]
+    fn the_interval_boundary_is_exclusive() {
+        assert!(
+            !score_write_due(Some(T0), T0 + SCORE_METRIC_INTERVAL_NANOS),
+            "exactly one interval later is not yet past it"
+        );
+        assert!(score_write_due(
+            Some(T0),
+            T0 + SCORE_METRIC_INTERVAL_NANOS + 1
+        ));
+        assert!(!score_write_due(
+            Some(T0),
+            T0 + SCORE_METRIC_INTERVAL_NANOS - 1
+        ));
+    }
+
+    /// A scoring inside the interval changes nothing, which is what makes
+    /// the family a sample of the scores rather than a view of them.
+    #[test]
+    fn a_scoring_inside_the_interval_does_nothing() {
+        assert!(!score_write_due(Some(T0), T0 + 1));
+    }
+}
+
+#[cfg(test)]
+mod score_publication_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use control_topology::{BackendInfo, MergedBackend};
+
+    use super::{Backend, PortRoutes, SCORE_METRIC_INTERVAL_NANOS, State};
+    use crate::factors::Factor;
+    use crate::ledger::Ledger;
+
+    const T0: i64 = 1_000_000_000_000;
+
+    /// A state with one backend whose routing id is deliberately not its
+    /// address, so a label taken from the wrong field is visible.
+    fn state_with_backend(history: &Arc<crate::ScoreHistory>) -> (State, Arc<str>) {
+        let id: Arc<str> = Arc::from("cluster-a/10.0.0.1:4000");
+        let mut state = State {
+            ledger: Ledger::new(8),
+            score_history: Some(Arc::clone(history)),
+            backend_metrics: None,
+            last_score_metric: None,
+            factors: BTreeMap::new(),
+            schedules: BTreeMap::new(),
+            backends: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            ports: PortRoutes::default(),
+            next_group: 1,
+            observed: None,
+            server_version: String::new(),
+            supports_redirection: true,
+        };
+        let account = state
+            .ledger
+            .add_account()
+            .unwrap_or_else(|error| unreachable!("account: {error:?}"));
+        state.backends.insert(
+            Arc::clone(&id),
+            Backend {
+                source: MergedBackend {
+                    backend_id: Arc::clone(&id),
+                    cluster_name: Arc::from("cluster-a"),
+                    backend: BackendInfo {
+                        addr: "10.0.0.1:4000".into(),
+                        keyspace: String::new(),
+                        ip: String::new(),
+                        status_port: 0,
+                        version: String::new(),
+                        git_hash: String::new(),
+                        deploy_path: String::new(),
+                        start_timestamp: 0,
+                        labels: BTreeMap::new(),
+                    },
+                },
+                account,
+                healthy: true,
+                supports_redirection: true,
+                group: None,
+                failover_since: None,
+                routing_identity: super::RoutingIdentity::new("10.0.0.1:4000"),
+            },
+        );
+        (state, id)
+    }
+
+    fn report(id: &Arc<str>, conn: u64, cpu: u64) -> crate::FactorReport {
+        crate::FactorReport {
+            rows: vec![crate::FactorScore {
+                backend_id: Arc::clone(id),
+                score: conn,
+                parts: vec![(Factor::Connection, conn), (Factor::Cpu, cpu)],
+                routeable: true,
+                advice_to_best: Vec::new(),
+            }],
+            preferred: Vec::new(),
+            balance: None,
+        }
+    }
+
+    /// The whole publication path on a controlled clock: the first scoring
+    /// writes, a scoring inside the interval changes nothing, one past it
+    /// writes again, and a configuration change clears the family without
+    /// earning a write.
+    ///
+    /// It also pins the label. `FactorScore.backend_id` is the opaque
+    /// routing identity, and `b_status` shipped labelled with exactly that
+    /// kind of value because a fixture typed the expected label by hand.
+    /// Here the id and the address differ, so using the wrong one shows.
+    #[test]
+    fn scores_publish_on_gos_cadence_and_are_labelled_by_address() {
+        let history = Arc::new(crate::ScoreHistory::new());
+        let (mut state, id) = state_with_backend(&history);
+
+        state.publish_scores(T0, &report(&id, 3, 1));
+        let scores = history.snapshot().scores;
+        assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)], 3);
+        assert_eq!(scores[&("10.0.0.1:4000".to_owned(), Factor::Cpu)], 1);
+        assert!(
+            !scores.keys().any(|(label, _)| label.contains('/')),
+            "the opaque routing id must never reach a metric label: {:?}",
+            scores.keys().collect::<Vec<_>>()
+        );
+
+        // Inside the interval: nothing moves.
+        state.publish_scores(T0 + 1, &report(&id, 99, 99));
+        assert_eq!(
+            history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
+            3,
+            "a scoring inside the interval must not update the gauge"
+        );
+
+        // Past it: the new values land.
+        let later = T0 + SCORE_METRIC_INTERVAL_NANOS + 1;
+        state.publish_scores(later, &report(&id, 5, 2));
+        assert_eq!(
+            history.snapshot().scores[&("10.0.0.1:4000".to_owned(), Factor::Connection)],
+            5
+        );
+
+        // The configuration reset is deliberately not exercised here any
+        // more: it moved to the plane's reconcile, where Go's `SetConfig`
+        // puts it, because a router-level reset cannot fire for a
+        // generation the router has not been asked about. That boundary is
+        // covered by the live RoutePlane regression, not by this unit.
+    }
+}

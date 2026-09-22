@@ -19,10 +19,10 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use control_plane::OwnerToken;
+use control_plane::permit::CommitPermit;
 use etcd_client::Client;
 use http::Uri;
 use thiserror::Error;
@@ -610,19 +610,19 @@ impl EtcdConnector {
 /// operation on a retired generation is fenced even while the process owner is
 /// still current.
 ///
-/// `Default` is hand-written to equal [`GenerationGate::new`] (a **live** gate);
-/// it is deliberately NOT derived, because a derived `Default` would build from
-/// `AtomicBool::default() == false` and be born already revoked (rejecting all
-/// I/O).
-#[derive(Clone, Debug)]
+/// `Default` is derived and gives a **live** gate, because it delegates to
+/// [`CommitPermit::default`], which is itself written to equal
+/// `CommitPermit::new`. That delegation is the contract: a permit whose
+/// `Default` ever became "already revoked" would silently make every
+/// derived gate reject all I/O, so the initial value belongs with the
+/// permit and not with a flag here.
+#[derive(Clone, Debug, Default)]
 pub struct GenerationGate {
-    live: Arc<AtomicBool>,
-}
-
-impl Default for GenerationGate {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The shared authority. Built on `control-plane`'s primitive so that
+    /// ownership, configuration and topology revoke through the same
+    /// mechanism without depending on this crate -- `control-plane` is the
+    /// root of the internal graph, and this one sits above it.
+    permit: CommitPermit,
 }
 
 impl GenerationGate {
@@ -630,20 +630,43 @@ impl GenerationGate {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            live: Arc::new(AtomicBool::new(true)),
+            permit: CommitPermit::new(),
         }
     }
 
     /// Revokes the gate. Every connection carrying it is retired at once, and any
     /// in-flight operation is fenced at its next ownership check.
+    ///
+    /// Takes the commit lock before revoking, so a [`Self::try_commit`]
+    /// already running finishes first and a later one is refused.
     pub fn revoke(&self) {
-        self.live.store(false, Ordering::SeqCst);
+        self.permit.revoke();
+    }
+
+    /// Runs `commit` if and only if the gate is still live, with revocation
+    /// excluded for its duration. Returns whether it ran.
+    ///
+    /// See [`CommitPermit::commit`] for the contract the closure must meet:
+    /// short, synchronous, and reaching for no lock a revoker holds first.
+    pub fn try_commit<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
+        self.permit.commit(commit)
+    }
+
+    /// The underlying authority, for a caller that must commit under this
+    /// gate together with other permits.
+    #[must_use]
+    pub const fn permit(&self) -> &CommitPermit {
+        &self.permit
     }
 
     /// Whether the gate is still live.
+    ///
+    /// A lock-free read for ordinary I/O fencing. It answers about the past
+    /// the instant it returns; anything that must not outlive the
+    /// generation belongs in [`Self::try_commit`].
     #[must_use]
     pub fn is_live(&self) -> bool {
-        self.live.load(Ordering::SeqCst)
+        self.permit.is_valid()
     }
 }
 
@@ -1152,5 +1175,83 @@ mod tests {
                 "must reject {bad}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_commit_tests {
+    use super::GenerationGate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    /// Revocation first: the commit is refused, and nothing it would have
+    /// done happens.
+    #[test]
+    fn a_revocation_ordered_first_refuses_the_commit() {
+        let gate = GenerationGate::new();
+        gate.revoke();
+        let ran = gate.try_commit(|| 1);
+        assert_eq!(ran, None, "a revoked gate commits nothing");
+    }
+
+    /// Commit first: the revocation waits for it to finish, and the effect
+    /// stands. This is the half that must *not* be undone -- the write was
+    /// made under a live generation.
+    ///
+    /// The barrier makes the order real rather than hoped for: the revoking
+    /// thread is released only once the commit is known to be inside the
+    /// lock, so a gate without one would let the flip land mid-commit.
+    #[test]
+    fn a_commit_ordered_first_completes_before_the_revocation() {
+        let gate = GenerationGate::new();
+        let inside = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+
+        let revoker = {
+            let gate = gate.clone();
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                // Only start revoking once the commit is demonstrably inside.
+                entered_rx
+                    .recv()
+                    .unwrap_or_else(|error| unreachable!("commit never entered: {error}"));
+                gate.revoke();
+                // The commit must have completed before the flip landed.
+                assert!(
+                    finished.load(Ordering::SeqCst),
+                    "revocation overtook a commit that had already begun"
+                );
+            })
+        };
+
+        let committed = gate.try_commit(|| {
+            inside.store(true, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            // Give the revoker every chance to interleave.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            finished.store(true, Ordering::SeqCst);
+            7
+        });
+
+        revoker
+            .join()
+            .unwrap_or_else(|_| unreachable!("revoking thread panicked"));
+        assert_eq!(committed, Some(7), "a live gate runs its commit");
+        assert!(inside.load(Ordering::SeqCst));
+        assert!(!gate.is_live(), "the revocation still lands, just after");
+    }
+
+    /// Ordinary liveness reads are unchanged; the lock is only on the
+    /// commit path.
+    #[test]
+    fn is_live_still_answers_without_the_commit_lock() {
+        let gate = GenerationGate::new();
+        assert!(gate.is_live());
+        let seen = gate.try_commit(|| gate.is_live());
+        assert_eq!(seen, Some(true), "is_live is readable from inside a commit");
+        gate.revoke();
+        assert!(!gate.is_live());
     }
 }
