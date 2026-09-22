@@ -61,7 +61,7 @@ use proxy_io::{PacketIo, PacketReader, PacketWriter};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use session_core::handshake::build_greeting;
+use session_core::handshake::{SUPPORTED_SERVER_CAPABILITIES, build_greeting};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -273,6 +273,100 @@ async fn write_fake_backend_greeting<W: AsyncWrite + Unpin>(
         return false;
     };
     writer.write_logical(&greeting, true).await.is_ok()
+}
+
+/// Starts one backend that sends exactly one caller-supplied greeting. This is
+/// enough to exercise the production backend parser and capability verifier:
+/// both must reject before any authentication response is forwarded.
+async fn spawn_one_greeting_backend(greeting: Vec<u8>) -> (u16, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("one-greeting backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("one-greeting backend address")
+    };
+    let accepted = Arc::new(AtomicU64::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        task_accepted.fetch_add(1, Ordering::Relaxed);
+        let mut writer = PacketWriter::new(stream);
+        let _ = writer.write_logical(&greeting, true).await;
+    });
+    (address.port(), accepted)
+}
+
+/// Starts a backend that performs a real caching-SHA2 fast-auth exchange:
+/// switch → client response → `0x01 0x03` → OK. The OK is sent immediately,
+/// without waiting for another client packet, so a proxy that incorrectly
+/// changes turns after the fast-success marker deadlocks against the client.
+async fn spawn_fast_auth_backend() -> (u16, Arc<AtomicU64>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("fast-auth backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("fast-auth backend address")
+    };
+    let accepted = Arc::new(AtomicU64::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        task_accepted.fetch_add(1, Ordering::Relaxed);
+        let (read, write) = stream.into_split();
+        let mut reader = PacketReader::new(read);
+        let mut writer = PacketWriter::new(write);
+        let broad = fake_backend_capabilities(false);
+        if !write_fake_backend_greeting(&mut writer, broad).await {
+            return;
+        }
+        reader.reset_sequence(writer.next_sequence());
+        let Ok(response) = reader.read_logical(64 * 1024).await else {
+            return;
+        };
+        let Ok(parsed) = parse_handshake_response(&response.payload) else {
+            return;
+        };
+        if parsed.auth_plugin_name != Some(b"auth_unknown_plugin".as_slice()) {
+            return;
+        }
+
+        let mut switch = vec![0xFE];
+        switch.extend_from_slice(b"caching_sha2_password\0");
+        switch.extend_from_slice(&[9_u8; 20]);
+        switch.push(0);
+        writer.reset_sequence(reader.expected_sequence());
+        if writer.write_logical(&switch, true).await.is_err() {
+            return;
+        }
+        reader.reset_sequence(writer.next_sequence());
+        let Ok(client_response) = reader.read_logical(64 * 1024).await else {
+            return;
+        };
+        if client_response.payload != b"sha2-response" {
+            return;
+        }
+        writer.reset_sequence(reader.expected_sequence());
+        if writer.write_logical(&[0x01, 0x03], true).await.is_err() {
+            return;
+        }
+        let Ok(ok) = encode_ok_packet(
+            ResponseHeader::OK,
+            0,
+            0,
+            StatusFlags::from_bits_retain(0x0002),
+            0,
+            b"",
+            broad,
+        ) else {
+            return;
+        };
+        let _ = writer.write_logical(&ok, true).await;
+    });
+    (address.port(), accepted)
 }
 
 async fn finish_fake_backend_auth<R, W>(
@@ -6539,6 +6633,328 @@ async fn read_frontend_greeting(port: u16) -> Option<(TcpStream, CapabilityFlags
     stream.read_exact(&mut payload).await.ok()?;
     let greeting = parse_initial_handshake(&payload).ok()?;
     Some((stream, greeting.capabilities))
+}
+
+/// HS-001/003 production seam: the actual listener emits the selected runtime
+/// identity and exact Go capability mask, then rejects an over-1-MiB declared
+/// client handshake from its header plus the one byte required by the packet
+/// peek. Sending no remaining payload is deliberate: the old generic draining
+/// read waited for the body until the handshake deadline, whereas Go's
+/// pre-read gate closes from that bounded prefix without allocating the packet
+/// or contacting a backend.
+#[tokio::test]
+async fn frontend_greeting_and_pre_read_handshake_limit_are_production_wired() {
+    let stack = spawn_stack().await;
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", stack.sql_port)).await else {
+        unreachable!("frontend connect")
+    };
+    let mut header = [0_u8; 4];
+    assert!(stream.read_exact(&mut header).await.is_ok());
+    assert_eq!(header[3], 0, "the proxy greeting opens at sequence zero");
+    let length =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut payload = vec![0_u8; length];
+    assert!(stream.read_exact(&mut payload).await.is_ok());
+    let Ok(greeting) = parse_initial_handshake(&payload) else {
+        unreachable!("production greeting parses")
+    };
+    assert_eq!(greeting.protocol_version, 10);
+    assert_eq!(greeting.server_version, b"TiProxy-test");
+    assert_eq!(greeting.connection_id, 1);
+    assert_eq!(greeting.auth_plugin_data_part_1.len(), 8);
+    assert_eq!(greeting.auth_plugin_data_part_2.len(), 12);
+    assert!(
+        greeting
+            .auth_plugin_data_part_1
+            .iter()
+            .chain(greeting.auth_plugin_data_part_2)
+            .any(|byte| *byte != 0),
+        "the production salt comes from OS entropy"
+    );
+    assert_eq!(
+        greeting.auth_plugin_name,
+        Some(b"mysql_native_password".as_slice())
+    );
+    assert_eq!(greeting.collation, Some(45));
+    assert_eq!(greeting.status, Some(StatusFlags::from_bits_retain(0)));
+    assert_eq!(
+        greeting.capabilities,
+        SUPPORTED_SERVER_CAPABILITIES.without(CapabilityFlags::SSL),
+        "the production greeting must use the pinned Go capability mask"
+    );
+
+    let declared = mysql_wire::limits::MAX_PRE_HANDSHAKE_PACKET_LEN + 1;
+    let declared = u32::try_from(declared).unwrap_or(u32::MAX).to_le_bytes();
+    assert!(
+        stream
+            .write_all(&[declared[0], declared[1], declared[2], 1])
+            .await
+            .is_ok()
+    );
+    assert!(stream.write_all(&[0]).await.is_ok());
+    assert!(stream.flush().await.is_ok());
+    let mut byte = [0_u8; 1];
+    match timeout(Duration::from_secs(1), stream.read(&mut byte)).await {
+        Ok(Ok(0)) => {}
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        other => unreachable!("oversized handshake was not rejected promptly: {other:?}"),
+    }
+    assert_eq!(
+        stack.backend_accepted_connections.load(Ordering::Relaxed),
+        0,
+        "an oversized frontend handshake must fail before backend routing"
+    );
+
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+}
+
+/// HS-002 production seam: a frontend that omits `PROTOCOL_41` receives the
+/// fixed Go error and is rejected before the route/backend path can run.
+#[tokio::test]
+async fn frontend_missing_protocol41_is_rejected_before_backend_routing() {
+    let stack = spawn_stack().await;
+    let Some((stream, _)) = read_frontend_greeting(stack.sql_port).await else {
+        unreachable!("frontend greeting")
+    };
+    let capabilities = CapabilityFlags::LONG_PASSWORD
+        | CapabilityFlags::SECURE_CONNECTION
+        | CapabilityFlags::PLUGIN_AUTH;
+    let Ok(response) = encode_handshake_response(HandshakeResponseParams {
+        capabilities,
+        max_packet_size: 16 * 1024 * 1024,
+        collation: 45,
+        username: b"legacy-pre-41",
+        auth_response: b"",
+        database: None,
+        auth_plugin_name: Some(b"mysql_native_password"),
+        attributes: None,
+        zstd_level: None,
+    }) else {
+        unreachable!("pre-4.1 response encodes")
+    };
+    let (read, write) = stream.into_split();
+    let mut reader = PacketReader::new(read);
+    let mut writer = PacketWriter::new(write);
+    writer.reset_sequence(1);
+    assert!(writer.write_logical(&response, true).await.is_ok());
+    reader.reset_sequence(writer.next_sequence());
+    let observed = timeout(Duration::from_secs(1), reader.read_logical(64 * 1024)).await;
+    let error = match observed {
+        Ok(Ok(error)) => error,
+        other => unreachable!("missing PROTOCOL_41 response: {other:?}"),
+    };
+    assert_exact_err_packet(
+        &error.payload,
+        1251,
+        *b"08004",
+        "Client does not support authentication protocol requested by server; consider upgrading MySQL client",
+    );
+    assert_eq!(
+        stack.backend_accepted_connections.load(Ordering::Relaxed),
+        0,
+        "capability rejection must precede backend routing"
+    );
+
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+}
+
+/// HS-002 production seam: Go tolerates legacy drivers that implement plugin
+/// auth but omit `CLIENT_PLUGIN_AUTH`. The live engine must force that bit after
+/// parsing the legacy layout and still complete the backend auth-switch flow.
+#[tokio::test]
+async fn frontend_without_plugin_auth_bit_authenticates_end_to_end() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Ok(stream) = TcpStream::connect(("127.0.0.1", stack.sql_port)).await else {
+        unreachable!("frontend connect")
+    };
+    let (read, write) = stream.into_split();
+    let mut reader = PacketReader::new(read);
+    let mut writer = PacketWriter::new(write);
+    let Ok(greeting) = reader.read_logical(64 * 1024).await else {
+        unreachable!("frontend greeting")
+    };
+    let Ok(greeting) = parse_initial_handshake(&greeting.payload) else {
+        unreachable!("frontend greeting parses")
+    };
+    let mut proxy_salt = greeting.auth_plugin_data_part_1.to_vec();
+    proxy_salt.extend_from_slice(greeting.auth_plugin_data_part_2);
+    let capabilities = CapabilityFlags::PROTOCOL_41
+        | CapabilityFlags::LONG_PASSWORD
+        | CapabilityFlags::SECURE_CONNECTION
+        | CapabilityFlags::CONNECT_ATTRS
+        | CapabilityFlags::DEPRECATE_EOF;
+    let attributes = [Attribute {
+        key: b"program_name",
+        value: b"legacy-no-plugin-bit",
+    }];
+    let scramble = native_scramble(FAKE_BACKEND_PASSWORD, &proxy_salt);
+    let Ok(response) = encode_handshake_response(HandshakeResponseParams {
+        capabilities,
+        max_packet_size: 16 * 1024 * 1024,
+        collation: 45,
+        username: b"root",
+        auth_response: &scramble,
+        database: None,
+        auth_plugin_name: None,
+        attributes: Some(&attributes),
+        zstd_level: None,
+    }) else {
+        unreachable!("legacy response encodes")
+    };
+    writer.reset_sequence(reader.expected_sequence());
+    assert!(writer.write_logical(&response, true).await.is_ok());
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(Ok(switch)) = timeout(Duration::from_secs(2), reader.read_logical(64 * 1024)).await
+    else {
+        unreachable!("backend auth switch reaches the legacy client")
+    };
+    assert_eq!(switch.payload.first(), Some(&0xFE));
+    let switch_data = &switch.payload[1..];
+    let Some(nul) = switch_data.iter().position(|byte| *byte == 0) else {
+        unreachable!("terminated native plugin")
+    };
+    assert_eq!(&switch_data[..nul], b"mysql_native_password");
+    let backend_salt = switch_data[nul + 1..]
+        .strip_suffix(&[0])
+        .unwrap_or(&switch_data[nul + 1..]);
+    writer.reset_sequence(reader.expected_sequence());
+    assert!(
+        writer
+            .write_logical(&native_scramble(FAKE_BACKEND_PASSWORD, backend_salt), true)
+            .await
+            .is_ok()
+    );
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(Ok(ok)) = timeout(Duration::from_secs(2), reader.read_logical(64 * 1024)).await else {
+        unreachable!("legacy client authentication completes")
+    };
+    assert_eq!(ok.payload.first(), Some(&0x00));
+
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+}
+
+/// HS-002/011 production seam: the real backend path parses the greeting and
+/// rejects both a missing negotiated capability and malformed protocol bytes.
+/// Parser unit tests exhaust every truncation prefix; these cases prove the
+/// parser/verifier are the code reached after an actual routed dial.
+#[tokio::test]
+async fn backend_greeting_parser_and_required_capability_gate_are_production_wired() {
+    let broad = fake_backend_capabilities(false);
+    let salt = [5_u8; 20];
+    let missing_required = encode_initial_handshake(build_greeting(
+        broad.without(CapabilityFlags::DEPRECATE_EOF),
+        &salt,
+        b"8.0.11-missing-eof",
+        91,
+        45,
+        StatusFlags::from_bits_retain(0x0002),
+    ))
+    .unwrap_or_else(|error| unreachable!("valid limited greeting: {error}"));
+    for greeting in [missing_required, vec![9, 0]] {
+        let (backend_port, accepted) = spawn_one_greeting_backend(greeting).await;
+        let stack = spawn_stack().await;
+        spawn_route_answer_to(&stack, 1, 2, backend_port);
+        assert!(
+            timeout(Duration::from_secs(2), MysqlClient::connect(stack.sql_port))
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "an invalid backend greeting must fail closed"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stack.backend_accepted_connections.load(Ordering::Relaxed),
+            0,
+            "the assignment must use only the deliberately invalid backend"
+        );
+        stack.shutdown_tx.send(true).ok();
+        stack.dispatch_task.abort();
+        stack.server_task.abort();
+    }
+}
+
+/// HS-005 production seam: after a caching-SHA2 fast-success marker, the
+/// backend may send OK immediately. The client deliberately sends nothing
+/// between those packets; completion therefore proves the engine stayed on the
+/// backend turn instead of asking for an erroneous extra client packet.
+#[tokio::test]
+async fn caching_sha2_fast_auth_needs_no_extra_client_packet() {
+    let (backend_port, accepted) = spawn_fast_auth_backend().await;
+    let stack = spawn_stack().await;
+    spawn_route_answer_to(&stack, 1, 2, backend_port);
+    let Ok(stream) = TcpStream::connect(("127.0.0.1", stack.sql_port)).await else {
+        unreachable!("frontend connect")
+    };
+    let (read, write) = stream.into_split();
+    let mut reader = PacketReader::new(read);
+    let mut writer = PacketWriter::new(write);
+    let Ok(greeting) = reader.read_logical(64 * 1024).await else {
+        unreachable!("frontend greeting")
+    };
+    let Ok(greeting) = parse_initial_handshake(&greeting.payload) else {
+        unreachable!("frontend greeting parses")
+    };
+    let mut proxy_salt = greeting.auth_plugin_data_part_1.to_vec();
+    proxy_salt.extend_from_slice(greeting.auth_plugin_data_part_2);
+    let capabilities = CapabilityFlags::PROTOCOL_41
+        | CapabilityFlags::LONG_PASSWORD
+        | CapabilityFlags::SECURE_CONNECTION
+        | CapabilityFlags::PLUGIN_AUTH
+        | CapabilityFlags::DEPRECATE_EOF;
+    let scramble = native_scramble(FAKE_BACKEND_PASSWORD, &proxy_salt);
+    let Ok(response) = encode_handshake_response(HandshakeResponseParams {
+        capabilities,
+        max_packet_size: 16 * 1024 * 1024,
+        collation: 45,
+        username: b"root",
+        auth_response: &scramble,
+        database: None,
+        auth_plugin_name: Some(b"mysql_native_password"),
+        attributes: None,
+        zstd_level: None,
+    }) else {
+        unreachable!("frontend response encodes")
+    };
+    writer.reset_sequence(reader.expected_sequence());
+    assert!(writer.write_logical(&response, true).await.is_ok());
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(Ok(switch)) = timeout(Duration::from_secs(2), reader.read_logical(64 * 1024)).await
+    else {
+        unreachable!("caching-SHA2 switch reaches the client")
+    };
+    assert!(switch.payload.starts_with(b"\xfe"));
+    assert!(
+        switch.payload[1..].starts_with(b"caching_sha2_password\0"),
+        "the production relay preserves the backend plugin switch"
+    );
+    writer.reset_sequence(reader.expected_sequence());
+    assert!(writer.write_logical(b"sha2-response", true).await.is_ok());
+    reader.reset_sequence(writer.next_sequence());
+    let Ok(Ok(fast)) = timeout(Duration::from_secs(2), reader.read_logical(64 * 1024)).await else {
+        unreachable!("fast-auth success reaches the client")
+    };
+    assert_eq!(fast.payload, [0x01, 0x03]);
+    let Ok(Ok(ok)) = timeout(Duration::from_secs(1), reader.read_logical(64 * 1024)).await else {
+        unreachable!("OK follows without another client packet")
+    };
+    assert_eq!(ok.payload.first(), Some(&0x00));
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+    stack.shutdown_tx.send(true).ok();
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
 }
 
 /// Writes one sequence-1 packet and reports whether the production listener

@@ -114,7 +114,8 @@ use session_core::error_source::{
 };
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
-    ConnectionEndpoints, build_greeting, greeting_capability, negotiate_frontend, verify_backend,
+    ConnectionEndpoints, SUPPORTED_SERVER_CAPABILITIES, build_greeting,
+    check_handshake_packet_size, greeting_capability, negotiate_frontend, verify_backend,
 };
 use session_core::internal_client::{
     InternalLimits, InternalParserState, InternalProgress, InternalQuery, InternalResult,
@@ -165,30 +166,7 @@ use crate::transport::{BackendTransport, ClientTransport};
 /// C): a client that negotiates either activates compressed framing at the
 /// auth-OK boundary.
 fn proxy_capability_base() -> CapabilityFlags {
-    CapabilityFlags::LONG_PASSWORD
-        | CapabilityFlags::FOUND_ROWS
-        | CapabilityFlags::LONG_FLAG
-        | CapabilityFlags::CONNECT_WITH_DB
-        | CapabilityFlags::NO_SCHEMA
-        | CapabilityFlags::ODBC
-        | CapabilityFlags::LOCAL_FILES
-        | CapabilityFlags::IGNORE_SPACE
-        | CapabilityFlags::PROTOCOL_41
-        | CapabilityFlags::INTERACTIVE
-        | CapabilityFlags::SSL
-        | CapabilityFlags::IGNORE_SIGPIPE
-        | CapabilityFlags::TRANSACTIONS
-        | CapabilityFlags::RESERVED
-        | CapabilityFlags::SECURE_CONNECTION
-        | CapabilityFlags::MULTI_STATEMENTS
-        | CapabilityFlags::MULTI_RESULTS
-        | CapabilityFlags::PS_MULTI_RESULTS
-        | CapabilityFlags::PLUGIN_AUTH
-        | CapabilityFlags::CONNECT_ATTRS
-        | CapabilityFlags::PLUGIN_AUTH_LENENC_CLIENT_DATA
-        | CapabilityFlags::DEPRECATE_EOF
-        | CapabilityFlags::COMPRESS
-        | CapabilityFlags::ZSTD_COMPRESSION_ALGORITHM
+    SUPPORTED_SERVER_CAPABILITIES
 }
 
 /// The proxy capabilities for one session: the full base with `SSL`
@@ -1675,9 +1653,9 @@ impl Engine {
         // handshake response inside the encrypted session. Otherwise the first
         // packet already is the plaintext handshake response.
         let frontend_tls_available = self.frontend_tls_available();
-        let payload = match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
-            Ok(packet) => packet.payload,
-            Err(error) => return Some(self.client_read_end(&error).await),
+        let payload = match self.read_client_handshake_packet().await {
+            Ok(payload) => payload,
+            Err(source) => return Some(source),
         };
         let ssl_request_capabilities =
             if leading_capabilities(&payload).contains(CapabilityFlags::SSL) {
@@ -1726,9 +1704,9 @@ impl Engine {
             if self.events.send(SessionEvent::TlsActivated).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
-            match self.client_io.read_logical(HANDSHAKE_PAYLOAD_LIMIT).await {
-                Ok(packet) => packet.payload,
-                Err(error) => return Some(self.client_read_end(&error).await),
+            match self.read_client_handshake_packet().await {
+                Ok(payload) => payload,
+                Err(source) => return Some(source),
             }
         } else {
             payload
@@ -1763,7 +1741,19 @@ impl Engine {
                 let (code, state, message) = missing.client_response();
                 let seq = self.client_io.expected_read_sequence();
                 self.client_io.reset_write_sequence(seq);
-                let _ = self.write_client_error(code, state, message).await;
+                // Go's capability failure is the fixed protocol-4.1
+                // 1251/08004 packet even though this client omitted the very
+                // bit being required. `self.negotiated` is still empty here,
+                // so using it would make the encoder reject SQLSTATE and drop
+                // the intended client response.
+                let _ = self
+                    .write_client_error_with_capabilities(
+                        code,
+                        state,
+                        message,
+                        CapabilityFlags::PROTOCOL_41,
+                    )
+                    .await;
                 let _ = self.events.send(SessionEvent::ClientIoError).await;
                 return Some(WireErrorSource::ClientNetwork);
             }
@@ -4425,14 +4415,51 @@ impl Engine {
         Ok(())
     }
 
+    /// Reads the one client packet whose declared length is trusted only after
+    /// the Go-compatible pre-handshake gate. Peeking is essential here: a
+    /// hostile peer may advertise an oversized payload and send only the first
+    /// byte needed by the protocol peek, so routing the packet through the
+    /// generic draining read would hold the session until its deadline instead
+    /// of rejecting from that bounded prefix.
+    async fn read_client_handshake_packet(&mut self) -> Result<Vec<u8>, WireErrorSource> {
+        let preview = match self.client_io.peek_packet().await {
+            Ok(preview) => preview,
+            Err(error) => return Err(self.client_read_end(&error).await),
+        };
+        let declared = usize::try_from(preview.first_packet_length).unwrap_or(usize::MAX);
+        if check_handshake_packet_size(declared).is_err() {
+            self.quit_source = QuitSource::ClientHandshake;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Err(WireErrorSource::ClientNetwork);
+        }
+        match self
+            .client_io
+            .read_logical(mysql_wire::limits::MAX_PRE_HANDSHAKE_PACKET_LEN)
+            .await
+        {
+            Ok(packet) => Ok(packet.payload),
+            Err(error) => Err(self.client_read_end(&error).await),
+        }
+    }
+
     async fn write_client_error(
         &mut self,
         code: u16,
         state: [u8; 5],
         message: &str,
     ) -> Result<(), WireErrorSource> {
-        let Ok(encoded) =
-            encode_error_packet(code, Some(state), message.as_bytes(), self.negotiated)
+        self.write_client_error_with_capabilities(code, state, message, self.negotiated)
+            .await
+    }
+
+    async fn write_client_error_with_capabilities(
+        &mut self,
+        code: u16,
+        state: [u8; 5],
+        message: &str,
+        capabilities: CapabilityFlags,
+    ) -> Result<(), WireErrorSource> {
+        let Ok(encoded) = encode_error_packet(code, Some(state), message.as_bytes(), capabilities)
         else {
             return Err(WireErrorSource::Proxy);
         };
