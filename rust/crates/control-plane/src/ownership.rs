@@ -15,12 +15,12 @@
 //! In-process ownership fencing for control responsibilities.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use thiserror::Error;
 
-use crate::permit::CommitPermit;
+use crate::permit::{CommitPermit, PermitHolder};
 
 /// Maximum byte length for owner, namespace, and cluster identifiers.
 pub const MAX_OWNER_ID_BYTES: usize = 256;
@@ -167,6 +167,7 @@ impl OwnershipRegistry {
             owner_id,
             generation,
             active: CommitPermit::new(),
+            unregistered: AtomicBool::new(false),
         });
         Ok(OwnerLease { state })
     }
@@ -190,16 +191,24 @@ struct LeaseState {
     /// [`OwnerToken::is_current`] and then acting leaves that window open;
     /// [`OwnerToken::permit`] is how a caller closes it.
     active: CommitPermit,
+    /// Whether this lease's one-time registry teardown has been performed.
+    unregistered: AtomicBool,
 }
 
 impl LeaseState {
     fn release(&self) {
-        // Exactly one caller unregisters, as the previous `swap` decided.
-        // The permit lock is released before the registry lock is taken, so
-        // this adds no nesting to the existing order.
-        if !self.active.revoke_once() {
+        // Two different facts, deliberately not one. `unregistered` decides
+        // who performs the one-time teardown; the permit decides whether
+        // the authority is still good. Deriving the first from the second
+        // meant a holder revoking its own copy of the permit could make
+        // this return early and leave the scope owned by a lease that had
+        // already been dropped.
+        if self.unregistered.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Revoked unconditionally: whether or not someone got here first,
+        // this lease's authority ends now.
+        self.active.revoke();
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -277,10 +286,14 @@ impl OwnerToken {
     /// This owner's authority, for a caller that must make an effect the
     /// release cannot interleave with.
     ///
+    /// A holder, not the permit: revoking this lease is the lease's own
+    /// business, and a token that could revoke would let a consumer end an
+    /// ownership it does not hold.
+    ///
     /// `None` once the lease itself is gone, which is already terminal.
     #[must_use]
-    pub fn permit(&self) -> Option<CommitPermit> {
-        self.state.upgrade().map(|state| state.active.clone())
+    pub fn permit(&self) -> Option<PermitHolder> {
+        self.state.upgrade().map(|state| state.active.holder())
     }
 
     /// Returns the owner generation while the lease is alive.
@@ -300,6 +313,66 @@ fn validate_identifier(kind: &'static str, value: String) -> Result<Arc<str>, Ow
 #[cfg(test)]
 mod owner_permit_tests {
     use super::{OwnerScope, OwnershipRegistry};
+
+    /// `CodexM5`'s counterexample, replayed through the public API: a
+    /// holder revokes its own copy of the permit, and the lease's release
+    /// must still unregister the scope.
+    ///
+    /// The bug this pins is a conflation -- "the authority is invalid" and
+    /// "the one-time unregistration has happened" are different facts, and
+    /// deciding the second from the first leaves the scope owned forever
+    /// by a lease that has already been dropped.
+    #[test]
+    fn a_revoked_permit_copy_does_not_strand_the_scope() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let permit = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+
+        // The holder cannot revoke at all now -- that is the fix. It can
+        // only commit, and committing does not end the lease.
+        assert_eq!(permit.commit(|| 1), Some(1));
+        drop(lease);
+
+        // The scope must be free: the lease is gone.
+        registry
+            .claim(OwnerScope::Process, "owner-2")
+            .unwrap_or_else(|error| {
+                unreachable!("the scope stayed owned after its lease was dropped: {error:?}")
+            });
+    }
+
+    /// The conflation itself, pinned independently of the capability that
+    /// exposed it.
+    ///
+    /// Removing `revoke` from the holder stops an outsider reaching this
+    /// state, but the two facts must stay separate on their own merits:
+    /// the unregistration is decided by its own one-shot flag, so an
+    /// already-invalid permit -- however it got that way -- cannot make
+    /// the lease skip freeing its scope.
+    #[test]
+    fn an_already_invalid_permit_does_not_skip_unregistration() {
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+
+        // Reach past the public API to the authority itself, which is how
+        // the original counterexample arrived here.
+        lease.state.active.revoke();
+        assert!(!lease.token().is_current());
+
+        drop(lease);
+        registry
+            .claim(OwnerScope::Process, "owner-2")
+            .unwrap_or_else(|error| {
+                unreachable!("an invalid permit stranded the scope: {error:?}")
+            });
+    }
 
     /// The owner's authority is now committable, not merely readable: an
     /// effect made under it cannot be interleaved by the release, and one

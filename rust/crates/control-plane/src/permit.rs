@@ -108,6 +108,19 @@ impl CommitPermit {
         Some(effect())
     }
 
+    /// A holder's view: it can commit and read validity, and cannot revoke.
+    ///
+    /// Revocation belongs to whoever owns the authority's lifetime. Handing
+    /// a full permit to a holder lets it revoke an authority it does not
+    /// own, and an owner that then treated "already invalid" as "my
+    /// teardown already ran" would skip that teardown.
+    #[must_use]
+    pub fn holder(&self) -> PermitHolder {
+        PermitHolder {
+            permit: self.clone(),
+        }
+    }
+
     /// Runs `effect` only if **every** permit is still valid, holding all
     /// of their commit locks for its duration.
     ///
@@ -165,6 +178,35 @@ impl CommitPermit {
             .commit
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The right to act under an authority, without the right to end it.
+///
+/// Clonable and cheap; it shares the authority it views. Every method
+/// carries the same contract as the permit's own.
+#[derive(Clone, Debug)]
+pub struct PermitHolder {
+    permit: CommitPermit,
+}
+
+impl PermitHolder {
+    /// As [`CommitPermit::commit`].
+    pub fn commit<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
+        self.permit.commit(effect)
+    }
+
+    /// As [`CommitPermit::is_valid`].
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.permit.is_valid()
+    }
+
+    /// As [`CommitPermit::commit_all`], over holders.
+    #[must_use]
+    pub fn commit_all<T>(holders: &[&Self], effect: impl FnOnce() -> T) -> Option<T> {
+        let permits: Vec<&CommitPermit> = holders.iter().map(|holder| &holder.permit).collect();
+        CommitPermit::commit_all(&permits, effect)
     }
 }
 
