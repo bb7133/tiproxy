@@ -262,13 +262,14 @@
     {
       "id": "CP-ROUTE-003",
       "family": "routing",
-      "summary": "Connection lifecycle, reconciliation, redirect watermarks, orphan closure, and generation reuse converge exactly once after either process restarts.",
-      "go_owner": "pkg/controlbridge/drain_metering.go (residual only: #223 Phase 2 deleted router_adapter.go and reconcile_rehydrate_test.go, so Go performs none of this)",
+      "summary": "Connection lifecycle re-attachment, redirect watermarks, and generation reuse converge exactly once after either process restarts. Orphan closure left this contract at #223 Phase 2 together with the bridge adapter that owned it: a route owner has no Go-owned route sessions to orphan, and a reconcile carrying connections is refused outright rather than converged.",
+      "go_owner": "pkg/balance/router (AssignmentRehydrator: RehydrateConn/LookupBackend on Group, ScoreBasedRouter, StaticRouter); #223 Phase 2 deleted the pkg/controlbridge half",
       "rust_target": "#147",
       "go_baseline": "anchored",
       "rust_status": "pending",
       "anchors": [
-        {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerResidualReconcileIsEmptyAndPreservesWatermarks"},
+        {"path": "pkg/balance/router/cproute_arrival_evidence_test.go", "contains": "func TestCPRouteArrivalObservation"},
+        {"path": "pkg/balance/router/api_differential_test.go", "contains": "func TestRouterAPIDifferential"},
         {"path": "pkg/controlbridge/route_owner_handler_test.go", "contains": "func TestRouteOwnerRejectsNonemptyResidualReconcile"}
       ],
       "observed_fields": ["connection_id", "generation", "command_sequence", "pending_redirect_id", "terminal_count", "route_count"],
