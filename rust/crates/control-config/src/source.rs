@@ -1469,6 +1469,7 @@ mod config_permit_tests {
 #[cfg(test)]
 mod namespace_permit_tests {
     use super::{ConfigNamespaceSource, ConfigNamespaceStore, NamespaceConfig, SourceRevision};
+    use crate::model::FrontendNamespaceConfig;
     use std::path::Path;
 
     const CONFIG: &[u8] = b"[balance]\npolicy=\"connection\"";
@@ -1559,6 +1560,53 @@ mod namespace_permit_tests {
         assert!(
             store.current().namespace_permit("alpha").is_some(),
             "and the new snapshot still carries it"
+        );
+    }
+
+    /// Altering a namespace retires the old one's authority just as
+    /// deleting it does. The carry-forward rule is struct equality, not
+    /// name equality, so an edit produces a different namespace and an
+    /// effect admitted under the pre-edit definition must not land.
+    #[test]
+    fn an_altered_namespace_loses_its_authority() {
+        let store = store(&["alpha"]);
+        let alpha = store
+            .current()
+            .namespace_permit("alpha")
+            .unwrap_or_else(|| unreachable!("alpha exists"));
+        assert_eq!(alpha.commit(|| 1), Some(1));
+
+        let edited = vec![NamespaceConfig {
+            namespace: "alpha".to_owned(),
+            frontend: FrontendNamespaceConfig {
+                user: "edited".to_owned(),
+                ..FrontendNamespaceConfig::default()
+            },
+            ..NamespaceConfig::default()
+        }];
+        let scratch = ConfigNamespaceStore::from_toml(CONFIG, None, Path::new("/tmp"))
+            .unwrap_or_else(|error| unreachable!("scratch: {error}"));
+        let effective = (**scratch.current().effective()).clone();
+        store
+            .apply(
+                effective,
+                edited,
+                SourceRevision {
+                    file_revision: 3,
+                    etcd_revision: 0,
+                },
+                Path::new("/tmp"),
+            )
+            .unwrap_or_else(|error| unreachable!("apply: {error}"));
+
+        assert_eq!(
+            alpha.commit(|| 1),
+            None,
+            "the pre-edit definition authorises nothing further"
+        );
+        assert!(
+            store.current().namespace_permit("alpha").is_some(),
+            "while the edited namespace carries a fresh authority"
         );
     }
 }
