@@ -8044,3 +8044,153 @@ async fn query_immediately_after_commit_survives_redirect() {
     let _ = timeout(Duration::from_secs(5), stack.server_task).await;
     stack.dispatch_task.abort();
 }
+
+/// PKT-003 request payload: larger than `COMMAND_PAYLOAD_LIMIT`, the 64 MiB
+/// ceiling the engine is willing to materialize. A proxy that reads the
+/// request before forwarding it cannot deliver this at all, which is what
+/// makes the property observable from outside.
+const STREAMED_QUERY_BYTES: u64 = 64 * 1024 * 1024 + 1024;
+
+/// A backend that drains one oversized command without materializing it
+/// either, reporting the exact logical length it received and the head of the
+/// payload. Draining into a sink through `forward_packet_to` keeps the test
+/// harness from becoming the thing that allocates 64 MiB.
+async fn spawn_streaming_fake_backend() -> (u16, Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let received = Arc::new(AtomicU64::new(0));
+    let head = Arc::new(Mutex::new(Vec::new()));
+    let server_received = Arc::clone(&received);
+    let server_head = Arc::clone(&head);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let broad = fake_backend_capabilities(false);
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = PacketReader::new(read);
+            let mut writer = PacketWriter::new(write);
+            if fake_backend_auth(&mut reader, &mut writer, broad)
+                .await
+                .is_none()
+            {
+                continue;
+            }
+            loop {
+                reader.reset_sequence(0);
+                match reader.peek_packet().await {
+                    Ok(preview) if preview.sequence_id == 0 => {}
+                    _ => break,
+                }
+                // Oversized commands are drained; anything small enough to
+                // hold is read normally so the follow-up query still works.
+                let first_byte = {
+                    let mut sink = PacketWriter::new(tokio::io::sink());
+                    let Ok(progress) = reader.forward_packet_to(&mut sink, 64).await else {
+                        break;
+                    };
+                    let logical = progress.logical_payload_bytes();
+                    if logical >= STREAMED_QUERY_BYTES {
+                        server_received.store(logical, Ordering::Relaxed);
+                        if let Ok(mut head) = server_head.lock() {
+                            *head = progress.captured_prefix().to_vec();
+                        }
+                    }
+                    progress.captured_prefix().first().copied()
+                };
+                if first_byte == Some(0x01) {
+                    break; // COM_QUIT
+                }
+                writer.reset_sequence(reader.expected_sequence());
+                let Ok(ok) = encode_ok_packet(
+                    ResponseHeader::OK,
+                    0,
+                    0,
+                    StatusFlags::AUTOCOMMIT,
+                    0,
+                    b"",
+                    broad,
+                ) else {
+                    break;
+                };
+                if writer.write_logical(&ok, true).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (address.port(), received, head)
+}
+
+/// PKT-003: a command whose first physical packet is already maximal is
+/// relayed to the backend as it arrives, never held.
+///
+/// The request is deliberately larger than `COMMAND_PAYLOAD_LIMIT`: under the
+/// materializing path `read_logical(COMMAND_PAYLOAD_LIMIT)` refuses it and the
+/// session dies, so a passing run is itself the evidence that no copy was
+/// made. Both ends stream — the client writes from a generator and the backend
+/// drains into a sink — so the only participant that could have allocated 64
+/// MiB is the proxy.
+#[tokio::test]
+async fn oversized_command_streams_to_the_backend_without_being_materialized() {
+    let (backend_port, received, head) = spawn_streaming_fake_backend().await;
+    let stack = spawn_stack().await;
+    spawn_route_answer_to(&stack, 1, 2, backend_port);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        unreachable!("client connect")
+    };
+
+    // COM_QUERY followed by filler. `write_logical_from` fragments it into
+    // maximal physical packets, so the FIRST one already reaches
+    // `MAX_PAYLOAD_LEN` — the exact condition the streaming path keys on.
+    let mut source = (&b"\x03"[..]).chain(tokio::io::repeat(b'x').take(STREAMED_QUERY_BYTES - 1));
+    client.writer.reset_sequence(0);
+    assert!(
+        timeout(
+            Duration::from_secs(60),
+            client
+                .writer
+                .write_logical_from(&mut source, STREAMED_QUERY_BYTES, true),
+        )
+        .await
+        .is_ok_and(|written| written.is_ok()),
+        "the oversized command must reach the proxy"
+    );
+
+    client.reader.reset_sequence(1);
+    let response = timeout(
+        Duration::from_secs(60),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        response
+            .is_ok_and(|packet| packet.is_ok_and(|packet| packet.payload.first() == Some(&0x00))),
+        "the backend's OK must come back to the client"
+    );
+
+    assert_eq!(
+        received.load(Ordering::Relaxed),
+        STREAMED_QUERY_BYTES,
+        "every byte of the logical request must reach the backend"
+    );
+    let captured = head.lock().map(|head| head.clone()).unwrap_or_default();
+    assert_eq!(captured.first(), Some(&0x03), "COM_QUERY head preserved");
+    assert!(
+        captured[1..].iter().all(|byte| *byte == b'x'),
+        "the payload head must arrive unaltered"
+    );
+
+    // The session is still in sequence afterwards: a streamed command must
+    // leave the wire exactly where an ordinary one does.
+    assert!(client.query_ok("SELECT 1").await, "session stays usable");
+    client.quit().await;
+    stack.dispatch_task.abort();
+}

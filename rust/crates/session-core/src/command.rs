@@ -153,6 +153,24 @@ impl Command {
         self as u8
     }
 
+    /// The command for a wire byte, or `None` when the byte names none.
+    ///
+    /// The fallible `TryFrom` carries a dispatch error, which a caller holding
+    /// only a peeked header has nothing to do with; PKT-003's intake decision
+    /// needs the byte classified before any payload exists.
+    #[must_use]
+    pub const fn try_from_byte(byte: u8) -> Option<Self> {
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            let command = Self::ALL[index];
+            if command.as_byte() == byte {
+                return Some(command);
+            }
+            index += 1;
+        }
+        None
+    }
+
     /// The response shape this command expects.
     ///
     /// This depends only on the command byte, never on the request body, and
