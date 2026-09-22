@@ -312,12 +312,14 @@ the real-TiDB migration phase:
   `ScoreBasedRouter` health/rebalance loop, fed the exact failed Rust
   terminal, and required the pending gauge to return to its prior baseline
   once. That is **frozen Go-adapter qualification**, not current evidence:
-  no Rust terminal feeds a Go router any more. The pending-gauge
-  once-and-only-once property is now a Rust-native concern, served from the
-  router's own state and recorded under MTR-004/MTR-006.
+  no Rust terminal feeds a Go router any more. Re-establishing the
+  pending-gauge once-and-only-once property natively is CP-ADMIN slice 5d,
+  which is **not in this tree** -- see MTR-004.
 
 Together these rows make the live A0 -> A1 result a single-owner atomic swap
-with generation-safe, idempotent control effects and balanced Go accounting.
+with generation-safe, idempotent control effects. The balanced Go-side
+accounting that sentence used to claim is old-bridge history: #223 Phase 2
+retired the route family, so no Rust terminal reaches a Go router.
 
 ## Control-frame dropper (chaos-E2E control-loss)
 
