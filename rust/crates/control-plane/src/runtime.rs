@@ -103,8 +103,17 @@ impl ShutdownReason {
 /// The only place `phase` is assigned, so the permit cannot drift from it.
 /// Entering `Ready` mints a fresh authority; leaving it revokes the old
 /// one, which excludes any commit already running and refuses every later
-/// one. Both happen while the runtime's state lock is held, so a reader
-/// never observes `Ready` beside a revoked permit or the reverse.
+/// one. Both happen while the runtime's state lock is held.
+///
+/// Be exact about what that guarantees, because the obvious stronger
+/// claim is false. A **newly published** state corresponds to the permit
+/// it carries, and a **revoked** permit refuses every later commit. It is
+/// *not* true that a reader never sees `Ready` beside a revoked permit: a
+/// snapshot retained from before the exit keeps its own now-revoked
+/// permit, and the revocation lands before the next snapshot is
+/// published, so that pairing is expected. What matters is that such a
+/// permit commits nothing — the reader's authority is gone, whatever the
+/// phase field of the value it happens to be holding says.
 fn set_phase(state: &mut LifecycleSnapshot, next: LifecyclePhase) {
     if state.phase == next {
         return;
