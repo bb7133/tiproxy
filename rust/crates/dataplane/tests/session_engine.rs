@@ -241,6 +241,8 @@ enum FakeAuth {
 const WIRE03_LARGE_QUERY: &[u8] = b"\x03SELECT wire03_large_response";
 const WIRE03_EXACT_MULTIPLE_QUERY: &[u8] = b"\x03SELECT wire03_exact_multiple_response";
 const WIRE03_LOCAL_INFILE_QUERY: &[u8] = b"\x03LOAD DATA LOCAL INFILE 'wire03.csv'";
+/// RSP-004: one command, two result sets (see `respond_to_multi_result`).
+const MULTI_RESULT_QUERY: &[u8] = b"\x03SELECT 0; SELECT 1";
 const WIRE03_LARGE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize + 257;
 const WIRE03_EXACT_MULTIPLE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize;
 
@@ -442,6 +444,52 @@ fn encode_resultset_terminator(status: StatusFlags, capabilities: CapabilityFlag
 /// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
 /// selects the shape: `0x80` sentinel = a backend error (e.g. execute after
 /// long data), `0x01` (read-only cursor) = a result-set header + column
+/// RSP-004: two result sets for one command. The first terminator carries
+/// `SERVER_MORE_RESULTS_EXISTS`, so the proxy must keep reading the backend
+/// instead of handing the command back to the client; the second clears it and
+/// ends the command. A proxy that stops at the first terminator leaves the
+/// second result set unread in the backend socket and desynchronises the
+/// session, which the follow-up command in the test detects.
+async fn respond_to_multi_result<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    capabilities: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.reset_sequence(reader.expected_sequence());
+    for (index, more) in [(0u8, true), (1u8, false)] {
+        for packet in [vec![0x01], result_column(b"c")] {
+            if writer.write_logical(&packet, true).await.is_err() {
+                return false;
+            }
+        }
+        // One text row carrying the result-set index, so the two sets are
+        // distinguishable on the wire rather than merely counted.
+        if writer
+            .write_logical(&[0x01, b'0' + index], true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let status = if more {
+            StatusFlags::AUTOCOMMIT | StatusFlags::MORE_RESULTS_EXISTS
+        } else {
+            StatusFlags::AUTOCOMMIT
+        };
+        if writer
+            .write_logical(&encode_resultset_terminator(status, capabilities), true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// definition + a cursor-open terminator (`CURSOR_EXISTS`, no rows), otherwise
 /// a one-row result set with a plain terminator (no cursor).
 async fn respond_to_execute<R, W>(
@@ -923,6 +971,12 @@ where
                 break;
             }
             in_transaction = false;
+            continue;
+        }
+        if packet.payload == MULTI_RESULT_QUERY {
+            if !respond_to_multi_result(&reader, &mut writer, broad).await {
+                break;
+            }
             continue;
         }
         if packet.payload == b"\x03SHOW SESSION_STATES" {
@@ -2236,6 +2290,30 @@ impl MysqlClient {
         response.payload.first() == Some(&0x00)
     }
 
+    /// RSP-004: sends one command and drains a two-result-set response,
+    /// returning the text rows in arrival order. Each set is column-count,
+    /// column definition, one row, terminator; the first terminator carries
+    /// `SERVER_MORE_RESULTS_EXISTS`. Returning the rows rather than a count
+    /// makes a proxy that forwarded only the first set distinguishable from
+    /// one that forwarded both.
+    async fn query_multi_result(&mut self, sql: &str) -> Option<Vec<u8>> {
+        let mut payload = vec![0x03_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        self.writer.reset_sequence(0);
+        self.writer.write_logical(&payload, true).await.ok()?;
+        self.reader.reset_sequence(1);
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            let packet = self.reader.read_logical(64 * 1024).await.ok()?;
+            // A text row here is a one-byte length-encoded string; the
+            // column-count packet is the bare 0x01 and is one byte shorter.
+            if packet.payload.len() == 2 && packet.payload[0] == 0x01 {
+                rows.push(packet.payload[1]);
+            }
+        }
+        Some(rows)
+    }
+
     /// Sends one command and reads a large OK-shaped logical response that
     /// crosses `MySQL`'s 16 MiB physical-packet boundary. Returns
     /// `(physical_packets, sequence_mismatches, next_expected_sequence)` so
@@ -2932,6 +3010,50 @@ async fn session_path_emits_query_traffic_and_exact_quit_source() {
         "session observations reach the bounded queue"
     );
     assert!(saw_handshake && saw_query && saw_close);
+    stack.dispatch_task.abort();
+}
+
+/// PARITY-RSP-004 at the session engine, not just the observer.
+///
+/// `ResponseObserver` already models `SERVER_MORE_RESULTS_EXISTS` and the
+/// response corpus pins it per packet, but nothing exercised the engine's own
+/// `response_rounds` loop, whose `MoreResults` arm is what actually keeps
+/// reading the backend. Both halves must hold: the client receives both result
+/// sets in order, and -- the part a first-set-only proxy fails -- the session
+/// is still synchronised afterwards, since an unread second set would sit in
+/// the backend socket and answer the next command at the wrong sequence.
+#[tokio::test]
+async fn multi_result_command_forwards_every_set_and_keeps_the_session_synchronised() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+
+    let rows = timeout(
+        Duration::from_secs(5),
+        client.query_multi_result("SELECT 0; SELECT 1"),
+    )
+    .await;
+    assert_eq!(
+        rows.ok().flatten(),
+        Some(vec![b'0', b'1']),
+        "both result sets reach the client, in order"
+    );
+
+    // The discriminator: a proxy that stopped at the first terminator leaves
+    // the second set unread, so this command answers at the wrong sequence.
+    assert!(
+        timeout(Duration::from_secs(5), client.query_ok("SELECT 1"))
+            .await
+            .unwrap_or(false),
+        "the session is still synchronised after a multi-result command"
+    );
+    client.quit().await;
     stack.dispatch_task.abort();
 }
 
