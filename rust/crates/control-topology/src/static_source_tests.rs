@@ -1389,8 +1389,8 @@ async fn an_effect_can_re_read_the_sources_it_committed_under() -> TestResult {
     fixture.mode.publish(BackendSourceMode::Static);
     let snapshot = fixture.handle.current().ok_or("static snapshot")?;
 
-    // Inside the effect the mode slot must be free to read again. If the
-    // borrow were still held this would deadlock rather than fail.
+    // Inside the effect the mode slot must still be readable. A failure
+    // here is an assertion failure, not a hang: see the scope note above.
     let observed = fixture
         .handle
         .commit_current(&snapshot, || fixture.handle.still_current(&snapshot));
@@ -1398,6 +1398,59 @@ async fn an_effect_can_re_read_the_sources_it_committed_under() -> TestResult {
         observed,
         Some(true),
         "the effect can re-read the sources it committed under"
+    );
+    Ok(())
+}
+
+// M5 basic smoke: actual ConfigNamespaceStore and TopologyModule; no gate injection.
+#[tokio::test]
+async fn review_namespace_removal_cannot_land_inside_an_admitted_commit() -> TestResult {
+    let store = store_with(
+        &zero_cluster_config(),
+        vec![namespace("default", &["127.0.0.1:44001"])],
+    )?;
+    let observed = store.clone();
+    // No network probe is needed for the configuration authority boundary.
+    let module = spawn_module(store, health(false)).await?;
+    let handle = wait_handle(&module, "default").await?;
+    let snapshot = wait_snapshot(&handle, |_| true).await?;
+    assert!(handle.still_current(&snapshot));
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        start_rx
+            .recv()
+            .unwrap_or_else(|e| unreachable!("start: {e}"));
+        apply(&observed, &zero_cluster_config(), vec![], 3)
+            .unwrap_or_else(|e| unreachable!("remove namespace: {e}"));
+        done_tx
+            .send(observed.current().generation())
+            .unwrap_or_else(|e| unreachable!("done: {e}"));
+    });
+    let value = AtomicUsize::new(0);
+    let mut published_during_commit = None;
+    let result = handle.commit_current(&snapshot, || {
+        start_tx
+            .send(())
+            .unwrap_or_else(|e| unreachable!("start: {e}"));
+        published_during_commit = done_rx.recv_timeout(Duration::from_millis(500)).ok();
+        // No store re-read or nested permit acquisition in the effect.
+        value.store(1, Ordering::SeqCst);
+    });
+    writer
+        .join()
+        .unwrap_or_else(|_| unreachable!("writer panicked"));
+    let current_after = handle.still_current(&snapshot);
+    let written = value.load(Ordering::SeqCst);
+    drop(module);
+    assert_eq!(result, Some(()), "the starting source was authoritative");
+    assert!(
+        !current_after,
+        "the actual source must observe namespace retirement"
+    );
+    assert!(
+        published_during_commit.is_none(),
+        "namespace retired at generation {published_during_commit:?} while effect was admitted; written={written}"
     );
     Ok(())
 }
