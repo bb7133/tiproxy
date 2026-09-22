@@ -722,6 +722,9 @@ fn review_backend_metric_accepted_factor_samples_publish_derived_values() {
         &make_queries(t, t / 1_000_000, [0.2, 0.6], 0.95),
         t,
     );
+    // Publication is the commit-time step the router runs under the
+    // combined authority; at this layer it is called directly.
+    state.publish_backend_metrics();
     assert_eq!(first.rows.len(), 2);
     let first_values = metrics.snapshot().values;
     println!("accepted actual factor sample -> backend_metric {first_values:?}");
@@ -748,6 +751,7 @@ fn review_backend_metric_accepted_factor_samples_publish_derived_values() {
     }
     let next = make_queries(t + 1_000_000, t / 1_000_000 + 1, [0.1, 0.3], 0.5);
     let _ = state.evaluate(&inputs, &policy, &next, t + 1_000_000);
+    state.publish_backend_metrics();
     let second = metrics.snapshot().values;
     for input in &inputs {
         assert!((second[&(input.address.clone(), Cpu)] - 0.2).abs() < 1e-12);
@@ -766,6 +770,7 @@ fn review_backend_metric_accepted_factor_samples_publish_derived_values() {
     }
     skipped.retain(|id, _| matches!(id, QueryId::Cpu | QueryId::Memory));
     let _ = state.evaluate(&inputs, &policy, &skipped, t + 2_000_000);
+    state.publish_backend_metrics();
     assert_eq!(
         metrics.snapshot().values,
         second,
@@ -773,9 +778,140 @@ fn review_backend_metric_accepted_factor_samples_publish_derived_values() {
     );
     policy.balance_policy = RoutingBalancePolicy::Connection;
     let _ = state.evaluate(&inputs, &policy, &Queries::new(), t + 3_000_000);
+    state.publish_backend_metrics();
     assert_eq!(
         metrics.snapshot().values,
         second,
         "configuration does not Reset backend_metric"
+    );
+}
+
+/// A round whose commit was refused never reaches the family, and never
+/// reaches it later either.
+///
+/// This is the property the deferral exists for. Go writes each accepted
+/// value inline, which cannot be fenced: by the time a source is found to
+/// have been revoked, the write has already happened. Recording the
+/// values and publishing them inside the combined commit moves the write
+/// to a point where refusing it is still possible.
+///
+/// Scope, because the obvious stronger reading is wrong: this does not by
+/// itself prove that a revoked source refuses publication. It proves the
+/// two halves that compose into that -- `evaluate` publishes nothing on
+/// its own, and an unpublished round is discarded rather than carried --
+/// while the refusal itself belongs to `commit_all`, which has its own
+/// tests. The connection between them is structural: the only callers of
+/// `publish_backend_metrics` outside this file are the two `commit_valid`
+/// closures in the selector.
+#[test]
+fn a_round_that_never_commits_never_publishes() {
+    use crate::BackendMetric::Cpu;
+    let metrics = Arc::new(crate::BackendMetricHistory::new());
+    let mut state = State::default();
+    state.set_backend_metrics(Some(Arc::clone(&metrics)));
+    let mut ledger = Ledger::new(1);
+    let inputs: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|i| Input {
+            id: Arc::from(format!("opaque-backend-{i}")),
+            address: format!("sql-{i}:4000"),
+            instance: format!("status-{i}:10080"),
+            cluster: "default".to_owned(),
+            owner: must(ledger.add_account()),
+            counts: Accounting::for_factor_test(10, 0),
+            healthy: true,
+            local: true,
+            label_matches: true,
+        })
+        .collect();
+    let mut policy = must(EffectiveConfig::default().routing());
+    policy.balance_policy = RoutingBalancePolicy::Resource;
+    let t = 1_000_000_000_000_i64;
+    // `only` selects which backends have a sample this round, so a round
+    // can stop reporting a backend the previous round did report.
+    let cpu_for = |sample_ms: i64, value: f64, only: &[usize]| -> Queries {
+        [(
+            QueryId::Cpu,
+            QueryResult {
+                updated_nanos: Some(sample_ms * 1_000_000),
+                kind: ValueKind::Matrix,
+                series: inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| only.contains(index))
+                    .map(|(_, input)| Series {
+                        labels: BTreeMap::from([
+                            ("instance".to_owned(), input.instance.clone()),
+                            ("tiproxy_cluster".to_owned(), "default".to_owned()),
+                        ]),
+                        samples: vec![
+                            Sample {
+                                timestamp_ms: sample_ms - 1000,
+                                value,
+                            },
+                            Sample {
+                                timestamp_ms: sample_ms,
+                                value,
+                            },
+                        ],
+                    })
+                    .collect(),
+            },
+        )]
+        .into_iter()
+        .collect()
+    };
+
+    // A committed round: accepted, then published.
+    let _ = state.evaluate(&inputs, &policy, &cpu_for(t / 1_000_000, 0.4, &[0, 1]), t);
+    assert!(
+        metrics.snapshot().values.is_empty(),
+        "evaluation alone publishes nothing -- the write waits for the commit"
+    );
+    state.publish_backend_metrics();
+    let committed = metrics.snapshot().values;
+    for input in &inputs {
+        let value = committed.get(&(input.address.clone(), Cpu)).copied();
+        assert!(
+            value.is_some_and(|v| (v - 0.4).abs() < 1e-12),
+            "the committed round is exposed: {value:?}"
+        );
+    }
+
+    // A refused round: accepted by the factors, never committed. It must
+    // leave the previous value standing rather than overwrite it.
+    let _ = state.evaluate(
+        &inputs,
+        &policy,
+        &cpu_for(t / 1_000_000 + 1, 0.9, &[0, 1]),
+        t + 1_000_000,
+    );
+    assert_eq!(
+        metrics.snapshot().values,
+        committed,
+        "a round whose commit was refused exposes nothing"
+    );
+
+    // And it must not ride along on the next round that does commit. The
+    // next round reports backend 0 only, so if the refused round were
+    // merely queued rather than discarded, backend 1 -- which this round
+    // says nothing about -- would still move to 0.9.
+    let _ = state.evaluate(
+        &inputs,
+        &policy,
+        &cpu_for(t / 1_000_000 + 2, 0.2, &[0]),
+        t + 2_000_000,
+    );
+    state.publish_backend_metrics();
+    let after = metrics.snapshot().values;
+    let reported = after.get(&(inputs[0].address.clone(), Cpu)).copied();
+    assert!(
+        reported.is_some_and(|v| (v - 0.2).abs() < 1e-12),
+        "the backend this round reported takes its committed value: {reported:?}"
+    );
+    let silent = after.get(&(inputs[1].address.clone(), Cpu)).copied();
+    assert!(
+        silent.is_some_and(|v| (v - 0.4).abs() < 1e-12),
+        "the backend it did not report keeps its last committed value,          not the refused round's 0.9: {silent:?}"
     );
 }

@@ -216,6 +216,16 @@ impl State {
     pub(crate) fn set_backend_metrics(&mut self, sink: Option<Arc<crate::BackendMetricHistory>>) {
         self.history.backend_metrics = sink;
     }
+
+    /// Publishes the `backend_metric` observations this round accepted.
+    ///
+    /// Separated from `evaluate` so the caller can run it under the same
+    /// combined authority that guards the score gauges: Go writes these
+    /// inline, but an inline write cannot be fenced against a source
+    /// revoked part-way through the evaluation.
+    pub(crate) fn publish_backend_metrics(&mut self) {
+        self.history.publish_backend_metrics();
+    }
 }
 
 impl Default for State {
@@ -348,6 +358,9 @@ impl State {
         policy: &RoutingConfig,
         window: &mut W,
     ) -> Result<FactorReport, W::Error> {
+        // A round that never reached its commit must not publish through
+        // this one.
+        self.history.discard_pending_metrics();
         for input in inputs {
             if self
                 .owners

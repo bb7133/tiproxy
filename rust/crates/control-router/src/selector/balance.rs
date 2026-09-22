@@ -87,8 +87,13 @@ impl Router {
             // write. The closure touches only the metric stores -- it must
             // not read the configuration store, whose publisher takes that
             // lock before the permits.
-            self.sources
-                .commit_valid(candidate, || state.publish_scores(now, &report));
+            //
+            // `backend_metric` publishes in the same commit: both families
+            // describe this one scoring round.
+            self.sources.commit_valid(candidate, || {
+                factors.core.publish_backend_metrics();
+                state.publish_scores(now, &report);
+            });
             let diagnostic_pair = report.balance.clone();
             let prepared = (|| {
                 if let Some(pair) = report.balance {

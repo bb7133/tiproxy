@@ -208,6 +208,15 @@ pub(crate) struct History<Q: Query> {
     /// it rejected -- a skip leaves the previous value exposed, which a
     /// pass over the finished cache could not distinguish from a fresh one.
     pub backend_metrics: Option<Arc<crate::BackendMetricHistory>>,
+    /// Observations accepted this round, not yet published.
+    ///
+    /// Go writes each value inline as it accepts it. We record at exactly
+    /// the same points -- past exactly the same guards -- but hold the
+    /// values until the caller can take the routing authority, so a round
+    /// whose sources were revoked mid-evaluation publishes nothing. The
+    /// buffer never outlives the round: `publish_backend_metrics` drains
+    /// it, and `evaluate` clears it before filling it again.
+    pending_metrics: Vec<(String, crate::BackendMetric, f64)>,
 }
 /// Equality over the observed state alone.
 ///
@@ -240,9 +249,44 @@ impl<Q: Query> History<Q> {
             // Preserve the preexisting staged API's saturating conversion.
             go_arch: GoArch::Arm64,
             backend_metrics: None,
+            pending_metrics: Vec::new(),
             zero,
         }
     }
+    /// Records an accepted observation for publication at commit time.
+    ///
+    /// Skipped entirely when nothing serves `backend_metric`, so an
+    /// unexposed process does not accumulate a buffer it will only drop.
+    fn record_metric(&mut self, address: &str, metric: crate::BackendMetric, value: f64) {
+        if self.backend_metrics.is_some() {
+            self.pending_metrics
+                .push((address.to_owned(), metric, value));
+        }
+    }
+
+    /// Discards observations recorded but never published.
+    ///
+    /// Called at the start of a round: a previous round that was refused
+    /// the authority must not leak its values into this one.
+    pub(crate) fn discard_pending_metrics(&mut self) {
+        self.pending_metrics.clear();
+    }
+
+    /// Publishes this round's accepted observations.
+    ///
+    /// The caller runs this inside the combined commit, so the values
+    /// land only while the sources that produced them are still
+    /// authoritative.
+    pub(crate) fn publish_backend_metrics(&mut self) {
+        let Some(metrics) = self.backend_metrics.clone() else {
+            self.pending_metrics.clear();
+            return;
+        };
+        for (address, metric, value) in self.pending_metrics.drain(..) {
+            metrics.observe(&address, metric, value);
+        }
+    }
+
     pub(crate) fn clear_resources(&mut self) {
         for cache in self.cache.values_mut() {
             cache.cpu = None;
@@ -311,18 +355,19 @@ impl<Q: Query> History<Q> {
                 if avg < 0.0 {
                     continue;
                 }
-                // Go publishes `calcAvgUsage`'s average here, past the same
-                // freshness and negative-usage guards. The latest sample is
-                // a different number and is not what the `cpu` label means.
-                if let Some(metrics) = &self.backend_metrics {
-                    metrics.observe(input.address(), crate::BackendMetric::Cpu, avg);
-                }
                 cache.cpu = Some(Cpu {
                     time,
                     avg,
                     latest,
                     connections: input.physical(),
                 });
+                // Go publishes `calcAvgUsage`'s average here, past the same
+                // freshness and negative-usage guards. The latest sample is
+                // a different number and is not what the `cpu` label means.
+                // Recorded after the cache write only to end its borrow;
+                // recording buffers, so the order between the two is not
+                // observable.
+                self.record_metric(input.address(), crate::BackendMetric::Cpu, avg);
             }
             for cache in self.cache.values_mut() {
                 if cache.cpu.is_some_and(|v| v.time.expired(now, 120)) {
@@ -406,11 +451,6 @@ impl<Q: Query> History<Q> {
                 if usage < 0.0 {
                     continue;
                 }
-                // Go publishes `calcMemUsage`'s latest usage here, past the
-                // same guards.
-                if let Some(metrics) = &self.backend_metrics {
-                    metrics.observe(input.address(), crate::BackendMetric::Memory, usage);
-                }
                 let risk = if usage > 0.75 || horizon < 45 * NS {
                     2
                 } else {
@@ -428,6 +468,11 @@ impl<Q: Query> History<Q> {
                     risk,
                     balance,
                 });
+                // Go publishes `calcMemUsage`'s latest usage here, past the
+                // same guards. Recorded after the cache write only to end
+                // its borrow; recording buffers, so the order is not
+                // observable.
+                self.record_metric(input.address(), crate::BackendMetric::Memory, usage);
             }
             for cache in self.cache.values_mut() {
                 if cache.memory.is_some_and(|v| v.time.expired(now, 60)) {
@@ -512,11 +557,9 @@ impl<Q: Query> History<Q> {
                     // are present -- its `failureSample == nil ||
                     // totalSample == nil` skips the pair together, so one
                     // half is never published alone.
-                    if let (Some(metrics), Some(failure_value), Some(total_value)) =
-                        (&self.backend_metrics, failure_value, total_value)
-                    {
-                        metrics.observe(input.address(), failure.into(), failure_value);
-                        metrics.observe(input.address(), total.into(), total_value);
+                    if let (Some(failure_value), Some(total_value)) = (failure_value, total_value) {
+                        self.record_metric(input.address(), failure.into(), failure_value);
+                        self.record_metric(input.address(), total.into(), total_value);
                     }
                     risk = risk.max(health_risk(failure_value, total_value, threshold));
                 }

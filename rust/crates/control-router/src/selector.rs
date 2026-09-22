@@ -690,9 +690,15 @@ impl Router {
             // the balance path would leave a proxy that routes without
             // rebalancing reporting nothing.
             //
-            // Under the same combined authority as the balance path.
-            self.sources
-                .commit_valid(candidate, || state.publish_scores(now, &report));
+            // Under the same combined authority as the balance path, and
+            // in the same commit as `backend_metric`: the two families
+            // describe one scoring round, so one of them landing while
+            // the other was refused would expose a round that never
+            // happened as one that half did.
+            self.sources.commit_valid(candidate, || {
+                factors.core.publish_backend_metrics();
+                state.publish_scores(now, &report);
+            });
             self.sources.validate(candidate)?;
             // Scoring happens even when every scored backend is rejected by
             // a factor. Persist only after the source and metric fences hold.
