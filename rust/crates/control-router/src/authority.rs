@@ -427,6 +427,14 @@ impl Sources {
     /// permit is taken, and `effect` must not read the configuration
     /// store: the publishing side takes the store lock and then the
     /// permit, so doing it the other way round here would close a cycle.
+    ///
+    /// What `effect` may take is the metric histories' own locks, which
+    /// are the innermost in the process: `ScoreHistory` and
+    /// `BackendMetricHistory` each guard a single `Mutex` and acquire
+    /// nothing further -- in particular they never re-enter the metric
+    /// feed, the configuration store, or any authority. That is what
+    /// keeps this closure acyclic; it is not that the histories are
+    /// lock-free.
     pub(crate) fn commit_valid<T>(
         &self,
         candidate: &Candidate,
