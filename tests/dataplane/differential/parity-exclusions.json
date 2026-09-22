@@ -47,7 +47,7 @@
     },
     {
       "parity_id": "HS-007",
-      "reason": "Handshake retry classification depends on the routing hook and distinct backend candidates, not a single byte stream."
+      "reason": "EXCLUDED by the RUST_ROUTE_OWNER production boundary: Rust mode rejects custom Go HandshakeHandler implementations before listeners open, while the supported default handler never approves RECONNECT. The pure relay reference transition remains unit-tested; initial dial retry and candidate retirement are covered by ADM-003."
     },
     {
       "parity_id": "HS-009",

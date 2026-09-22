@@ -4828,7 +4828,7 @@ async fn non_empty_password_reauths_against_backend_salt() {
 /// client-visible error.
 #[tokio::test]
 async fn wrong_password_reports_using_password() {
-    let stack = spawn_stack().await;
+    let mut stack = spawn_stack().await;
     spawn_route_answer(&stack, 1, 2);
     let Ok(login) = timeout(
         Duration::from_secs(5),
@@ -4850,6 +4850,16 @@ async fn wrong_password_reports_using_password() {
         String::from_utf8_lossy(&denied).contains("using password"),
         "Go's using-password semantics survive the relay: {denied:?}"
     );
+    let closed_source = timeout(Duration::from_secs(5), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::SessionClosed { source, .. } = observation {
+                return Some(source);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(closed_source, Ok(Some(QuitSource::ClientAuthFail)));
     stack.dispatch_task.abort();
 }
 
@@ -6022,7 +6032,7 @@ async fn rejected_handshake_decision_refuses_the_client() {
 /// session reports CLOSED.
 #[tokio::test]
 async fn no_backend_route_answer_refuses_the_client() {
-    let stack = spawn_stack().await;
+    let mut stack = spawn_stack().await;
     // Accepted decision at request 1; the route request (2) answers a
     // terminal NO_BACKEND assignment.
     let forwarder = Arc::clone(&stack.forwarder);
@@ -6094,6 +6104,16 @@ async fn no_backend_route_answer_refuses_the_client() {
     )
     .await;
     assert!(closed.is_some(), "the refused session reports CLOSED");
+    let closed_source = timeout(Duration::from_secs(5), async {
+        while let Some(observation) = stack.metrics_rx.recv().await {
+            if let Observation::SessionClosed { source, .. } = observation {
+                return Some(source);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(closed_source, Ok(Some(QuitSource::ProxyNoBackend)));
     stack.dispatch_task.abort();
 }
 
@@ -6693,16 +6713,19 @@ async fn frontend_greeting_and_pre_read_handshake_limit_are_production_wired() {
     );
     assert!(stream.write_all(&[0]).await.is_ok());
     assert!(stream.flush().await.is_ok());
-    let mut byte = [0_u8; 1];
-    match timeout(Duration::from_secs(1), stream.read(&mut byte)).await {
-        Ok(Ok(0)) => {}
-        Ok(Err(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
-            ) => {}
-        other => unreachable!("oversized handshake was not rejected promptly: {other:?}"),
-    }
+    let mut reader = PacketReader::new(stream);
+    reader.reset_sequence(1);
+    let observed = timeout(Duration::from_secs(1), reader.read_logical(64 * 1024)).await;
+    let error = match observed {
+        Ok(Ok(error)) => error,
+        other => unreachable!("oversized handshake response: {other:?}"),
+    };
+    assert_exact_err_packet(
+        &error.payload,
+        1153,
+        *b"08S01",
+        "Got a packet bigger than 'max_allowed_packet' bytes",
+    );
     assert_eq!(
         stack.backend_accepted_connections.load(Ordering::Relaxed),
         0,
@@ -6861,24 +6884,101 @@ async fn backend_greeting_parser_and_required_capability_gate_are_production_wir
         StatusFlags::from_bits_retain(0x0002),
     ))
     .unwrap_or_else(|error| unreachable!("valid limited greeting: {error}"));
-    for greeting in [missing_required, vec![9, 0]] {
+    for (greeting, expected_message) in [
+        (
+            missing_required,
+            "Verify TiDB capability failed, please upgrade TiDB",
+        ),
+        (
+            vec![9, 0],
+            "TiProxy fails to connect to TiDB, please make sure TiDB is available",
+        ),
+    ] {
         let (backend_port, accepted) = spawn_one_greeting_backend(greeting).await;
-        let stack = spawn_stack().await;
+        let mut stack = spawn_stack().await;
         spawn_route_answer_to(&stack, 1, 2, backend_port);
-        assert!(
-            timeout(Duration::from_secs(2), MysqlClient::connect(stack.sql_port))
-                .await
-                .ok()
-                .flatten()
-                .is_none(),
-            "an invalid backend greeting must fail closed"
-        );
+        let Ok(Err(denied)) = timeout(
+            Duration::from_secs(2),
+            MysqlClient::login(stack.sql_port, FAKE_BACKEND_PASSWORD),
+        )
+        .await
+        else {
+            unreachable!("an invalid backend greeting must fail closed")
+        };
+        assert_exact_err_packet(&denied, 1105, *b"HY000", expected_message);
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
         assert_eq!(
             stack.backend_accepted_connections.load(Ordering::Relaxed),
             0,
             "the assignment must use only the deliberately invalid backend"
         );
+        let closed_source = timeout(Duration::from_secs(5), async {
+            while let Some(observation) = stack.metrics_rx.recv().await {
+                if let Observation::SessionClosed { source, .. } = observation {
+                    return Some(source);
+                }
+            }
+            None
+        })
+        .await;
+        assert_eq!(closed_source, Ok(Some(QuitSource::BackendHandshake)));
+        stack.shutdown_tx.send(true).ok();
+        stack.dispatch_task.abort();
+        stack.server_task.abort();
+    }
+}
+
+/// HS-008 production error translation for required backend TLS: a backend
+/// that omits SSL receives the exact `ErrBackendNoTLS` response, while one
+/// that advertises SSL but cannot complete the upgrade receives Go's
+/// `ErrBackendPPV2` response. Both retain the backend-handshake quit label.
+#[tokio::test]
+async fn backend_tls_failures_use_go_client_errors_and_source_label() {
+    let broad = fake_backend_capabilities(false);
+    for (capabilities, expected_message) in [
+        (
+            broad,
+            "Require TLS enabled on TiDB when require-backend-tls=true",
+        ),
+        (
+            broad.union(CapabilityFlags::SSL),
+            "TiProxy fails to connect to TiDB, please make sure TiDB proxy-protocol is set correctly. If this error still exists, please contact PingCAP",
+        ),
+    ] {
+        let greeting = encode_initial_handshake(build_greeting(
+            capabilities,
+            &[5_u8; 20],
+            b"8.0.11-tls-failure",
+            92,
+            45,
+            StatusFlags::from_bits_retain(0x0002),
+        ))
+        .unwrap_or_else(|error| unreachable!("valid TLS-case greeting: {error}"));
+        let (backend_port, accepted) = spawn_one_greeting_backend(greeting).await;
+        let mut stack = spawn_tls_stack(SnapshotReply::Valid).await;
+        spawn_route_answer_to(&stack, 1, 2, backend_port);
+
+        let Ok(Err(denied)) = timeout(
+            Duration::from_secs(2),
+            MysqlClient::login(stack.sql_port, FAKE_BACKEND_PASSWORD),
+        )
+        .await
+        else {
+            unreachable!("a required backend TLS failure must refuse the client")
+        };
+        assert_exact_err_packet(&denied, 1105, *b"HY000", expected_message);
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+        let closed_source = timeout(Duration::from_secs(5), async {
+            while let Some(observation) = stack.metrics_rx.recv().await {
+                if let Observation::SessionClosed { source, .. } = observation {
+                    return Some(source);
+                }
+            }
+            None
+        })
+        .await;
+        assert_eq!(closed_source, Ok(Some(QuitSource::BackendHandshake)));
         stack.shutdown_tx.send(true).ok();
         stack.dispatch_task.abort();
         stack.server_task.abort();

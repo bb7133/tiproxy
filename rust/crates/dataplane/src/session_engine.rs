@@ -110,11 +110,12 @@ use session_core::command::{
     Command, CommandSessionState, CommandStateEffects, ExpectedResponse, SessionMutation, dispatch,
 };
 use session_core::error_source::{
-    DisconnectState, FailureDescriptor, FailureKind, SideMarker, is_disconnect_io,
+    ClientResponse, DisconnectState, FailureDescriptor, FailureKind, SideMarker, client_response,
+    is_disconnect_io,
 };
 use session_core::fsm::{SessionEffect, SessionEvent};
 use session_core::handshake::{
-    ConnectionEndpoints, SUPPORTED_SERVER_CAPABILITIES, build_greeting,
+    BackendVerificationError, ConnectionEndpoints, SUPPORTED_SERVER_CAPABILITIES, build_greeting,
     check_handshake_packet_size, greeting_capability, negotiate_frontend, verify_backend,
 };
 use session_core::internal_client::{
@@ -1971,24 +1972,30 @@ impl Engine {
                     succeeded: false,
                 });
                 self.quit_source = acquire_quit_source(&error);
-                // Go parity: a NO_BACKEND refusal reaches the client
-                // as the approved vocabulary before the session closes
-                // (Go maps router.ErrNoBackend to ErrProxyNoBackend in
-                // ErrToClient); other acquire failures keep Go's
-                // behavior of closing without a client error packet.
-                if matches!(error, AcquireError::NoBackend { .. }) {
-                    let seq = self.client_io.expected_read_sequence();
-                    self.client_io.reset_write_sequence(seq);
-                    let _ = self
-                        .write_client_error(
-                            1105,
-                            *b"HY000",
-                            "No available TiDB instances, please make sure TiDB is available",
-                        )
-                        .await;
+                // Go's total connect budget returns the last dial failure when
+                // one exists, so it is a backend-handshake refusal; a terminal
+                // empty selector is the distinct no-backend vocabulary. A
+                // timeout before any assignment/control answer is an internal
+                // routing failure and remains silent.
+                match &error {
+                    AcquireError::NoBackend { .. } | AcquireError::ClusterUnsupported { .. } => {
+                        self.write_handshake_failure(FailureKind::NoBackend, false)
+                            .await;
+                    }
+                    AcquireError::BudgetExhausted {
+                        last_failure: Some(_),
+                    } => {
+                        self.quit_source = QuitSource::BackendHandshake;
+                        self.write_handshake_failure(FailureKind::BackendHandshake, false)
+                            .await;
+                    }
+                    AcquireError::BudgetExhausted { last_failure: None }
+                    | AcquireError::Routing { .. }
+                    | AcquireError::MalformedAssignment { .. }
+                    | AcquireError::Channel(_) => {}
                 }
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
-                return Some(WireErrorSource::Proxy);
+                return Some(wire_source_of(self.quit_source));
             }
         };
         let (channel, _) = route_engine.into_parts();
@@ -2061,7 +2068,11 @@ impl Engine {
             Ok(())
         };
         if let Err(source) = proxy_v2_result {
-            self.quit_source = QuitSource::BackendHandshake;
+            let source = self.end_source(coarse_quit_source(source));
+            if source == WireErrorSource::BackendNetwork {
+                self.write_handshake_failure(FailureKind::BackendHandshake, false)
+                    .await;
+            }
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(source);
         }
@@ -2092,27 +2103,41 @@ impl Engine {
                 // handled by the verify/plan branches below and stays
                 // BackendHandshake.
                 let source = classify_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+                let source = self.end_source(source);
+                self.write_handshake_failure(FailureKind::BackendHandshake, false)
+                    .await;
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
-                return Some(self.end_source(source));
+                return Some(source);
             }
         };
         let greeting_payload = greeting_packet.payload;
         let Ok(backend_greeting) = mysql_wire::parse_initial_handshake(&greeting_payload) else {
             self.quit_source = QuitSource::BackendHandshake;
+            let mysql_error = greeting_payload.first() == Some(&0xff);
+            if mysql_error {
+                let seq = self.client_io.expected_read_sequence();
+                self.client_io.reset_write_sequence(seq);
+                let _ = self.client_io.write_logical(&greeting_payload, true).await;
+            }
+            self.write_handshake_failure(FailureKind::BackendHandshake, mysql_error)
+                .await;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         };
         let backend_caps = backend_greeting.capabilities;
         let (require_backend_tls, backend_tls_available) = self.backend_tls_policy();
-        if verify_backend(
+        if let Err(error) = verify_backend(
             backend_caps,
             self.negotiated,
             proxy_capabilities(self.frontend_tls_available()),
             require_backend_tls,
-        )
-        .is_err()
-        {
+        ) {
             self.quit_source = QuitSource::BackendHandshake;
+            let kind = match error {
+                BackendVerificationError::MissingCapabilities(_) => FailureKind::BackendCapability,
+                BackendVerificationError::TlsRequired => FailureKind::BackendNoTls,
+            };
+            self.write_handshake_failure(kind, false).await;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::BackendNetwork);
         }
@@ -2122,7 +2147,9 @@ impl Engine {
             require_backend_tls,
             backend_tls_available,
         ) else {
-            self.quit_source = QuitSource::BackendHandshake;
+            self.quit_source = QuitSource::ProxyError;
+            self.write_handshake_failure(FailureKind::ProxyNoTls, false)
+                .await;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(WireErrorSource::Proxy);
         };
@@ -2141,6 +2168,8 @@ impl Engine {
         };
         if let Err(source) = backend_tls_result {
             self.quit_source = QuitSource::BackendHandshake;
+            self.write_handshake_failure(FailureKind::BackendProxyProtocol, false)
+                .await;
             let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Some(source);
         }
@@ -2221,15 +2250,13 @@ impl Engine {
                 let next = backend.backend_io.expected_read_sequence();
                 backend.backend_io.reset_write_sequence(next);
             }
-            if backend
-                .backend_io
-                .write_logical(&forwarded, true)
-                .await
-                .is_err()
-            {
-                self.quit_source = QuitSource::BackendHandshake;
+            if let Err(error) = backend.backend_io.write_logical(&forwarded, true).await {
+                let quit = classify_packet_io(&error, SideMarker::Backend, SideMarker::Backend);
+                let source = self.end_source(quit);
+                self.write_handshake_failure(FailureKind::BackendHandshake, false)
+                    .await;
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
-                return Some(WireErrorSource::BackendNetwork);
+                return Some(source);
             }
         }
 
@@ -4429,6 +4456,8 @@ impl Engine {
         let declared = usize::try_from(preview.first_packet_length).unwrap_or(usize::MAX);
         if check_handshake_packet_size(declared).is_err() {
             self.quit_source = QuitSource::ClientHandshake;
+            self.write_handshake_failure(FailureKind::PacketTooLarge, false)
+                .await;
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Err(WireErrorSource::ClientNetwork);
         }
@@ -4472,6 +4501,38 @@ impl Engine {
             )));
         }
         Ok(())
+    }
+
+    /// Applies Go's `ErrToClient` allowlist to one typed handshake failure.
+    ///
+    /// Classification is deliberately owned by the caller: Go may wrap the
+    /// same client-visible sentinel around either a handshake rejection or a
+    /// side-attributed transport break, and disconnect precedence must still
+    /// decide the final source label. This helper only emits the approved
+    /// fixed response (if any); it never derives a message from runtime detail.
+    async fn write_handshake_failure(&mut self, kind: FailureKind, mysql_error: bool) {
+        let descriptor = FailureDescriptor {
+            kind: Some(kind),
+            mysql_error,
+            ..FailureDescriptor::default()
+        };
+        let Some(response) = client_response(&descriptor) else {
+            return;
+        };
+        let (code, state, message) = match response {
+            ClientResponse::Fixed(response) => {
+                (response.code, response.sql_state, response.message)
+            }
+            ClientResponse::Approved(response) => {
+                (response.code(), response.sql_state(), response.message())
+            }
+        };
+        let seq = self.client_io.expected_read_sequence();
+        self.client_io.reset_write_sequence(seq);
+        let capabilities = self.negotiated.union(CapabilityFlags::PROTOCOL_41);
+        let _ = self
+            .write_client_error_with_capabilities(code, state, message, capabilities)
+            .await;
     }
 
     /// Records a classified session end from a single [`QuitSource`]: sets the
@@ -4636,10 +4697,14 @@ const fn failure_quit_source(kind: FailureKind) -> QuitSource {
 
 const fn acquire_quit_source(error: &AcquireError) -> QuitSource {
     match error {
-        AcquireError::NoBackend { .. }
-        | AcquireError::BudgetExhausted { .. }
-        | AcquireError::ClusterUnsupported { .. } => QuitSource::ProxyNoBackend,
-        AcquireError::Routing { .. }
+        AcquireError::NoBackend { .. } | AcquireError::ClusterUnsupported { .. } => {
+            QuitSource::ProxyNoBackend
+        }
+        AcquireError::BudgetExhausted {
+            last_failure: Some(_),
+        } => QuitSource::BackendHandshake,
+        AcquireError::BudgetExhausted { last_failure: None }
+        | AcquireError::Routing { .. }
         | AcquireError::MalformedAssignment { .. }
         | AcquireError::Channel(_) => QuitSource::ProxyError,
     }
@@ -4826,8 +4891,8 @@ fn fill_salt(salt: &mut [u8; 20]) {
 mod error_classification_tests {
     use super::{
         DisconnectState, IoSide, PacketIoError, QuitSource, SideMarker, WireErrorSource,
-        classify_packet_io, coarse_quit_source, descriptor_for_packet_io, resolve_end_source,
-        wire_source_of,
+        acquire_quit_source, classify_packet_io, coarse_quit_source, descriptor_for_packet_io,
+        resolve_end_source, wire_source_of,
     };
     use mysql_wire::DecodeError;
     use std::io::{Error as IoError, ErrorKind};
@@ -5050,6 +5115,22 @@ mod error_classification_tests {
             SideMarker::Backend,
         );
         assert_eq!(quit, QuitSource::BackendNetwork);
+    }
+
+    #[test]
+    fn route_timeout_preserves_go_last_failure_semantics() {
+        assert_eq!(
+            acquire_quit_source(&super::AcquireError::BudgetExhausted {
+                last_failure: Some(crate::route::DialFailure::Timeout),
+            }),
+            QuitSource::BackendHandshake,
+            "Go returns the last typed dial failure when the connect budget expires"
+        );
+        assert_eq!(
+            acquire_quit_source(&super::AcquireError::BudgetExhausted { last_failure: None }),
+            QuitSource::ProxyError,
+            "a routing/control wait that never produced a backend is not a false no-backend label"
+        );
     }
 }
 
