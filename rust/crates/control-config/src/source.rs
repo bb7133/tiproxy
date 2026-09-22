@@ -1557,9 +1557,14 @@ mod namespace_permit_tests {
             Some(1),
             "the namespace is untouched, so its authority stands"
         );
-        assert!(
-            store.current().namespace_permit("alpha").is_some(),
-            "and the new snapshot still carries it"
+        let carried = store
+            .current()
+            .namespace_permit("alpha")
+            .unwrap_or_else(|| unreachable!("the untouched namespace is carried"));
+        assert_eq!(
+            carried.commit(|| 1),
+            Some(1),
+            "and the new snapshot still carries it, still able to admit"
         );
     }
 
@@ -1604,9 +1609,14 @@ mod namespace_permit_tests {
             None,
             "the pre-edit definition authorises nothing further"
         );
-        assert!(
-            store.current().namespace_permit("alpha").is_some(),
-            "while the edited namespace carries a fresh authority"
+        let fresh = store
+            .current()
+            .namespace_permit("alpha")
+            .unwrap_or_else(|| unreachable!("the edited namespace is carried"));
+        assert_eq!(
+            fresh.commit(|| 1),
+            Some(1),
+            "while the edited namespace carries a fresh authority that admits"
         );
     }
 }
