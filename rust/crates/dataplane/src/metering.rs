@@ -700,12 +700,64 @@ impl MeteringSourceRegistry {
     }
 }
 
-/// Classifies the direct accepted TCP peer against the frozen public CIDRs.
+/// Classifies the direct accepted TCP peer the way Go `fromPublicEndpoint`
+/// does: the configured public CIDRs first, then — for everything they do not
+/// name — public unless the address is private.
+///
 /// The PROXY-v2 inner client is deliberately excluded: Go's `ProxyAddr()`
-/// semantics classify the upstream/LB hop visible to the listener.
+/// returns the underlying `packetReadWriter.RemoteAddr()` even when the PROXY
+/// header supplied a different client address, so the hop visible to the
+/// listener is what gets classified.
+///
+/// The non-private fallback is not a convenience. A public NLB may enable
+/// `preserveIP`, in which case the address arriving here is the real client's
+/// public address and no CIDR can be configured to cover it; a private NLB
+/// with `preserveIP` still yields a private address. Without this branch the
+/// default configuration — no `public_cidrs` at all — classifies *every*
+/// connection as private and the public share of metered bytes is always zero.
 #[must_use]
 pub fn is_public_endpoint(ip: std::net::IpAddr, cidrs: &[String]) -> bool {
-    cidrs.iter().any(|cidr| cidr_contains(ip, cidr))
+    if cidrs.iter().any(|cidr| cidr_contains(ip, cidr)) {
+        return true;
+    }
+    !is_private(ip)
+}
+
+/// Go `netutil.IsPrivate`: loopback, link-local unicast and multicast, the
+/// carrier-grade NAT range, and `net.IP.IsPrivate`.
+///
+/// Go reaches all of these through `ip.To4()`, so a v4-mapped v6 address is
+/// judged by its v4 form; normalizing once up front reproduces that.
+fn is_private(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    let ip = match ip {
+        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        value @ IpAddr::V4(_) => value,
+    };
+    match ip {
+        IpAddr::V4(value) => {
+            let [first, second, ..] = value.octets();
+            value.is_loopback()
+                // 169.254.0.0/16 link-local unicast, 224.0.0.0/24 link-local
+                // multicast.
+                || value.is_link_local()
+                || (first == 224 && second == 0 && value.octets()[2] == 0)
+                // 100.64.0.0/10, carrier-grade NAT.
+                || (first == 100 && (64..=127).contains(&second))
+                // 10/8, 172.16/12, 192.168/16.
+                || value.is_private()
+        }
+        IpAddr::V6(value) => {
+            let first = value.segments()[0];
+            value.is_loopback()
+                // fe80::/10 link-local unicast, ff02::/16 link-local multicast.
+                || first & 0xffc0 == 0xfe80
+                || first & 0xff0f == 0xff02
+                // fc00::/7 unique local.
+                || first & 0xfe00 == 0xfc00
+        }
+    }
 }
 
 fn cidr_contains(ip: std::net::IpAddr, cidr: &str) -> bool {
@@ -1458,6 +1510,65 @@ mod tests {
         assert!(!is_public_endpoint(
             "10.4.5.6".parse().expect("IPv4"),
             &["bad".to_owned()]
+        ));
+    }
+
+    /// ADM-004: an address no CIDR names is public unless it is private.
+    ///
+    /// This is the default configuration — `public_cidrs` is empty — so
+    /// without the fallback every connection meters as private and the public
+    /// share is always zero. The private set is Go `netutil.IsPrivate`, which
+    /// is wider than RFC1918: it also covers loopback, both link-local forms
+    /// and the carrier-grade NAT range.
+    #[test]
+    fn an_address_outside_every_cidr_is_public_unless_go_calls_it_private() {
+        let none: &[String] = &[];
+        for public in [
+            "8.8.8.8",
+            "203.0.113.9",
+            "100.128.0.1",    // just above the CGNAT range
+            "169.253.0.1",    // just below link-local
+            "224.0.1.1",      // multicast, but not link-local multicast
+            "::ffff:8.8.8.8", // v4-mapped: judged by its v4 form
+            "2001:4860:4860::8888",
+            "fe00::1", // just below the fe80::/10 mask
+            "fb00::1", // just below fc00::/7
+        ] {
+            assert!(
+                is_public_endpoint(public.parse().expect("address"), none),
+                "{public} must be public with no CIDRs configured"
+            );
+        }
+
+        for private in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "169.254.1.1",     // link-local unicast
+            "224.0.0.251",     // link-local multicast
+            "100.64.0.1",      // carrier-grade NAT, low edge
+            "100.127.255.254", // carrier-grade NAT, high edge
+            "::ffff:10.0.0.1", // v4-mapped private
+            "::1",
+            "fe80::1",
+            "ff02::1",
+            "fc00::1",
+            "fd12:3456::1",
+        ] {
+            assert!(
+                !is_public_endpoint(private.parse().expect("address"), none),
+                "{private} must stay private with no CIDRs configured"
+            );
+        }
+
+        // A configured CIDR still wins outright, exactly like Go's early
+        // `if contains { return true }`: a private address named by the
+        // operator is public.
+        assert!(is_public_endpoint(
+            "10.4.5.6".parse().expect("IPv4"),
+            &["10.0.0.0/8".to_owned()]
         ));
     }
 }
