@@ -1341,7 +1341,37 @@ mod tests {
             .map(|listener| listener.actual_address.port())
             .collect();
         assert_eq!(actual, (start..=end).collect::<Vec<_>>());
-        let owner = tokio::spawn(server.run(|_connection: AcceptedConnection| async {}));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().clone());
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        // Each expanded port accepts on its own owner: the handler for the
+        // first connection never returns, and the later listeners still
+        // serve their own clients under their own name/address.
+        let expected: Vec<(String, SocketAddr)> = handle
+            .listeners()
+            .iter()
+            .map(|listener| (listener.name.to_string(), listener.actual_address))
+            .collect();
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for (_, address) in &expected {
+            clients.push(TcpStream::connect(*address).await?);
+            let metadata = timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("listener did not accept")?;
+            accepted.push((
+                metadata.listener_name.to_string(),
+                metadata.listener_address,
+            ));
+        }
+        assert_eq!(accepted, expected);
+
         handle.shutdown();
         owner.await??;
         for address in handle
