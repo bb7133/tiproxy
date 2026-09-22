@@ -689,7 +689,10 @@ impl Router {
             // gauges behind the one shared throttle; publishing only from
             // the balance path would leave a proxy that routes without
             // rebalancing reporting nothing.
-            state.publish_scores(now, &report);
+            //
+            // Under the same combined authority as the balance path.
+            self.sources
+                .commit_valid(candidate, || state.publish_scores(now, &report));
             self.sources.validate(candidate)?;
             // Scoring happens even when every scored backend is rejected by
             // a factor. Persist only after the source and metric fences hold.

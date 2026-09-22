@@ -407,6 +407,55 @@ impl Sources {
         Ok(candidate)
     }
 
+    /// Runs `effect` only while `candidate` is valid, holding every
+    /// authority that validity rests on for its duration.
+    ///
+    /// [`Self::validate`] answers and returns, so a revocation can land
+    /// between the answer and the effect. This is the version for an
+    /// effect that must not outlive the candidate -- a metric write, say,
+    /// which would otherwise be attributable to a generation that had
+    /// already gone.
+    ///
+    /// Everything is taken in **one** `commit_all`: the process owner, the
+    /// runtime's readiness, the configuration snapshot, and the five the
+    /// backend source contributes. Committing in stages would nest, and
+    /// the permits are not reentrant. Duplicates are expected and handled
+    /// -- the health overlay's owner is usually the process owner -- since
+    /// `commit_all` deduplicates before locking.
+    ///
+    /// The watch borrow for readiness is resolved and dropped before any
+    /// permit is taken, and `effect` must not read the configuration
+    /// store: the publishing side takes the store lock and then the
+    /// permit, so doing it the other way round here would close a cycle.
+    pub(crate) fn commit_valid<T>(
+        &self,
+        candidate: &Candidate,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        // Identity conditions first; none of them is revocable.
+        if !Arc::ptr_eq(&candidate.bundle, &self.identity)
+            || !Arc::ptr_eq(&candidate.config, &self.source.current())
+        {
+            return None;
+        }
+        if candidate.admission && self.namespace_current(&candidate.config).is_err() {
+            return None;
+        }
+        // Copied out of the watch before anything is locked.
+        let readiness = {
+            let lifecycle = self.lifecycle.borrow();
+            if lifecycle.phase != LifecyclePhase::Ready {
+                return None;
+            }
+            lifecycle.ready_permit()?
+        };
+        let mut permits = vec![readiness, candidate.config.permit()];
+        permits.push(self.owner.permit()?);
+        permits.extend(self.backend.authorities_for(&candidate.backend)?);
+        let borrowed: Vec<&control_plane::permit::PermitHolder> = permits.iter().collect();
+        control_plane::permit::PermitHolder::commit_all(&borrowed, effect)
+    }
+
     pub(crate) fn validate(&self, candidate: &Candidate) -> Result<(), RouteError> {
         self.live()?;
         // C is independent of topology's accepted material. Comparing C's

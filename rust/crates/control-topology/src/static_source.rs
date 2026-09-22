@@ -858,31 +858,71 @@ impl BackendSourceHandle {
         snapshot: &BackendSourceSnapshot,
         effect: impl FnOnce() -> T,
     ) -> Option<T> {
-        // Identity first. None of these is revocable, so checking them
-        // outside the commit costs nothing and keeps the critical section
-        // to the part that needs it.
-        if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) || !self.namespace_current() {
-            return None;
-        }
-        let authorities = {
-            // Scoped so the watch borrow is gone before the commit.
-            let current = self.mode.borrow();
-            if !Arc::ptr_eq(&snapshot.epoch, &current) {
-                return None;
-            }
-            let (routing, health) = self.side(&snapshot.epoch);
-            if !health.still_current_for(&snapshot.health, &snapshot.routing, routing) {
-                return None;
-            }
-            let mut permits = vec![
-                snapshot.epoch.gate.permit().holder(),
-                snapshot.routing.source_gate().permit().holder(),
-            ];
-            permits.extend(snapshot.health.authorities()?);
-            permits
-        };
+        let authorities = self.authorities_for(snapshot)?;
         let borrowed: Vec<&PermitHolder> = authorities.iter().collect();
         PermitHolder::commit_all(&borrowed, effect)
+    }
+
+    /// The authorities `snapshot` is current under, or `None` if it is not.
+    ///
+    /// Separate from [`Self::commit_current`] so a caller with authorities
+    /// of its own can take them all in **one** `commit_all`. Committing
+    /// here and then again outside would nest, and neither `commit` nor
+    /// `commit_all` is reentrant -- the inner call would block on a permit
+    /// the outer one already holds.
+    ///
+    /// Every identity condition is checked here and every watch borrow is
+    /// released before returning, so the caller receives permits and no
+    /// guards.
+    #[must_use]
+    pub fn authorities_for(&self, snapshot: &BackendSourceSnapshot) -> Option<Vec<PermitHolder>> {
+        // The handle identity is genuinely not revocable, so it is checked
+        // outside the commit.
+        if !Arc::ptr_eq(&snapshot.bundle, &self.bundle) {
+            return None;
+        }
+        // The namespace is a different matter, and calling it identity was
+        // wrong: for a plain handle it is read from the current
+        // configuration and a publication can retire it. It is bound here
+        // to the configuration snapshot this call captured -- one read,
+        // used for both the check and the permit -- so the namespace
+        // cannot be retired between them.
+        //
+        // Deliberately the per-namespace permit and not the snapshot's:
+        // every publication revokes the snapshot-wide one, which would
+        // refuse an effect on an untouched namespace after any unrelated
+        // change. A retained handle takes neither, keeping its explicit
+        // continuation contract, which does not consult the configuration
+        // at all.
+        let namespace_permit = if self.retained.is_some() {
+            None
+        } else {
+            let config = self.config.current();
+            if !self
+                .origin
+                .same_namespace_incarnation(&config, &self.namespace)
+            {
+                return None;
+            }
+            Some(config.namespace_permit(&self.namespace)?)
+        };
+        // Scoped so the watch borrow is gone before the caller commits.
+        let current = self.mode.borrow();
+        if !Arc::ptr_eq(&snapshot.epoch, &current) {
+            return None;
+        }
+        let (routing, health) = self.side(&snapshot.epoch);
+        if !health.still_current_for(&snapshot.health, &snapshot.routing, routing) {
+            return None;
+        }
+        let mut permits = vec![
+            snapshot.epoch.gate.permit().holder(),
+            snapshot.routing.source_gate().permit().holder(),
+        ];
+        permits.extend(snapshot.health.authorities()?);
+        permits.extend(namespace_permit);
+        drop(current);
+        Some(permits)
     }
 
     #[must_use]

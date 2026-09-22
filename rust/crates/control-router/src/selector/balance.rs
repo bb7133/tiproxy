@@ -81,7 +81,14 @@ impl Router {
                 .evaluate(&inputs, &candidate.policy, queries, now);
             // Go `updateScore` writes the score gauges here: at a real
             // scoring, behind its own per-instance 10s check.
-            state.publish_scores(now, &report);
+            //
+            // Committed under the whole candidate authority, so a
+            // revocation cannot land between the validation above and the
+            // write. The closure touches only the metric stores -- it must
+            // not read the configuration store, whose publisher takes that
+            // lock before the permits.
+            self.sources
+                .commit_valid(candidate, || state.publish_scores(now, &report));
             let diagnostic_pair = report.balance.clone();
             let prepared = (|| {
                 if let Some(pair) = report.balance {

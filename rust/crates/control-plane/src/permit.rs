@@ -108,6 +108,15 @@ impl CommitPermit {
         Some(effect())
     }
 
+    /// Whether both handles name the same authority.
+    ///
+    /// Identity, not equality of state: two permits that happen both to
+    /// be valid are still different authorities.
+    #[must_use]
+    pub fn same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// A holder's view: it can commit and read validity, and cannot revoke.
     ///
     /// Revocation belongs to whoever owns the authority's lifetime. Handing

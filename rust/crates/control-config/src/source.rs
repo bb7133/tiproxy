@@ -211,6 +211,16 @@ pub struct ConfigNamespaceSnapshot {
     effective: Arc<EffectiveConfig>,
     namespaces: Arc<[NamespaceConfig]>,
     namespace_identities: BTreeMap<String, Arc<()>>,
+    /// One authority per namespace, retained on exactly the same rule as
+    /// [`Self::namespace_identities`].
+    ///
+    /// A namespace's currency is revocable and the snapshot-wide permit is
+    /// the wrong instrument for it: every publication revokes that one, so
+    /// binding a namespace check to it would refuse an effect after any
+    /// unrelated configuration change. These survive an unrelated change
+    /// with the namespace and are revoked exactly when the namespace is
+    /// retired or altered.
+    namespace_permits: BTreeMap<String, CommitPermit>,
     resource_incarnation: ResourceIncarnation,
     prepared: PreparedArtifact,
     /// The authority to act on this exact snapshot.
@@ -357,8 +367,44 @@ impl ConfigNamespaceSnapshot {
             {
                 self.namespace_identities
                     .insert(namespace.namespace.clone(), Arc::clone(identity));
+                // The authority travels with the identity: an unchanged
+                // namespace is the same namespace, so an effect admitted
+                // under it is still admissible.
+                if let Some(permit) = previous.namespace_permits.get(&namespace.namespace) {
+                    self.namespace_permits
+                        .insert(namespace.namespace.clone(), permit.clone());
+                }
             }
         }
+    }
+
+    /// Revokes the authority of every namespace this snapshot does not
+    /// carry forward from `previous`.
+    ///
+    /// Called by the publisher immediately before this snapshot becomes
+    /// current, so a namespace that was retired or altered stops
+    /// authorising at the same moment it stops being current. A namespace
+    /// carried forward keeps the very same permit, so it is untouched.
+    fn revoke_retired_namespaces(&self, previous: &Self) {
+        for (name, permit) in &previous.namespace_permits {
+            let carried = self
+                .namespace_permits
+                .get(name)
+                .is_some_and(|kept| kept.same_authority(permit));
+            if !carried {
+                permit.revoke();
+            }
+        }
+    }
+
+    /// The authority to act on one namespace of this snapshot.
+    ///
+    /// `None` for a namespace this snapshot does not carry. Revoked when
+    /// the namespace is retired or altered, and **not** when some
+    /// unrelated part of the configuration changes.
+    #[must_use]
+    pub fn namespace_permit(&self, name: &str) -> Option<PermitHolder> {
+        self.namespace_permits.get(name).map(CommitPermit::holder)
     }
 
     /// Returns the opaque artifact the validator prepared for this generation.
@@ -781,8 +827,10 @@ impl ConfigNamespaceStore {
         candidate.retain_identities(&state.current);
         let candidate = Arc::new(candidate);
         // As in `publish_candidate`: the outgoing snapshot loses its
-        // authority just before it stops being current. A failed
+        // authority just before it stops being current, and only the
+        // namespaces this one does not carry forward lose theirs. A failed
         // `validate_candidate` above returned without reaching here.
+        candidate.revoke_retired_namespaces(&state.current);
         state.current.permit.revoke();
         state.current = Arc::clone(&candidate);
         self.updates.send_replace(Arc::clone(&candidate));
@@ -1238,6 +1286,11 @@ fn publish_candidate(
     // Immediately before the swap, and only here: an unchanged candidate
     // returned above and a rejected one never reached this point, so
     // neither ends the current configuration's authority.
+    //
+    // Namespaces the candidate carries forward keep the very same permit;
+    // only the retired and altered ones lose theirs, so an unrelated
+    // change does not refuse an effect on an untouched namespace.
+    candidate.revoke_retired_namespaces(&state.current);
     state.current.permit.revoke();
     state.current = Arc::clone(&candidate);
     updates.send_replace(Arc::clone(&candidate));
@@ -1281,6 +1334,10 @@ fn build_snapshot(
         namespace_identities: namespaces
             .iter()
             .map(|namespace| (namespace.namespace.clone(), Arc::new(())))
+            .collect(),
+        namespace_permits: namespaces
+            .iter()
+            .map(|namespace| (namespace.namespace.clone(), CommitPermit::new()))
             .collect(),
         namespaces: Arc::from(namespaces),
         prepared,
@@ -1405,6 +1462,103 @@ mod config_permit_tests {
             permit.commit(|| 1),
             Some(1),
             "a rejected candidate leaves the configuration in force"
+        );
+    }
+}
+
+#[cfg(test)]
+mod namespace_permit_tests {
+    use super::{ConfigNamespaceSource, ConfigNamespaceStore, NamespaceConfig, SourceRevision};
+    use std::path::Path;
+
+    const CONFIG: &[u8] = b"[balance]\npolicy=\"connection\"";
+
+    fn namespaces(names: &[&str]) -> Vec<NamespaceConfig> {
+        names
+            .iter()
+            .map(|name| NamespaceConfig {
+                namespace: (*name).to_owned(),
+                ..NamespaceConfig::default()
+            })
+            .collect()
+    }
+
+    fn apply(store: &ConfigNamespaceStore, config: &[u8], names: &[&str], revision: u64) {
+        let scratch = ConfigNamespaceStore::from_toml(config, None, Path::new("/tmp"))
+            .unwrap_or_else(|error| unreachable!("scratch: {error}"));
+        let effective = (**scratch.current().effective()).clone();
+        store
+            .apply(
+                effective,
+                namespaces(names),
+                SourceRevision {
+                    file_revision: revision,
+                    etcd_revision: 0,
+                },
+                Path::new("/tmp"),
+            )
+            .unwrap_or_else(|error| unreachable!("apply: {error}"));
+    }
+
+    fn store(names: &[&str]) -> ConfigNamespaceStore {
+        let store = ConfigNamespaceStore::from_toml(CONFIG, None, Path::new("/tmp"))
+            .unwrap_or_else(|error| unreachable!("fixture config: {error}"));
+        apply(&store, CONFIG, names, 2);
+        store
+    }
+
+    /// Retiring a namespace ends its authority at the moment it stops
+    /// being current -- `CodexM5`'s counterexample, where an effect was
+    /// admitted and then wrote while the namespace had already gone.
+    #[test]
+    fn a_retired_namespace_loses_its_authority() {
+        let store = store(&["alpha", "beta"]);
+        let alpha = store
+            .current()
+            .namespace_permit("alpha")
+            .unwrap_or_else(|| unreachable!("alpha exists"));
+        let beta = store
+            .current()
+            .namespace_permit("beta")
+            .unwrap_or_else(|| unreachable!("beta exists"));
+        assert_eq!(alpha.commit(|| 1), Some(1));
+
+        apply(&store, CONFIG, &["beta"], 3);
+
+        assert_eq!(
+            alpha.commit(|| 1),
+            None,
+            "a retired namespace authorises nothing further"
+        );
+        assert_eq!(
+            beta.commit(|| 1),
+            Some(1),
+            "an untouched namespace keeps the very same authority"
+        );
+    }
+
+    /// An unrelated configuration change must not refuse an effect on a
+    /// namespace it did not touch. This is why the binding is per
+    /// namespace and not to the snapshot-wide permit, which every
+    /// publication revokes.
+    #[test]
+    fn an_unrelated_change_keeps_every_namespace_authority() {
+        let store = store(&["alpha"]);
+        let alpha = store
+            .current()
+            .namespace_permit("alpha")
+            .unwrap_or_else(|| unreachable!("alpha exists"));
+
+        apply(&store, b"[balance]\npolicy=\"resource\"", &["alpha"], 3);
+
+        assert_eq!(
+            alpha.commit(|| 1),
+            Some(1),
+            "the namespace is untouched, so its authority stands"
+        );
+        assert!(
+            store.current().namespace_permit("alpha").is_some(),
+            "and the new snapshot still carries it"
         );
     }
 }
