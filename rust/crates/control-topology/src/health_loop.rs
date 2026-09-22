@@ -692,10 +692,28 @@ pub(crate) async fn run_health_loop<Probe, Fut>(
                             // produces a whole-map verdict over the retained
                             // topology of a failed fetch, and applying it
                             // would rewrite exactly what Go preserves.
+                            //
+                            // Committed under the source's own gate, as the
+                            // dial publication is. `round_authoritative`
+                            // reads liveness and then acts, which leaves the
+                            // revocation free to land in between; taking the
+                            // gate's commit lock around the write closes
+                            // that for `b_status` too. The closure only
+                            // reaches the history's lock -- no await, no
+                            // I/O, and no publisher or watch lock.
+                            //
+                            // Deliberately only the status write. The purge
+                            // and the cycle gauge below are not the source's
+                            // to authorise: Go runs both on every iteration
+                            // including the ones whose backend-list fetch
+                            // failed, and gating them here would filter out
+                            // that behaviour rather than fence a source.
                             if let Some(gauges) = gauges.as_mut()
                                 && source.observer_error().is_none()
                             {
-                                gauges.apply_round(&by_address, Instant::now());
+                                source.source_gate().try_commit(|| {
+                                    gauges.apply_round(&by_address, Instant::now());
+                                });
                             }
                             guard.publisher.publish_observation(
                                 &source,

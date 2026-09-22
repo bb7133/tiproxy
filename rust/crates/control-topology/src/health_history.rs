@@ -129,29 +129,17 @@ impl BackendHealthHistory {
     /// assigned when the dial returns, so this compares completion order, not
     /// the order the observations happened to reach this method.
     ///
-    /// `still_valid` is the caller's source fence, evaluated **while this
-    /// lock is held**. Be precise about what that does and does not buy:
+    /// This method does not fence the source itself. The caller runs it
+    /// inside [`control_external::GenerationGate::try_commit`], which
+    /// excludes revocation for the duration, so a write reaching here was
+    /// made under a generation that is live and stays live until it
+    /// returns. Lock order is therefore gate then history, and nothing
+    /// here may reach back for a publisher or watch lock.
     ///
-    /// It *does* make the check and the write atomic with respect to other
-    /// observations. No competing sample can land between them, so a dial
-    /// admitted by the fence is ordered against exactly the value the fence
-    /// saw.
-    ///
-    /// It does *not* serialise against retirement, which this lock does not
-    /// govern: a source revoked one instruction after the predicate returns
-    /// still lets that dial through. Closing that would mean holding a
-    /// routing-generation lock across a metric write, which puts the
-    /// publisher in the metrics path to buy nothing -- Go has no fence here
-    /// at all and writes unconditionally, so the residual window degrades to
-    /// exactly Go's behaviour. The fence is a best-effort narrowing of a
-    /// stricter-than-Go rule, not a guarantee that no retired source ever
-    /// writes.
-    ///
-    /// The predicate must not acquire a lock that any holder takes before
-    /// this one. The production fence reads the routing publisher's watch
-    /// slot and a generation gate, and nothing on the publishing side ever
-    /// reaches for this history, so that order has no counterpart to invert
-    /// against.
+    /// A value written this way is kept when its generation is later
+    /// revoked. It was a real observation made under a live source, and
+    /// dropping it would replace this family's last-Set and retention
+    /// semantics with "disappears whenever routing re-publishes".
     pub fn observe_dial(&self, address: &str, dial: &SqlDialObservation) {
         let mut state = self.lock();
         let sample = PingSample {
@@ -749,6 +737,36 @@ mod tests {
             "a revoked generation commits nothing"
         );
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.5);
+    }
+
+    /// `b_status` commits under the same gate as the dial, so a revoked
+    /// generation cannot write one either -- and a status already written
+    /// under a live generation stays, as the dial's value does.
+    #[tokio::test]
+    async fn b_status_is_committed_under_its_source_gate() {
+        let gate = control_external::GenerationGate::new();
+        let history = Arc::new(BackendHealthHistory::new());
+        let mut observer = ObserverHealthMetrics::new(Arc::clone(&history));
+        let now = Instant::now();
+
+        let committed = gate.try_commit(|| {
+            observer.apply_round(&round(&[("a:4000", true)]), now);
+        });
+        assert!(committed.is_some(), "a live generation commits");
+        assert!(history.snapshot().status["a:4000"]);
+
+        gate.revoke();
+        assert!(
+            gate.try_commit(|| {
+                observer.apply_round(&round(&[("a:4000", false)]), now);
+            })
+            .is_none(),
+            "a revoked generation writes no status"
+        );
+        assert!(
+            history.snapshot().status["a:4000"],
+            "the value committed under the live generation is kept"
+        );
     }
 
     /// `CodexM5`'s retirement-ordering case, replayed exactly: sequence 7 is
