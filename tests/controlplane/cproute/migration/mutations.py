@@ -53,10 +53,19 @@ def main():
             ("terminal-uses-latest-owner", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [(".get_mut(&redirect.source.sequence)", ".last_entry().map(|entry| entry.into_mut())", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
             ("terminal-ignores-operation-sequence", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("pending.sequence != redirect.sequence", "false", 1)], "redirect_old_same_pair_terminal_cannot_settle_new_operation"),
             ("success-adds-cooldown", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("active.failed_at = None;", "active.failed_at = Some(redirect.issued_at);", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
-            ("failure-cooldown-starts-at-terminal", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("Some(redirect.issued_at)", "Some(_now)", 1)], "redirect_delayed_failure_does_not_restart_issuance_cooldown"),
+            ("failure-cooldown-starts-at-terminal", "ledger.rs", "pub(crate) fn finish_redirect", "fn release_redirect", [("Some(redirect.issued_at)", "Some(now)", 1)], "redirect_delayed_failure_does_not_restart_issuance_cooldown"),
             ("rejected-offer-consumes-sequence", "ledger.rs", "pub(crate) fn admit_redirect", "pub(crate) fn finish_redirect", [("if admitted {\n            self.next_redirect += 1;", "self.next_redirect += 1;\n        if admitted {", 1)], "redirect_rejected_offer_records_cooldown_without_consuming_watermark_or_capacity"),
             ("final-offer-skips-source-validation", "selector.rs", "fn prepare_offer_locked", "pub(crate) fn finish_redirect", [("self.sources.validate(&prepared.candidate)?;", "", 4)], "migration_final_lock_rechecks_config_routing_and_health"),
-            ("offer-releases-lock-before-commit", "selector.rs", "pub(crate) fn offer_redirect", "fn offer_redirect_locked", [("self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected)", unlock_offer, 1)], "migration_immediate_terminal_waits_for_accepted_ledger_commit"),
+            # The helper body is statements, so it can only be spliced where a
+            # statement sequence is legal. The caller assigns the call to a
+            # binding and then publishes from the same guard, so the whole
+            # three-line sequence is replaced: inline the body, then publish
+            # under a freshly taken guard because the inlined body has already
+            # dropped and re-acquired the original one.
+            ("offer-releases-lock-before-commit", "selector.rs", "pub(crate) fn offer_redirect", "fn offer_redirect_locked", [("""let result =
+                self.offer_redirect_locked(&mut state, prepared, sender, now, &mut rejected);
+            self.publish_migrations(state.ledger.drain_migrations());
+            result""", "let result = {" + unlock_offer + "};\n            self.publish_migrations(self.lock().ledger.drain_migrations());\n            result", 1)], "migration_immediate_terminal_waits_for_accepted_ledger_commit"),
             ("connection-factor-uses-physical", "factors.rs", "fn score(", "fn advice_values(", [("connections: input.counts.connection_score(),", "connections: if factor == Factor::Connection { input.counts.active() } else { input.counts.connection_score() },", 1)], "redirect_connection_factor_reads_transferred_score_not_physical_count"),
             ("outgoing-score-zero-pruned", "ledger.rs", "pub(crate) fn prune", "fn account(", [("self.counts(identity) != Some(Accounting::default())", "self.counts(identity).map(Accounting::connection_score) != Some(0)", 1)], "redirect_transfers_score_then_physical_and_failure_returns_only_score"),
         ]

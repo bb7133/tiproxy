@@ -176,6 +176,22 @@
     {
       "parity_id": "MTR-007",
       "reason": "Backend connection counts are process state, not client wire traffic: an immutable MySQL byte trace can neither produce nor observe how many sessions a router incarnation physically owns. Verification is the ledger test that the count follows Go's connList exactly (reservation excluded, source kept until a migration succeeds, closed once), the Go promhttp oracle over native-families.json, and the comparator case pinning the one declared deviation for backend addresses shared between namespaces."
+    },
+    {
+      "parity_id": "MTR-008",
+      "reason": "A health-check cycle duration is observer-loop timing, not client wire traffic: an immutable MySQL byte trace neither drives the probe round nor observes how long it took. Verification is the topology test that the gauge is written on every completed round including one that applied no verdict, plus the Go promhttp oracle over native-families.json. The declared deviation -- the Rust interval spans the probe round alone because discovery is a separate ticker -- is recorded in the parity row itself; it is a difference in what the interval covers, which no corpus trace could express."
+    },
+    {
+      "parity_id": "MTR-009",
+      "reason": "The post-purge pending_migrate offset is an interaction between retention purge and in-flight migrations held in process state, with no MySQL packet representation. Verification is the control-router test that retiring a backend deletes its series without disturbing the ledger, and the Go-side reproduction of the offset rule; Rust reads the true in-flight count from the ledger and carries no offset, which is exactly the declared deviation and therefore not something a shared byte trace could compare."
+    },
+    {
+      "parity_id": "MTR-010",
+      "reason": "server_owner reports which etcd elections this process holds. It is control-plane campaign state with no client wire traffic: a MySQL trace cannot win, hold or retire an election. Verification is the topology test deriving the label from the same key the campaign runs on across all four Go key shapes, the retirement test that the child is deleted rather than zeroed, and the Go oracle exercising a won-then-retired election. The declared gap -- only metric_reader elections exist because Rust has no VIP manager -- is a missing subsystem, not a metric difference."
+    },
+    {
+      "parity_id": "MTR-011",
+      "reason": "This is an internal concurrency invariant, not an exposition property: a metric write made under a routing generation must not land after that generation is revoked. It has no MySQL byte representation at all -- the observable output is identical whether or not the fence exists, and only the interleaving differs. Verification is the CommitPermit ordering tests (both orders, barrier-pinned), the per-step owner/readiness/config/topology receipts, and the real-router regression that holds a scoring round between evaluation and commit while another thread publishes a new configuration."
     }
   ]
 }
