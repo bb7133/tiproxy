@@ -2440,13 +2440,7 @@ pub(crate) mod tests {
             "routing_refresh_failed",
             "health_loop_failed",
         ];
-        let snapshot = |phase| LifecycleSnapshot {
-            phase,
-            owner_id: Arc::from("owner"),
-            owner_generation: 1,
-            config_generation: 1,
-            shutdown_reason: None,
-        };
+        let snapshot = |phase| LifecycleSnapshot::for_phase(phase, Arc::from("owner"), 1, 1, None);
         let fatal = [
             LifecyclePhase::Starting,
             LifecyclePhase::Ready,

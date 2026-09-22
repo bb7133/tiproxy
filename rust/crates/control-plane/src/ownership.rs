@@ -197,18 +197,21 @@ struct LeaseState {
 
 impl LeaseState {
     fn release(&self) {
-        // Two different facts, deliberately not one. `unregistered` decides
-        // who performs the one-time teardown; the permit decides whether
-        // the authority is still good. Deriving the first from the second
-        // meant a holder revoking its own copy of the permit could make
-        // this return early and leave the scope owned by a lease that had
-        // already been dropped.
+        // Revoke first, on **every** call. A release that returned before
+        // revoking would leave the owner current on return -- which is
+        // what a concurrent second release did when this was ordered the
+        // other way round, because the loser of the swap bailed out early.
+        // Revoking is idempotent and excludes any commit in flight.
+        self.active.revoke();
+        // Then decide who performs the one-time teardown. These are two
+        // different facts and neither may be derived from the other:
+        // deriving the teardown from the permit's validity let a holder
+        // that revoked its own copy strand the scope, and deriving the
+        // revocation from the teardown flag leaves the authority live on
+        // a losing thread's return.
         if self.unregistered.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Revoked unconditionally: whether or not someone got here first,
-        // this lease's authority ends now.
-        self.active.revoke();
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -377,6 +380,79 @@ mod owner_permit_tests {
             .unwrap_or_else(|error| {
                 unreachable!("an invalid permit stranded the scope: {error:?}")
             });
+    }
+
+    /// `CodexM5`'s concurrency counterexample, with the detail that makes
+    /// it bite: a commit is **in flight** while two threads release.
+    ///
+    /// The in-flight commit holds the permit's lock, so the thread that
+    /// wins the teardown flag blocks inside `revoke()` waiting for it.
+    /// With the flag checked first, the thread that loses returns straight
+    /// away having revoked nothing -- and a caller that released and then
+    /// asked found the owner still current. Without the in-flight commit
+    /// the winner revokes immediately and the loser almost never observes
+    /// the gap, which is why a plainer two-thread race passes on the
+    /// broken ordering.
+    #[test]
+    fn a_concurrent_release_revokes_before_returning_even_under_an_in_flight_commit() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let registry = OwnershipRegistry::new();
+        let lease = registry
+            .claim(OwnerScope::Process, "owner-1")
+            .unwrap_or_else(|error| unreachable!("claim: {error:?}"));
+        let token = lease.token();
+        let holder = token
+            .permit()
+            .unwrap_or_else(|| unreachable!("a live lease has a permit"));
+        let state = Arc::clone(&lease.state);
+
+        // Released once the commit is demonstrably inside the permit.
+        let committing = Arc::new(Barrier::new(2));
+        let releasing = Arc::new(Barrier::new(3));
+
+        let seen = std::thread::scope(|scope| {
+            {
+                let committing = Arc::clone(&committing);
+                scope.spawn(move || {
+                    holder.commit(|| {
+                        committing.wait();
+                        // Hold the permit while both releases run.
+                        std::thread::sleep(Duration::from_millis(200));
+                    });
+                });
+            }
+            committing.wait();
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    let releasing = Arc::clone(&releasing);
+                    let token = token.clone();
+                    scope.spawn(move || {
+                        releasing.wait();
+                        state.release();
+                        token.is_current()
+                    })
+                })
+                .collect();
+            releasing.wait();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| unreachable!("releasing thread panicked"))
+                })
+                .collect::<Vec<bool>>()
+        });
+
+        assert!(
+            seen.iter().all(|current| !current),
+            "a release returned with the owner still current: {seen:?}"
+        );
+        drop(lease);
     }
 
     /// The owner's authority is now committable, not merely readable: an
