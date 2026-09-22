@@ -345,3 +345,40 @@ async fn module_set_rejects_duplicate_names_and_reports_bounded_results() {
         })
     );
 }
+
+/// Dropping the publisher must end readiness, not merely make the channel
+/// unreadable.
+///
+/// `Sources::live` already fails once the sender is gone, so a consumer
+/// that re-checks is fine. One holding the permit it was handed is not:
+/// it would keep committing under a runtime that no longer exists. An
+/// orderly shutdown revokes on the way out through the phase change; this
+/// covers the drop that never got there.
+#[test]
+fn dropping_the_runtime_revokes_readiness() {
+    let registry = OwnershipRegistry::new();
+    let sink = Arc::new(RecordingSink::default());
+    let runtime = ControlRuntime::claim_process(
+        &registry,
+        "tiproxy-rs-drop",
+        config(1, Vec::new()),
+        sink.clone(),
+    )
+    .unwrap_or_else(|error| unreachable!("runtime claim: {error}"));
+    runtime
+        .mark_ready()
+        .unwrap_or_else(|error| unreachable!("ready: {error}"));
+
+    let snapshot = runtime.handle().lifecycle();
+    let permit = snapshot
+        .ready_permit()
+        .unwrap_or_else(|| unreachable!("Ready carries its authority"));
+    assert_eq!(permit.commit(|| 1), Some(1));
+
+    drop(runtime);
+    assert_eq!(
+        permit.commit(|| 1),
+        None,
+        "a permit outliving its publisher must not still commit"
+    );
+}

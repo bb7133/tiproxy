@@ -579,6 +579,26 @@ pub struct ControlRuntime {
     metrics: Arc<RuntimeMetrics>,
 }
 
+impl Drop for ControlRuntime {
+    /// Ends readiness when the publisher does.
+    ///
+    /// `Sources::live` treats a closed lifecycle channel as loss of
+    /// authority (`lifecycle.has_changed()` fails once the sender is
+    /// gone), so dropping the runtime already strips it -- but the permit
+    /// a consumer is holding would stay valid and keep committing. An
+    /// orderly shutdown revokes it through `set_phase` on the way out;
+    /// this covers the drop that never got there.
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(permit) = state.ready.take() {
+            permit.revoke();
+        }
+    }
+}
+
 impl ControlRuntime {
     /// Claims the unique process owner and installs the initial foundations.
     ///
