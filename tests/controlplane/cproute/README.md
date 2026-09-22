@@ -131,8 +131,11 @@ remain later work. This head does not close #220 or #147.
 
 Evidence layers:
 
-- `ledger/events.tsv`: 17 event rows run through the real Go RouterAdapter and
-  ScoreBasedRouter, compared with Rust's production ledger. Includes pending
+- `ledger/events.tsv`: 17 event rows compared against Rust's production
+  ledger. They were run through the real Go RouterAdapter and ScoreBasedRouter
+  until #223 Phase 2 deleted that adapter; `ledger/expected.tsv` is its final
+  output, frozen and rechecked on every run (same treatment as
+  `balance/arrival.expected.tsv`). Rust must still reproduce it exactly. Includes pending
   retransmission, failure plus retry, duplicate/late results, new sessions and
   both pending/active close. Go bridge IDs cannot be reopened after close; rows
   mint new connections and late results retain their old assignment IDs.
@@ -209,8 +212,8 @@ locality with the exact H; nothing recomputes it from the current config.
 ### Selector assignment locality
 
 `control-router` copies `Local` from the selected backend's exact captured H
-into the reservation, matching Go `RouterAdapter.sendAssignmentLocked` reading
-`backend.Local()`. The actual Go health rule is covered by the shared locality
+into the reservation, matching what Go `RouterAdapter.sendAssignmentLocked`
+read from `backend.Local()` before #223 Phase 2 deleted it. The actual Go health rule is covered by the shared locality
 observation above. A proxy zone is now supported for connection policy; resource
 and location factors remain separately unsupported. Static source routing is
 covered by the namespace source composition below.

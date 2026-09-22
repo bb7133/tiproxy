@@ -32,7 +32,6 @@ import (
 // CP-ADMIN slice 3, both drain bodies). Everything else goes to the
 // RouterAdapter in the legacy composition.
 type CompositeControlHandler struct {
-	adapter                 *RouterAdapter
 	consumer                *MeteringConsumer
 	publisher               *SnapshotPublisher
 	routeOwner              bool
@@ -68,25 +67,10 @@ func (handler *CompositeControlHandler) AttachSnapshotPublisher(publisher *Snaps
 	handler.publisher = publisher
 }
 
-// NewCompositeControlHandler wires the legacy owners together; the
-// consumer's applied sequence becomes the adapter's reconcile
-// acknowledgement. Operator drains are issued inside the Rust process
-// (CP-ADMIN slice 3), so no composition carries a Go drain issuer.
-func NewCompositeControlHandler(
-	adapter *RouterAdapter,
-	consumer *MeteringConsumer,
-) (*CompositeControlHandler, error) {
-	if adapter == nil || consumer == nil {
-		return nil, errors.New("composite control handler requires adapter and consumer")
-	}
-	adapter.AttachMetering(consumer)
-	return &CompositeControlHandler{adapter: adapter, consumer: consumer}, nil
-}
-
 // NewRouteOwnerControlHandler installs the post-cutover residual handler. It
-// deliberately has no RouterAdapter and therefore no Go-side route state,
-// and no drain issuer: `drain_command`/`drain_result` are retired tombstones
-// under RUST_ROUTE_OWNER.
+// has no Go-side route state -- #223 Phase 2 deleted the RouterAdapter that
+// held it -- and no drain issuer: `drain_command`/`drain_result` are retired
+// tombstones under RUST_ROUTE_OWNER.
 func NewRouteOwnerControlHandler(
 	consumer *MeteringConsumer,
 ) (*CompositeControlHandler, error) {
@@ -205,36 +189,22 @@ func (handler *CompositeControlHandler) HandleEnvelope(
 		return nil
 	case *controlpb.ControlEnvelope_DrainCommand, *controlpb.ControlEnvelope_DrainResult:
 		// Operator drains are issued inside the Rust process (CP-ADMIN
-		// slice 3): no Go composition issues or consumes drain bodies. The
-		// route owner rejects them as retired tombstones; the legacy
-		// composition ignores them.
-		if handler.routeOwner {
-			return handler.rejectRetiredRouteBody(ctx, sender, envelope)
-		}
-		return nil
+		// slice 3): no Go composition issues or consumes drain bodies, so
+		// they are retired tombstones like the rest of the route family.
+		return handler.rejectRetiredRouteBody(ctx, sender, envelope)
 	case *controlpb.ControlEnvelope_Error:
-		// Errors keep the transport's generic (ignore) handling via the
-		// adapter; no drain issuance correlates to them any more.
-		if handler.routeOwner {
-			return nil
-		}
-		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+		// Ignored: no drain issuance correlates to them any more.
+		return nil
 	case *controlpb.ControlEnvelope_ReconcileRequest:
 		// `last_drain_command_sequence` is Rust's own gate watermark,
 		// reported for diagnostics only: local drains keep their sequence
 		// lineage inside the Rust process and Go restores nothing.
-		if handler.routeOwner {
-			return handler.handleResidualReconcile(ctx, sender, envelope, body.ReconcileRequest)
-		}
-		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+		return handler.handleResidualReconcile(ctx, sender, envelope, body.ReconcileRequest)
 	default:
-		if handler.routeOwner && isRetiredRouteBody(envelope.GetBody()) {
+		if isRetiredRouteBody(envelope.GetBody()) {
 			return handler.rejectRetiredRouteBody(ctx, sender, envelope)
 		}
-		if handler.routeOwner {
-			return nil
-		}
-		return handler.adapter.HandleEnvelope(ctx, sender, envelope)
+		return nil
 	}
 }
 
@@ -328,14 +298,6 @@ func sendFatalMeteringError(
 			Fatal:              true,
 		}},
 	})
-}
-
-// ResolveOrphans delegates the maintenance cadence to the adapter.
-func (handler *CompositeControlHandler) ResolveOrphans(ctx context.Context) error {
-	if handler.routeOwner {
-		return nil
-	}
-	return handler.adapter.ResolveOrphans(ctx)
 }
 
 // MeteringConsumer owns the Go side of deduplicated cumulative metering

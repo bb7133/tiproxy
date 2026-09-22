@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/pingcap/tiproxy/lib/config"
-	"github.com/pingcap/tiproxy/pkg/balance/router"
 	controlpb "github.com/pingcap/tiproxy/pkg/controlbridge/pb"
 	"github.com/pingcap/tiproxy/pkg/controlbridge/transport"
 	"google.golang.org/protobuf/proto"
@@ -48,25 +47,19 @@ func bridgeTransportConfig(t *testing.T) transport.ServerConfig {
 // the composite handler, runs the orphan cadence, and tears all of it
 // down on context cancellation.
 func TestBridgeOwnsListenerAndCadenceLifecycle(t *testing.T) {
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
-	handler := &recordingHandler{rt: rt}
 	bridge, err := NewBridge(BridgeConfig{
-		Transport:             bridgeTransportConfig(t),
-		Handshake:             handler,
-		RouterLookup:          func(string) (router.Router, error) { return rt, nil },
-		OrphanResolveInterval: 10 * time.Millisecond,
+		Transport:  bridgeTransportConfig(t),
+		RouteOwner: true,
 	})
 	require.NoError(t, err)
-	require.NotNil(t, bridge.Adapter())
 	require.NotNil(t, bridge.Consumer())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- bridge.Run(ctx) }()
 
-	// The cadence runs against an empty orphan set without incident.
+	// The cadence runs without incident.
 	time.Sleep(50 * time.Millisecond)
-	require.Equal(t, 0, bridge.Adapter().OrphanCount())
 
 	cancel()
 	select {
@@ -89,7 +82,6 @@ func TestRouteOwnerBridgeConstructsNoRouterAdapter(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, bridge.Close()) })
-	require.Nil(t, bridge.Adapter())
 	status, ok := bridge.RouteOwnerStatus()
 	require.True(t, ok)
 	require.Zero(t, status.RouterAdapterConstructions)
@@ -102,67 +94,6 @@ func TestRouteOwnerBridgeConstructsNoRouterAdapter(t *testing.T) {
 	require.Zero(t, status.ConnectionMappings)
 	require.Zero(t, status.LegacyRouteViolations)
 	require.Equal(t, emptyRouteStateSHA256, status.RouteStateSHA256)
-}
-
-// Concurrent orphan resolution, sender rotations, and reconciles under
-// -race: the single-critical-section compare-and-delete may only
-// remove the obligation while the carrying sender is still current, so
-// after every interleaving either the orphan is gone AND the final
-// lineage carried (or observed) its close, or the orphan is retained.
-func TestOrphanCompareAndDeleteLinearizesWithRotation(t *testing.T) {
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
-	handler := &recordingHandler{rt: rt}
-	adapter := newTestAdapter(t, handler)
-	capabilities := []uint64{
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_CONNECTIONS),
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_RECONCILE_SESSION_REHYDRATION),
-		uint64(controlpb.ControlCapability_CONTROL_CAPABILITY_PER_CONNECTION_CLOSE),
-	}
-	first := newFakeSender(30, capabilities...)
-	remote := reconciledConnection(85, "tidb-gone:4000", "")
-	require.NoError(t, adapter.HandleEnvelope(context.Background(), first, reconcileRequestEnvelope(99, remote)))
-	require.Equal(t, 1, adapter.OrphanCount())
-
-	// Exhaust the bounded retries so every further cadence attempts
-	// the close+delete path.
-	for attempt := 0; attempt < MaxOrphanResolveAttempts-1; attempt++ {
-		require.NoError(t, adapter.ResolveOrphans(context.Background()))
-	}
-
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	// Rotation storm: new lineages keep taking over.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		epoch := uint64(31)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			adapter.rememberSender(newFakeSender(epoch, capabilities...))
-			epoch++
-		}
-	}()
-	// Resolver storm.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 200; i++ {
-			_ = adapter.ResolveOrphans(context.Background())
-		}
-	}()
-	// Let both run, then stop the rotation and converge.
-	time.Sleep(20 * time.Millisecond)
-	close(stop)
-	wg.Wait()
-	for i := 0; i < 5 && adapter.OrphanCount() > 0; i++ {
-		require.NoError(t, adapter.ResolveOrphans(context.Background()))
-	}
-	require.Equal(t, 0, adapter.OrphanCount(),
-		"with rotations stopped the obligation converges to deletion")
 }
 
 func bridgeFakeRustPeer(t *testing.T, socketPath string) (*net.UnixConn, uint64) {
@@ -213,13 +144,11 @@ func TestBridgeCadenceSurvivesTicksWithoutAPeer(t *testing.T) {
 		ServerVersion:        "test-server",
 	})
 	require.NoError(t, err)
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
 	bridge, err := NewBridge(BridgeConfig{
-		Transport:             bridgeTransportConfig(t),
-		Handshake:             &recordingHandler{rt: rt},
-		OrphanResolveInterval: time.Hour,
-		Publisher:             publisher,
-		SnapshotSyncInterval:  5 * time.Millisecond,
+		Transport:            bridgeTransportConfig(t),
+		RouteOwner:           true,
+		Publisher:            publisher,
+		SnapshotSyncInterval: 5 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -270,13 +199,11 @@ func TestBridgeStreamsTopologyChangesToTheWire(t *testing.T) {
 	require.NoError(t, err)
 
 	transportConfig := bridgeTransportConfig(t)
-	rt := router.NewStaticRouter([]string{"tidb-a:4000"})
 	bridge, err := NewBridge(BridgeConfig{
-		Transport:             transportConfig,
-		Handshake:             &recordingHandler{rt: rt},
-		OrphanResolveInterval: time.Hour,
-		Publisher:             publisher,
-		SnapshotSyncInterval:  20 * time.Millisecond,
+		Transport:            transportConfig,
+		RouteOwner:           true,
+		Publisher:            publisher,
+		SnapshotSyncInterval: 20 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
