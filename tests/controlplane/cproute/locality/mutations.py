@@ -54,8 +54,8 @@ def main():
         original = source.read_text()
         cases = [
             ("disabled-round-marks-local", [
-                ('    if generation.networks.is_none() {\n        let health = source\n            .backends\n            .backends\n            .iter()\n            .map(|backend| {\n                (\n                    Arc::clone(&backend.backend_id),\n                    BackendHealth {\n                        healthy: true,\n                        server_version: None,\n                        local: false,\n                    },',
-                 '    if generation.networks.is_none() {\n        let health = source\n            .backends\n            .backends\n            .iter()\n            .map(|backend| {\n                (\n                    Arc::clone(&backend.backend_id),\n                    BackendHealth {\n                        healthy: true,\n                        server_version: None,\n                        local: true,\n                    },')]),
+                ('    if generation.networks.is_none() {\n        let health = source\n            .backends\n            .backends\n            .iter()\n            .map(|backend| {\n                (\n                    Arc::clone(&backend.backend_id),\n                    BackendHealth {\n                        healthy: true,\n                        server_version: None,\n                        local: false,\n                        sql_dial: None,\n                    },',
+                 '    if generation.networks.is_none() {\n        let health = source\n            .backends\n            .backends\n            .iter()\n            .map(|backend| {\n                (\n                    Arc::clone(&backend.backend_id),\n                    BackendHealth {\n                        healthy: true,\n                        server_version: None,\n                        local: true,\n                        sql_dial: None,\n                    },')]),
             ("empty-zone-compares-as-zone", [
                 ('        None | Some("") => true,', '        None => true,')]),
             ("zone-compare-case-insensitive", [
