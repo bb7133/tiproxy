@@ -51,7 +51,7 @@
     },
     {
       "parity_id": "HS-009",
-      "reason": "Direct backend authentication is a replay/test topology path and remains outside ordinary proxy-session corpus coverage."
+      "reason": "EXCLUDED with the SQL traffic capture/replay subsystem by EXCL-001: the only production caller is replay's synthetic BackendConn, while Rust snapshot validation and server preflight reject traffic_replay_enabled before listeners serve. Ordinary client authentication remains covered by HS-003/004/005/006."
     },
     {
       "parity_id": "HS-010",
