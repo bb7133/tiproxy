@@ -2350,3 +2350,181 @@ async fn review_bscore_real_plane_reset_preserves_cadence() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // Two real paths end to end; splitting would hide the ordering.
+async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle() -> TestResult {
+    for balance in [false, true] {
+        let h = Harness::with_health(
+            "",
+            "resource",
+            &[("127.0.0.1:4000", &[]), ("127.0.0.1:4001", &[])],
+            HealthCheckConfig {
+                enabled: false,
+                interval_nanos: 3_600_000_000_000,
+                ..HealthCheckConfig::default()
+            },
+            "",
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.topology.routing_handle().current().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let mut metrics = h
+            .topology
+            .replay_metric_input(h.runtime.handle().module_context().owner().clone())
+            .await?;
+        let sample = |now: i64, value: &str| {
+            serde_json::json!({
+                "cpu": {"kind":"matrix", "updated_nanos":now, "series":[{
+                    "labels":{"instance":"127.0.0.1:0"}, "samples":[
+                        {"timestamp_ms":now/1_000_000-1000, "value":value},
+                        {"timestamp_ms":now/1_000_000, "value":value}]}]},
+                "memory":null,"failure_pd":null,"total_pd":null,"failure_tikv":null,"total_tikv":null
+            })
+        };
+        let t0 = 1_000_000_000_000_i64;
+        metrics.deliver(sample(t0, "0.4"))?;
+        let scores = Arc::new(crate::ScoreHistory::new());
+        let observations = Arc::new(crate::BackendMetricHistory::new());
+        let resolved = must(crate::ResolvedNamespace::named(
+            h.source.current(),
+            "default",
+        ));
+        let router = Arc::new(must(Router::new_resolved(
+            Arc::new(h.source.clone()),
+            &h.topology,
+            &h.runtime.handle().module_context(),
+            &resolved,
+            16,
+            Some(metrics.handle()),
+            crate::selector::RouterShared {
+                scores: Arc::clone(&scores),
+                backend_metrics: Arc::clone(&observations),
+                input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
+                history: Arc::new(crate::MigrationHistory::default()),
+            },
+        )));
+        let score_round = |router: &Router, candidate: &Candidate| -> Result<(), RouteError> {
+            if balance {
+                router
+                    .prepare_balance(candidate, ClientInfo::default(), "")
+                    .map(|_| ())
+            } else {
+                let session = router.open()?;
+                let reserved = router.reserve_with_ticket(
+                    &session,
+                    candidate,
+                    ClientInfo::default(),
+                    "",
+                    &[],
+                    0,
+                );
+                if let Ok(ref reservation) = reserved {
+                    router.finish(reservation, false);
+                }
+                router.close(&session);
+                reserved.map(|_| ())
+            }
+        };
+        router.set_replay_wall(t0);
+        let first = must(router.capture());
+        assert!(matches!(
+            first.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        must(score_round(&router, &first));
+        let key = ("127.0.0.1:4000".to_owned(), crate::BackendMetric::Cpu);
+        assert_eq!(observations.snapshot().values.get(&key).copied(), Some(0.4));
+        let before = scores.snapshot().scores;
+        assert!(!before.is_empty());
+        assert_eq!(router.review_last_score_metric(), Some(t0));
+
+        let refused_time = t0 + 11_000_000_000;
+        metrics.deliver(sample(refused_time, "0.9"))?;
+        router.set_replay_wall(refused_time);
+        let candidate = must(router.capture());
+        assert!(matches!(
+            candidate.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        let (evaluated, release) = router.review_hold_before_metric_commit();
+        let worker_router = Arc::clone(&router);
+        let worker = std::thread::spawn(move || {
+            if balance {
+                worker_router
+                    .prepare_balance(&candidate, ClientInfo::default(), "")
+                    .map(|_| ())
+            } else {
+                let session = worker_router.open()?;
+                let result = worker_router.reserve_with_ticket(
+                    &session,
+                    &candidate,
+                    ClientInfo::default(),
+                    "",
+                    &[],
+                    0,
+                );
+                if let Ok(ref reservation) = result {
+                    worker_router.finish(reservation, false);
+                }
+                worker_router.close(&session);
+                result.map(|_| ())
+            }
+        });
+        evaluated.recv_timeout(Duration::from_secs(5))?;
+        // Real accepted C publication, after evaluation but before authority acquisition.
+        // It preserves routing and resource inputs; no synthetic permit or fake source.
+        let old = h.source.current().generation();
+        h.patch("[proxy]\nfailover-timeout=61", 3);
+        assert_ne!(h.source.current().generation(), old);
+        release.send(())?;
+        let result = worker.join().map_err(|_| "review worker panicked")?;
+        assert_eq!(result, Err(RouteError::StaleCandidate));
+        println!(
+            "path={} real C revocation: result={result:?}, cpu={:?}, last_score={:?}",
+            if balance { "balance" } else { "route" },
+            observations.snapshot().values.get(&key),
+            router.review_last_score_metric()
+        );
+        assert_eq!(
+            observations.snapshot().values.get(&key).copied(),
+            Some(0.4),
+            "refused evaluated 0.9 must not publish"
+        );
+        assert_eq!(
+            scores.snapshot().scores,
+            before,
+            "refused round must not publish scores"
+        );
+        assert_eq!(
+            router.review_last_score_metric(),
+            Some(t0),
+            "refused round must not advance throttle"
+        );
+
+        let accepted_time = refused_time + 1_000_000;
+        metrics.deliver(sample(accepted_time, "0.2"))?;
+        router.set_replay_wall(accepted_time);
+        let fresh = must(router.capture());
+        assert!(matches!(
+            fresh.metrics,
+            crate::authority::MetricInputs::Dynamic(Some(_))
+        ));
+        must(score_round(&router, &fresh));
+        assert_eq!(observations.snapshot().values.get(&key).copied(), Some(0.2));
+        assert_eq!(
+            router.review_last_score_metric(),
+            Some(accepted_time),
+            "accepted round 1ms later must not inherit refused throttle"
+        );
+        println!(
+            "path={} accepted next round: cpu=0.2, last_score={accepted_time}",
+            if balance { "balance" } else { "route" }
+        );
+    }
+    Ok(())
+}

@@ -204,6 +204,8 @@ impl SchedulerStateSnapshot {
 /// reservations can still settle their original accounting owner.
 pub struct Router {
     #[cfg(test)]
+    review_metric_commit: Mutex<Option<RedirectOfferBarrier>>,
+    #[cfg(test)]
     replay_wall: Mutex<Option<i64>>,
     factors_enabled: bool,
     metrics: Option<control_topology::MetricOverlayHandle>,
@@ -313,6 +315,8 @@ impl Router {
             #[cfg(test)]
             next_metric_use: Mutex::new(None),
             #[cfg(test)]
+            review_metric_commit: Mutex::new(None),
+            #[cfg(test)]
             next_redirect_offer: Mutex::new(None),
             #[cfg(test)]
             next_failover_commit: Mutex::new(None),
@@ -355,6 +359,8 @@ impl Router {
             next_lock: Mutex::new(None),
             #[cfg(test)]
             next_metric_use: Mutex::new(None),
+            #[cfg(test)]
+            review_metric_commit: Mutex::new(None),
             #[cfg(test)]
             next_redirect_offer: Mutex::new(None),
             #[cfg(test)]
@@ -432,6 +438,38 @@ impl Router {
             let _ = signal.send(());
         }
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_hold_before_metric_commit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (signal, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self
+            .review_metric_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((signal, wait));
+        (observed, release)
+    }
+    #[cfg(test)]
+    pub(crate) fn review_before_metric_commit(&self) {
+        if let Some((signal, wait)) = self
+            .review_metric_commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            signal
+                .send(())
+                .unwrap_or_else(|error| unreachable!("review observer gone: {error}"));
+            wait.recv_timeout(std::time::Duration::from_secs(8))
+                .unwrap_or_else(|error| unreachable!("review release timed out: {error}"));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn review_last_score_metric(&self) -> Option<i64> {
+        self.lock().last_score_metric
     }
 
     #[cfg(test)]
@@ -695,6 +733,8 @@ impl Router {
             // describe one scoring round, so one of them landing while
             // the other was refused would expose a round that never
             // happened as one that half did.
+            #[cfg(test)]
+            self.review_before_metric_commit();
             self.sources.commit_valid(candidate, || {
                 factors.core.publish_backend_metrics();
                 state.publish_scores(now, &report);

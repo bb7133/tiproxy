@@ -90,6 +90,8 @@ impl Router {
             //
             // `backend_metric` publishes in the same commit: both families
             // describe this one scoring round.
+            #[cfg(test)]
+            self.review_before_metric_commit();
             self.sources.commit_valid(candidate, || {
                 factors.core.publish_backend_metrics();
                 state.publish_scores(now, &report);
