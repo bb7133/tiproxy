@@ -152,16 +152,8 @@ impl BackendHealthHistory {
     /// slot and a generation gate, and nothing on the publishing side ever
     /// reaches for this history, so that order has no counterpart to invert
     /// against.
-    pub fn observe_dial(
-        &self,
-        address: &str,
-        dial: &SqlDialObservation,
-        still_valid: &dyn Fn() -> bool,
-    ) {
+    pub fn observe_dial(&self, address: &str, dial: &SqlDialObservation) {
         let mut state = self.lock();
-        if !still_valid() {
-            return;
-        }
         let sample = PingSample {
             seconds: dial.duration.as_secs_f64(),
             sequence: dial.sequence,
@@ -636,7 +628,7 @@ mod tests {
     async fn a_dial_is_reported_for_a_backend_with_no_status_series() {
         let (history, mut observer) = observer();
         let now = Instant::now();
-        history.observe_dial("a:4000", &dial(0.5, 1), &|| true);
+        history.observe_dial("a:4000", &dial(0.5, 1));
         observer.apply_round(&round(&[("a:4000", false)]), now);
 
         let snapshot = history.snapshot();
@@ -649,12 +641,12 @@ mod tests {
     #[tokio::test]
     async fn an_older_dial_never_overwrites_a_newer_one() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.2, 7), &|| true);
-        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
+        history.observe_dial("a:4000", &dial(0.2, 7));
+        history.observe_dial("a:4000", &dial(9.0, 3));
 
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.2);
 
-        history.observe_dial("a:4000", &dial(0.4, 8), &|| true);
+        history.observe_dial("a:4000", &dial(0.4, 8));
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.4);
     }
 
@@ -663,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn a_forgotten_backend_can_come_back() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.1, 1), &|| true);
+        history.observe_dial("a:4000", &dial(0.1, 1));
         history.set_status("a:4000", true);
         history.forget_backend("a:4000");
         assert!(history.snapshot().ping.is_empty());
@@ -702,7 +694,7 @@ mod tests {
 
         // The ping family has its own room: a full status map does not
         // refuse a dial.
-        history.observe_dial("overflow:4000", &dial(0.1, 1), &|| true);
+        history.observe_dial("overflow:4000", &dial(0.1, 1));
         assert!(history.snapshot().ping.contains_key("overflow:4000"));
     }
 
@@ -714,19 +706,49 @@ mod tests {
     #[tokio::test]
     async fn the_first_dial_of_a_process_is_admitted() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.5, 0), &|| true);
+        history.observe_dial("a:4000", &dial(0.5, 0));
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.5);
 
         // And a retirement at sequence 0 really does refuse sequence 0,
         // which is what the absent case must not be confused with.
         let retired = BackendHealthHistory::new();
-        retired.observe_dial("b:4000", &dial(0.5, 0), &|| true);
+        retired.observe_dial("b:4000", &dial(0.5, 0));
         retired.forget_backend("b:4000");
-        retired.observe_dial("b:4000", &dial(9.0, 0), &|| true);
+        retired.observe_dial("b:4000", &dial(9.0, 0));
         assert!(
             retired.snapshot().ping.is_empty(),
             "a real watermark of 0 still rejects sequence 0"
         );
+    }
+
+    /// A value committed under a live generation stays after that
+    /// generation is revoked.
+    ///
+    /// The fence refuses *new* writes from a dead source; it does not
+    /// retract old ones. Clearing on revocation would look like tightening
+    /// and would in fact replace `ping_duration_seconds`'s last-Set and
+    /// two-hour retirement semantics with "disappears whenever routing
+    /// re-publishes", which is neither Go's behaviour nor the one already
+    /// reviewed.
+    #[tokio::test]
+    async fn a_committed_value_survives_its_generation_being_revoked() {
+        let gate = control_external::GenerationGate::new();
+        let history = BackendHealthHistory::new();
+
+        let committed = gate.try_commit(|| history.observe_dial("a:4000", &dial(0.5, 1)));
+        assert!(committed.is_some(), "a live generation commits");
+        gate.revoke();
+
+        assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.5);
+        // And a further dial from that dead generation is refused, so the
+        // retained value is the last legitimate one rather than a stale
+        // overwrite.
+        assert!(
+            gate.try_commit(|| history.observe_dial("a:4000", &dial(9.0, 2)))
+                .is_none(),
+            "a revoked generation commits nothing"
+        );
+        assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.5);
     }
 
     /// `CodexM5`'s retirement-ordering case, replayed exactly: sequence 7 is
@@ -738,11 +760,11 @@ mod tests {
     #[tokio::test]
     async fn a_pre_retirement_dial_arriving_late_does_not_resurrect_the_series() {
         let history = BackendHealthHistory::new();
-        history.observe_dial("a:4000", &dial(0.5, 7), &|| true);
+        history.observe_dial("a:4000", &dial(0.5, 7));
         history.forget_backend("a:4000");
         assert!(history.snapshot().ping.is_empty());
 
-        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
+        history.observe_dial("a:4000", &dial(9.0, 3));
         assert!(
             history.snapshot().ping.is_empty(),
             "an observation older than the retirement must not recreate the series"
@@ -750,12 +772,12 @@ mod tests {
 
         // A genuinely new dial still does, and it clears the watermark it no
         // longer needs.
-        history.observe_dial("a:4000", &dial(0.25, 8), &|| true);
+        history.observe_dial("a:4000", &dial(0.25, 8));
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.25);
         assert!(history.snapshot().retired_above.is_empty());
 
         // And the recreated series rejects the stale one on its own again.
-        history.observe_dial("a:4000", &dial(9.0, 3), &|| true);
+        history.observe_dial("a:4000", &dial(9.0, 3));
         assert_seconds(history.snapshot().ping["a:4000"].seconds, 0.25);
     }
 
@@ -765,7 +787,7 @@ mod tests {
     async fn retirement_watermarks_are_bounded_and_counted() {
         let history = BackendHealthHistory::new();
         for index in 0..MAX_RETAINED_BACKENDS {
-            history.observe_dial(&format!("a{index}:4000"), &dial(0.1, 1), &|| true);
+            history.observe_dial(&format!("a{index}:4000"), &dial(0.1, 1));
         }
         assert_eq!(history.snapshot().ping.len(), MAX_RETAINED_BACKENDS);
         for index in 0..MAX_RETAINED_BACKENDS {
@@ -781,7 +803,7 @@ mod tests {
 
         // One more retired address has nowhere of its own to record a
         // watermark, so it folds into the shared floor.
-        history.observe_dial("extra:4000", &dial(0.1, 500), &|| true);
+        history.observe_dial("extra:4000", &dial(0.1, 500));
         history.forget_backend("extra:4000");
         let snapshot = history.snapshot();
         assert_eq!(snapshot.retired_above.len(), MAX_RETAINED_BACKENDS);
@@ -798,14 +820,14 @@ mod tests {
         // The point of the fold: that address's late pre-retirement dial
         // still cannot recreate the series. Counting the shed would document
         // the hole; it would not close it.
-        history.observe_dial("extra:4000", &dial(9.0, 499), &|| true);
+        history.observe_dial("extra:4000", &dial(9.0, 499));
         assert!(
             !history.snapshot().ping.contains_key("extra:4000"),
             "an over-capacity retirement must still reject an older observation"
         );
 
         // A genuinely newer dial is admitted, as for any other address.
-        history.observe_dial("extra:4000", &dial(0.75, 501), &|| true);
+        history.observe_dial("extra:4000", &dial(0.75, 501));
         assert_seconds(history.snapshot().ping["extra:4000"].seconds, 0.75);
     }
 

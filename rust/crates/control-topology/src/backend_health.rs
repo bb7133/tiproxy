@@ -534,18 +534,33 @@ impl ClusterHealthNetwork {
         // freeze point instead, which is where Go calls
         // `setPingBackendMetrics`.
         //
-        // The fence runs inside the history's lock, not before the call: a
-        // stale source may no longer map this address to this cluster, and a
-        // dial's sequence orders observations without authorising them, so a
-        // later dial from a retired source must not overwrite a live one.
-        // Checking out here would leave a window in which the source retires
-        // between the check and the write.
+        // Lock order is gate then history, and the two checks are in that
+        // order for a reason.
+        //
+        // The identity check comes first and is the cheap one: a stale
+        // source may no longer map this address to this cluster, and a
+        // dial's sequence orders observations without authorising them, so
+        // a later dial from a retired source must not overwrite a live one.
+        //
+        // The write then happens inside the gate's commit lock, which
+        // revocation also takes. That is what makes the fence a guarantee
+        // rather than a narrowing: a revocation ordered first refuses this
+        // write, and one ordered second waits for it to finish. Checking
+        // liveness and then writing outside such a lock would leave the
+        // flip free to land between them.
+        //
+        // The closure is short and synchronous, and reaches for nothing but
+        // the history's own lock -- no await, no I/O, and in particular no
+        // publisher or watch lock, which revocation paths already hold.
         let publish_dial = |dial: &SqlDialObservation| {
             let Some(history) = self.health_history.as_ref() else {
                 return;
             };
-            history.observe_dial(&backend.backend.addr, dial, &|| {
-                handle.still_current(source)
+            if !handle.still_current(source) {
+                return;
+            }
+            source.source_gate().try_commit(|| {
+                history.observe_dial(&backend.backend.addr, dial);
             });
         };
         loop {

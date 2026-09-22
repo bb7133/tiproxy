@@ -726,15 +726,17 @@ fn backend_metric_publishes_accepted_values_labelled_by_address() {
         "the opaque routing id must never reach a metric label: {:?}",
         published.keys().collect::<Vec<_>>()
     );
+    // Exact expectations, not merely "different from the latest sample":
+    // [0.2, 0.6] averages to 0.4 and [0.3, 0.7] to 0.5, so a wrong
+    // aggregation that still differs from the last sample is caught too.
     let first = published[&("10.0.0.8:4000".to_owned(), BackendMetric::Cpu)];
-    assert!(
-        (first - 0.6).abs() > 1e-9,
-        "cpu must be calcAvgUsage's average, not the latest sample ({first})"
-    );
-    // And the two backends are not conflated onto one value.
     let second = published[&("10.0.0.9:4000".to_owned(), BackendMetric::Cpu)];
     assert!(
-        (first - second).abs() > 1e-9,
-        "each backend publishes its own samples ({first} vs {second})"
+        (first - 0.4).abs() < 1e-9,
+        "cpu is calcAvgUsage's average of [0.2, 0.6]; got {first}"
+    );
+    assert!(
+        (second - 0.5).abs() < 1e-9,
+        "cpu is calcAvgUsage's average of [0.3, 0.7]; got {second}"
     );
 }
