@@ -1,0 +1,17 @@
+reserve	1	0
+repeat-reserve	1	0
+commit	1	1
+repeat-commit	1	1
+failed-after-commit	1	1
+close-active	0	0
+repeat-close	0	0
+success-after-close	0	0
+new-session	1	0
+old-session-success	1	0
+failed-attempt-retries	1	0
+failed-old-attempt	1	0
+commit-retry	1	1
+close-retry	0	0
+reserve-before-close	1	0
+close-pending	0	0
+success-after-pending-close	0	0
