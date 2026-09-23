@@ -2,6 +2,15 @@ name: Rust
 
 on:
   pull_request:
+    # `labeled` is not in the default set (opened/synchronize/reopened), so
+    # without it, adding `ci-full` to an open pull request would change
+    # nothing until the next push. The core jobs below skip label-only
+    # events unless that label is `ci-full`, so an unrelated label is free.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
     paths:
       - ".github/workflows/rust.yml"
       - "AGENTS.md"
@@ -55,7 +64,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-${{ github.workflow }}-${{ github.ref }}
+  # Pull requests cancel their own superseded runs. Everything else -- pushes
+  # to main, the nightly schedule, manual dispatch -- gets a group of its own,
+  # so consecutive merges cannot cancel each other's evidence run. That is
+  # what keeps a regression bisectable to a single commit; sharing
+  # `github.ref` across every main push would silently defeat it.
+  group: rust-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -66,6 +80,7 @@ env:
 jobs:
   quality:
     name: Format, lint, and test
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-24.04
     # Formatting, Clippy, unit/doc tests, the generated-source check and the
     # Go control-bridge race test. The live-etcd and Go-oracle evidence steps
@@ -836,6 +851,7 @@ jobs:
 
   supply-chain:
     name: Audit dependencies and policy
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -863,6 +879,7 @@ jobs:
 
   release:
     name: Release (${{ matrix.arch }})
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     strategy:
       fail-fast: false
       matrix:
