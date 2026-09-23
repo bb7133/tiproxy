@@ -614,6 +614,57 @@ fn parity_ps_005_reset_connection_clears_every_guard() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+/// PARITY-CMD-026's ERR branch, and PARITY-CMD-025's no-response branch.
+///
+/// The Go corpus `stmt-reset` trace carries an OK, so replaying it shows the
+/// success path only. The row also says the pending state clears *only* when
+/// the response completes the statement -- i.e. an ERR must leave the guard
+/// alone -- and there is no corpus trace for a reset that fails.
+///
+/// What makes the ERR branch correct is where the mutation sits: `StmtReset`
+/// declares `Reset` in `after_success`, which the session applies only on a
+/// successful completion, while `StmtClose` declares `Close` in
+/// `after_forward` because it never gets a response at all. Nothing asserted
+/// either placement, so moving `Reset` to `after_forward` would clear the
+/// guard on an ERR and every existing test would still pass.
+#[test]
+fn parity_cmd_025_026_declare_their_mutations_at_the_right_boundary() -> Result<(), Box<dyn Error>>
+{
+    let records = load_trace("stmt-reset")?;
+    let payload = only_client_payload(&records[0])?;
+    let plan = dispatch(CommandPacket::decode(&payload)?)?;
+    assert_eq!(plan.command, Command::StmtReset);
+    let statement_id =
+        PreparedRegistry::statement_id(&payload, CommandCode::from_byte(plan.command.as_byte()))?;
+    assert_eq!(
+        plan.after_forward.prepared, None,
+        "PARITY-CMD-026: a reset that fails must not clear the guard, so the \
+         mutation cannot be declared at forward time"
+    );
+    assert_eq!(
+        plan.after_success.prepared,
+        Some(PreparedMutation::Reset(statement_id)),
+        "PARITY-CMD-026"
+    );
+
+    let records = load_trace("stmt-close")?;
+    let payload = only_client_payload(&records[0])?;
+    let plan = dispatch(CommandPacket::decode(&payload)?)?;
+    assert_eq!(plan.command, Command::StmtClose);
+    let statement_id =
+        PreparedRegistry::statement_id(&payload, CommandCode::from_byte(plan.command.as_byte()))?;
+    assert_eq!(
+        plan.after_success.prepared, None,
+        "PARITY-CMD-025: close has no response to succeed at"
+    );
+    assert_eq!(
+        plan.after_forward.prepared,
+        Some(PreparedMutation::Close(statement_id)),
+        "PARITY-CMD-025"
+    );
+    Ok(())
+}
+
 #[test]
 fn corpus_manifest_links_every_ses_05_parity_item() -> Result<(), Box<dyn Error>> {
     let manifest = read_to_string(corpus_root().join("manifest.json"))?;
