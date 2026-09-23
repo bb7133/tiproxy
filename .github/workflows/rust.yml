@@ -2,6 +2,15 @@ name: Rust
 
 on:
   pull_request:
+    # `labeled` is not in the default set (opened/synchronize/reopened), so
+    # without it, adding `ci-full` to an open pull request would change
+    # nothing until the next push. The core jobs below skip label-only
+    # events unless that label is `ci-full`, so an unrelated label is free.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
     paths:
       - ".github/workflows/rust.yml"
       - "AGENTS.md"
@@ -41,12 +50,26 @@ on:
       - "rust/**"
       - "scripts/generate-control-proto.sh"
       - "tests/controlplane/**"
+  # The control-plane evidence jobs below do not run on pull requests. They
+  # re-prove live etcd / Go-oracle behaviour that a pull request rarely
+  # changes, and re-running them on every push to a branch was the bulk of
+  # the cost. They still run on every merge to main -- so a regression is
+  # still bisectable to a single commit, not to a day -- plus nightly, on
+  # demand, and on any pull request explicitly labelled `ci-full`.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: rust-${{ github.workflow }}-${{ github.ref }}
+  # Pull requests cancel their own superseded runs. Everything else -- pushes
+  # to main, the nightly schedule, manual dispatch -- gets a group of its own,
+  # so consecutive merges cannot cancel each other's evidence run. That is
+  # what keeps a regression bisectable to a single commit; sharing
+  # `github.ref` across every main push would silently defeat it.
+  group: rust-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -57,11 +80,13 @@ env:
 jobs:
   quality:
     name: Format, lint, and test
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-24.04
-    # The complete existing mutation matrix already took nearly 38 minutes.
-    # Its topology-dependent builds now include the collector; leave headroom
-    # for those builds while keeping every older gate and the separate C job.
-    timeout-minutes: 60
+    # Formatting, Clippy, unit/doc tests, the generated-source check and the
+    # Go control-bridge race test. The live-etcd and Go-oracle evidence steps
+    # that used to sit here now live in `controlplane-evidence`, which does
+    # not run on pull requests.
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +119,48 @@ jobs:
         run: make control-proto-generate-check
       - name: Run Go control bridge tests
         run: go test -race ./pkg/controlbridge/...
+      - name: Check formatting and Clippy
+        run: make rust-lint
+      - name: Run unit tests
+        run: make rust-test
+      - name: Run doc tests
+        run: make rust-doc-test
+      - name: Reject a stale lockfile
+        run: cargo check --locked --workspace --manifest-path rust/Cargo.toml
+
+  controlplane-evidence:
+    name: Control-plane live and Go-oracle evidence
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Select repository Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            bin/control-codegen
+            bin/control-codegen-rust
+            rust/target
+          key: rust-evidence-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('rust/Cargo.lock') }}
       - name: Run CP-002 live external dependency evidence
         run: make controlplane-cp002-evidence
       - name: Run CP-ETCD live lease and election evidence
@@ -118,17 +185,10 @@ jobs:
         run: make controlplane-cpctl-evidence
       - name: Run CP-METER durable ingestion and state handoff evidence
         run: make controlplane-cpmeter-evidence
-      - name: Check formatting and Clippy
-        run: make rust-lint
-      - name: Run unit tests
-        run: make rust-test
-      - name: Run doc tests
-        run: make rust-doc-test
-      - name: Reject a stale lockfile
-        run: cargo check --locked --workspace --manifest-path rust/Cargo.toml
 
   applied-metrics:
     name: Applied metrics material and transport evidence
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Keep the existing CP-ROUTE/CP-METRICS gates intact and give the new
     # isolated real-etcd mutation build its own bounded execution budget.
@@ -166,6 +226,7 @@ jobs:
 
   collector-metrics:
     name: Metrics collector and mixed owner evidence
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Run the complete collector evidence independently of the older quality job.
     # Each compiling mutant gets owned real etcd and an actual Go reader peer.
@@ -203,6 +264,7 @@ jobs:
 
   factor-metrics:
     name: Resource factor and producer evidence
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Actual Go factors, real collector/ledger composition and compiling mutations.
     timeout-minutes: 30
@@ -239,6 +301,7 @@ jobs:
 
   resource-routing:
     name: Composed Resource and Location routing
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Actual Go Group.Route, policy/query lifetimes, source windows and reservations.
     timeout-minutes: 30
@@ -275,6 +338,7 @@ jobs:
 
   migration-ledger:
     name: Migration ledger, factor pairs and physical order
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Actual Go Group.Balance lifecycle, final admission lock and exact terminals.
     timeout-minutes: 30
@@ -313,6 +377,7 @@ jobs:
 
   migration-worker:
     name: Migration worker timing, closure and ownership
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Separate budget: shared Go clocks, real producer retirement and compiling faults.
     timeout-minutes: 30
@@ -349,6 +414,7 @@ jobs:
 
   routing-api:
     name: Router API differential adapter smoke
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -670,6 +736,7 @@ jobs:
 
   routing-shadow:
     name: Read-only routing observation ledger and framing
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Separate budget: real Go lifecycle, strict framing and compiling faults.
     timeout-minutes: 30
@@ -706,6 +773,7 @@ jobs:
 
   routing-recorder:
     name: Actual routing capture, UDS consumer and sustained lifecycle
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Separate budget: recorder faults, real UDS and fixed 60s workloads.
     timeout-minutes: 30
@@ -746,6 +814,7 @@ jobs:
 
   routing-native:
     name: Native factor read windows, comparison and sustained coverage
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-24.04
     # Eighteen unchanged 60s policy windows plus native oracle and faults.
     timeout-minutes: 45
@@ -782,6 +851,7 @@ jobs:
 
   supply-chain:
     name: Audit dependencies and policy
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -809,6 +879,7 @@ jobs:
 
   release:
     name: Release (${{ matrix.arch }})
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-full'
     strategy:
       fail-fast: false
       matrix:
