@@ -575,6 +575,40 @@ fn parity_cmd_024_025_026_028_state_effects_match_go_corpus() -> Result<(), Box<
     Ok(())
 }
 
+/// The `COM_RESET_CONNECTION` half of PARITY-PS-005.
+///
+/// The `COM_CHANGE_USER` half is
+/// `prepared_lifecycle::change_user_clears_all_only_after_relay_success`.
+/// The reset-connection corpus trace was replayed only for dispatch, by
+/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, which says nothing
+/// about prepared state -- so the guard-clearing clause had no Rust evidence
+/// on this path at all.
+#[test]
+fn parity_ps_005_reset_connection_clears_every_guard() -> Result<(), Box<dyn Error>> {
+    let mut registry = lifecycle_registry();
+    drive_trace("stmt-long-data", &mut registry)?;
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::LongDataPending),
+        "precondition: statement 7 is blocked before the reset"
+    );
+    assert!(registry.has_pending());
+
+    assert_eq!(
+        drive_trace("reset-connection", &mut registry)?,
+        Command::ResetConnection
+    );
+
+    // Nothing survives the successful reset: no statement is left holding a
+    // guard, and the blocked statement 7 in particular is gone rather than
+    // merely idle.
+    assert!(!registry.has_pending(), "PARITY-PS-005");
+    assert!(registry.get(7).is_none(), "PARITY-PS-005");
+    assert!(registry.get(8).is_none(), "PARITY-PS-005");
+    assert!(registry.is_empty(), "PARITY-PS-005");
+    Ok(())
+}
+
 #[test]
 fn corpus_manifest_links_every_ses_05_parity_item() -> Result<(), Box<dyn Error>> {
     let manifest = read_to_string(corpus_root().join("manifest.json"))?;
