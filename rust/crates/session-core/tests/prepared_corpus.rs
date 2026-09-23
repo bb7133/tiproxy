@@ -369,6 +369,16 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
         ],
         "PARITY-PS-001/PS-002/PS-003 per-statement guard sequence"
     );
+    // Restores an assertion the pre-extraction version of this test had: the
+    // FSM's own `prepared_pending` flag, which is a different value from the
+    // registry aggregate and only follows it because the replay feeds
+    // `registry.session_event()` in. Asserting the registry sequence alone
+    // would not notice the flag falling out of sync.
+    assert_eq!(
+        replay.fsm_pending_after_command, replay.pending_after_command,
+        "the FSM flag must track the registry aggregate at every step"
+    );
+    assert_eq!(replay.fsm_pending_after_command.last(), Some(&false));
     assert_eq!(
         registry.get(7).map(PreparedStatementState::guard),
         Some(PreparedGuard::Idle)
@@ -383,6 +393,11 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
 struct Replay {
     commands: Vec<Command>,
     pending_after_command: Vec<bool>,
+    /// The FSM's own `prepared_pending` flag, which is a separate value from
+    /// `PreparedRegistry::has_pending()` and only tracks it because the replay
+    /// feeds `registry.session_event()` into the FSM. Recorded so a desync
+    /// between the two is visible.
+    fsm_pending_after_command: Vec<bool>,
     guards_after_command: Vec<(Option<PreparedGuard>, Option<PreparedGuard>)>,
 }
 
@@ -398,6 +413,7 @@ fn replay_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Replay
     let mut replay = Replay {
         commands: Vec::new(),
         pending_after_command: Vec::new(),
+        fsm_pending_after_command: Vec::new(),
         guards_after_command: Vec::new(),
     };
     for record in &records {
@@ -427,6 +443,9 @@ fn replay_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Replay
                 if plan.response == ExpectedResponse::None {
                     fsm.on_event(SessionEvent::NoResponseCommandComplete)?;
                     replay.pending_after_command.push(registry.has_pending());
+                    replay
+                        .fsm_pending_after_command
+                        .push(fsm.flags().prepared_pending);
                     replay.guards_after_command.push(guards(registry));
                 } else {
                     awaiting = Some((
@@ -460,6 +479,9 @@ fn replay_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Replay
                 }
                 assert_eq!(fsm.state(), SessionState::Ready, "{case_id}");
                 replay.pending_after_command.push(registry.has_pending());
+                replay
+                    .fsm_pending_after_command
+                    .push(fsm.flags().prepared_pending);
                 replay.guards_after_command.push(guards(registry));
             }
             other => {
