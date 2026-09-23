@@ -93,10 +93,20 @@ stop_owned_process() {
 	# out which owned process it was meant downloading the CI artifact.
 	process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
 	local children
-	# Report the most recent verified command line, not the one read before
-	# SIGINT, so the diagnostic describes the process that was actually
-	# signalled twice.
-	command_line=$(ps -p "$pid" -o command= 2>/dev/null || echo "$command_line")
+	local latest_command
+	# Refresh the command line only while it still proves ownership. An
+	# unverified re-read could print a bystander's full command line — the
+	# PID may have been reused after the process exited during the TERM
+	# wait — into a public CI log, labelled as the process we signalled.
+	# Anything else keeps the pre-TERM verified value and says so.
+	latest_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ -z $latest_command ]]; then
+		command_line="$command_line (exited after the last verified read)"
+	elif [[ $latest_command == *"$expected"* ]]; then
+		command_line=$latest_command
+	else
+		command_line="$command_line (PID identity changed after the last verified read)"
+	fi
 	# GNU ps; absent on macOS, where this block is only read by a developer
 	# reproducing locally, so print the line only when there is something.
 	children=$(ps --ppid "$pid" -o pid=,state=,command= 2>/dev/null || true)
