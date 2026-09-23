@@ -8992,6 +8992,7 @@ struct ConcurrentFakeBackend {
     port: u16,
     accepted: Arc<AtomicU64>,
     proxy_headers: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: watch::Sender<bool>,
     listener_task: tokio::task::JoinHandle<()>,
 }
 
@@ -9005,14 +9006,18 @@ impl ConcurrentFakeBackend {
             .unwrap_or_default()
     }
 
-    /// Cancels the listener and every connection handler it owns, then waits
-    /// for the listener task to actually finish.
+    /// Stops accepting and waits until every connection handler has actually
+    /// finished.
     ///
-    /// The handlers live in a `JoinSet` owned by the listener task, so
-    /// aborting the listener drops that set and cancels its children with it —
-    /// nothing is left running that the fixture cannot name.
+    /// The listener is asked to stop rather than aborted from outside, because
+    /// dropping a `JoinSet` only calls `abort()` on its children and does not
+    /// wait for them — the cancellations would still be in flight, with the
+    /// handles gone. Instead the listener leaves its loop, runs
+    /// `JoinSet::shutdown().await` (abort *and* join every child), and only
+    /// then returns; awaiting the listener here therefore means the whole tree
+    /// is finished.
     async fn shutdown(self) {
-        self.listener_task.abort();
+        let _ = self.stop.send(true);
         let _ = self.listener_task.await;
     }
 }
@@ -9031,12 +9036,27 @@ async fn spawn_concurrent_fake_backend(modes: Vec<BackendMode>) -> ConcurrentFak
     let proxy_headers = Arc::new(Mutex::new(Vec::new()));
     let server_accepted = Arc::clone(&accepted);
     let server_headers = Arc::clone(&proxy_headers);
+    let (stop, mut stop_rx) = watch::channel(false);
     let listener_task = tokio::spawn(async move {
-        // Owning the handlers here is what makes `shutdown()` deterministic:
-        // the set is dropped with this task, cancelling every child.
+        // The handlers are owned here and drained here: `shutdown()` below is
+        // the only thing that ends this loop, so the set is never merely
+        // dropped.
         let mut handlers = tokio::task::JoinSet::new();
         let mut index = 0_usize;
-        while let Ok((stream, _)) = listener.accept().await {
+        loop {
+            let accepted_connection = tokio::select! {
+                biased;
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let Ok((stream, _)) = accepted_connection else {
+                break;
+            };
             let mode = modes[index.min(modes.len() - 1)];
             index += 1;
             server_accepted.fetch_add(1, Ordering::Relaxed);
@@ -9088,11 +9108,14 @@ async fn spawn_concurrent_fake_backend(modes: Vec<BackendMode>) -> ConcurrentFak
                 .await;
             });
         }
+        // Abort every handler AND wait for it, which `Drop` alone does not do.
+        handlers.shutdown().await;
     });
     ConcurrentFakeBackend {
         port: address.port(),
         accepted,
         proxy_headers,
+        stop,
         listener_task,
     }
 }
