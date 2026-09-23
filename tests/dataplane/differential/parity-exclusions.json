@@ -47,11 +47,11 @@
     },
     {
       "parity_id": "HS-007",
-      "reason": "Handshake retry classification depends on the routing hook and distinct backend candidates, not a single byte stream."
+      "reason": "EXCLUDED by the RUST_ROUTE_OWNER production boundary: Rust mode rejects custom Go HandshakeHandler implementations before listeners open, while the supported default handler never approves RECONNECT. The pure relay reference transition remains unit-tested; initial dial retry and candidate retirement are covered by ADM-003."
     },
     {
       "parity_id": "HS-009",
-      "reason": "Direct backend authentication is a replay/test topology path and remains outside ordinary proxy-session corpus coverage."
+      "reason": "EXCLUDED with the SQL traffic capture/replay subsystem by EXCL-001: the only production caller is replay's synthetic BackendConn, while Rust snapshot validation and server preflight reject traffic_replay_enabled before listeners serve. Ordinary client authentication remains covered by HS-003/004/005/006."
     },
     {
       "parity_id": "HS-010",
