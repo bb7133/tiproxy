@@ -144,6 +144,11 @@ async fn routing_endpoint_separates_bind_and_peer_identity() -> Result<(), TestE
     )
     .await?;
     assert_eq!(collector.local_addr().ip().to_string(), "127.0.0.1");
+    assert_ne!(
+        collector.local_addr().port(),
+        0,
+        "port zero must bind an OS-assigned port"
+    );
     assert_eq!(
         collector.advertised_addr(),
         format!("metric-peer.internal:{}", collector.local_addr().port())
