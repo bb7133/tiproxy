@@ -1886,6 +1886,7 @@ async fn spawn_metered_stack(registry: MeteringSourceRegistry) -> Stack {
         None,
         Duration::from_millis(400),
         Some(registry),
+        None,
     )
     .await
 }
@@ -1957,11 +1958,12 @@ async fn spawn_stack_configured(
         tls_config,
         drain_deadline,
         None,
+        None,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn spawn_stack_configured_with_metering(
     snapshot_reply: SnapshotReply,
     proxy_v2: bool,
@@ -1972,6 +1974,7 @@ async fn spawn_stack_configured_with_metering(
     tls_config: Option<Arc<ServerConfig>>,
     drain_deadline: Duration,
     metering: Option<MeteringSourceRegistry>,
+    route_plane: Option<control_router::RoutePlaneHandle>,
 ) -> Stack {
     let backend =
         spawn_configured_fake_backend(snapshot_reply, proxy_v2, send_idle_byte, tls_config.clone())
@@ -2032,6 +2035,12 @@ async fn spawn_stack_configured_with_metering(
     .with_metrics(metrics);
     let owner = match metering {
         Some(registry) => owner.with_metering(registry),
+        None => owner,
+    };
+    // Production attaches the process-local route plane here; without it the
+    // engine falls back to the compatibility bridge acquisition path.
+    let owner = match route_plane {
+        Some(handle) => owner.with_route_plane(handle),
         None => owner,
     };
     let owner: Arc<dyn BoundSessionHandler> = Arc::new(owner);
@@ -8709,4 +8718,619 @@ async fn oversized_command_streams_to_the_backend_without_being_materialized() {
     assert!(client.query_ok("SELECT 1").await, "session stays usable");
     client.quit().await;
     stack.dispatch_task.abort();
+}
+
+/// A topology client factory for a zero-cluster config: it is asked for the
+/// clusters of each published generation, and with `pd-addrs = ""` there are
+/// none, so it never produces an etcd client and nothing ever dials one.
+struct NoClusterFactory;
+
+impl control_topology::TopologyClientFactory for NoClusterFactory {
+    fn build(
+        &self,
+        snapshot: &control_config::ConfigNamespaceSnapshot,
+    ) -> Result<Vec<control_topology::TopologyClusterClient>, String> {
+        let topology = snapshot.topology().map_err(|error| format!("{error:?}"))?;
+        assert!(
+            topology.backend_clusters.is_empty(),
+            "the local-route fixture is zero-cluster by construction"
+        );
+        Ok(Vec::new())
+    }
+}
+
+/// Discards runtime events; the fixture asserts on behaviour, not on logs.
+struct SilentSink;
+
+impl control_plane::EventSink for SilentSink {
+    fn record(&self, _event: &control_plane::RuntimeEvent) {}
+}
+
+/// The process-local control plane a production session owner consults:
+/// a config source with one static namespace, a topology module over it, and
+/// a running route plane.
+///
+/// This is what `spawn_stack*` has never had. Those build their owner without
+/// `.with_route_plane(...)`, so every one of them runs the compatibility
+/// `BindingRouteChannel` instead — which is why they cannot admit a second
+/// session. Here admission resolves the way production resolves it.
+struct LocalRoutePlane {
+    handle: control_router::RoutePlaneHandle,
+    _runtime: control_plane::ControlRuntime,
+    topology_task: tokio::task::JoinHandle<Result<(), control_plane::ModuleError>>,
+    plane_task: tokio::task::JoinHandle<Result<(), control_plane::ModuleError>>,
+}
+
+impl LocalRoutePlane {
+    /// Stops both module tasks and waits for them, so a leaked task is never
+    /// mistaken for a product defect and the runtime is released before the
+    /// test returns.
+    async fn shutdown(self) {
+        self.topology_task.abort();
+        self.plane_task.abort();
+        let _ = self.topology_task.await;
+        let _ = self.plane_task.await;
+    }
+}
+
+/// Builds the plane for a namespace whose only backend is `backend_port`,
+/// pinned statically so no discovery, health probe or etcd connection runs.
+async fn spawn_local_route_plane(user: &str, backend_port: u16) -> LocalRoutePlane {
+    use control_config::HealthCheckConfig;
+    use control_config::{ConfigNamespaceStore, TopologyRuntimeIdentity};
+    use control_plane::ControlModule;
+    use control_plane::{ControlConfig, ControlRuntime, LogLevel, MetricsPolicy, TlsPolicy};
+    use control_topology::{StaticAdvertiseResolver, TopologyModule};
+
+    // An empty `pd-addrs` yields zero backend clusters, so discovery has
+    // nothing to connect to and the factory above returns no clients.
+    // `EffectiveConfig`'s fields are private but it derives `Deserialize`,
+    // so serde is the supported way to build one that differs from default.
+    let Ok(effective) =
+        serde_json::from_str::<control_config::EffectiveConfig>(r#"{"proxy":{"pd-addrs":""}}"#)
+    else {
+        unreachable!("zero-cluster effective config")
+    };
+    let namespace_json = format!(
+        r#"{{"namespace":"default","frontend":{{"user":"{user}"}},"backend":{{"instances":["127.0.0.1:{backend_port}"]}}}}"#
+    );
+    let Ok(namespace) =
+        control_config::source::decode_namespace("default", namespace_json.as_bytes())
+    else {
+        unreachable!("static namespace decodes")
+    };
+    let Ok(store) = ConfigNamespaceStore::new(
+        effective,
+        vec![namespace],
+        control_config::SourceRevision::default(),
+        &std::env::current_dir().unwrap_or_default(),
+    ) else {
+        unreachable!("namespace store")
+    };
+
+    let registry = control_plane::OwnershipRegistry::new();
+    let Ok(control_config) = ControlConfig::new(
+        1,
+        Duration::from_secs(30),
+        0,
+        TlsPolicy::default(),
+        LogLevel::Info,
+        MetricsPolicy::default(),
+    ) else {
+        unreachable!("control config")
+    };
+    let Ok(runtime) = ControlRuntime::claim_process(
+        &registry,
+        "dataplane-local-route-fixture",
+        control_config,
+        Arc::new(SilentSink),
+    ) else {
+        unreachable!("claim process")
+    };
+
+    let source: Arc<dyn control_config::ConfigNamespaceSource> = Arc::new(store);
+    let Ok((topology_module, mut topology_handle)) = TopologyModule::new(
+        Arc::clone(&source),
+        Box::new(NoClusterFactory),
+        Arc::new(StaticAdvertiseResolver::new("127.0.0.1")),
+        TopologyRuntimeIdentity {
+            version: Arc::from("v-test"),
+            git_hash: Arc::from("hash-test"),
+            deploy_path: std::path::PathBuf::from("/deploy/test"),
+            start_timestamp: 1_700_000_000,
+        },
+        HealthCheckConfig {
+            enabled: false,
+            ..HealthCheckConfig::default()
+        },
+    ) else {
+        unreachable!("topology module")
+    };
+
+    let (route_plane, mut plane_handle) =
+        control_router::RoutePlane::new(Arc::clone(&source), topology_handle.clone(), None);
+
+    let context = runtime.handle().module_context();
+    let plane_context = runtime.handle().module_context();
+    let Ok(()) = runtime.mark_ready() else {
+        unreachable!("runtime ready")
+    };
+    let topology_task = tokio::spawn(Box::new(topology_module).run(context));
+    // Stage 1 of the four-stage localisation: topology must be ready before
+    // the plane can bind a namespace incarnation to it.
+    assert!(
+        timeout(Duration::from_secs(5), topology_handle.wait_ready())
+            .await
+            .is_ok(),
+        "stage topology-ready: the zero-cluster topology module never became ready"
+    );
+    let plane_task = tokio::spawn(Box::new(route_plane).run(plane_context));
+    // Stage 2: the plane builds its router incarnation and publishes it.
+    assert!(
+        timeout(Duration::from_secs(5), plane_handle.wait_ready())
+            .await
+            .is_ok(),
+        "stage route-ready: the route plane never became ready"
+    );
+
+    LocalRoutePlane {
+        handle: plane_handle,
+        _runtime: runtime,
+        topology_task,
+        plane_task,
+    }
+}
+
+/// A stack whose session owner holds a real route plane, so admission runs
+/// the production local path instead of the compatibility bridge.
+async fn spawn_local_route_stack(user: &str, backend_port: u16) -> (Stack, LocalRoutePlane) {
+    let plane = spawn_local_route_plane(user, backend_port).await;
+    let stack = spawn_stack_configured_with_metering(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+        None,
+        Duration::from_secs(30),
+        None,
+        Some(plane.handle.clone()),
+    )
+    .await;
+    (stack, plane)
+}
+
+/// CFG-001 fixture smoke: one stack admits two client sessions in sequence,
+/// each reaching its backend.
+///
+/// This is the property the compatibility-bridge fixture cannot provide —
+/// there `HandshakeResponse`/`RouteRequest` go to a never-running
+/// `ControlClient`, so `spawn_route_answer*` has to guess request ids and
+/// re-inject them, and a second session never completes. Every reload
+/// acceptance test needs a second session by construction, so this smoke is
+/// the gate the PROXY-v2 and required-TLS effect tests are built on.
+#[tokio::test]
+async fn local_route_stack_admits_two_sequential_sessions() {
+    let backend = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let (stack, plane) = spawn_local_route_stack("root", backend.port).await;
+    let accepted = Arc::clone(&backend.accepted);
+
+    // Stage 3 and 4 of the localisation ladder: admit, then backend-accept.
+    let Some(mut first) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!("stage admit: the first session never completed its handshake")
+    };
+    assert!(first.query_ok("SELECT 1").await, "first session serves");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "stage backend-accept: exactly one backend connection so far"
+    );
+
+    let Some(mut second) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!(
+            "stage admit: the SECOND session never completed — the fixture still cannot admit one"
+        )
+    };
+    assert!(second.query_ok("SELECT 2").await, "second session serves");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "stage backend-accept: the second session reached the backend on its own connection"
+    );
+
+    // Both are independent: the first keeps working after the second exists.
+    assert!(
+        first.query_ok("SELECT 3").await,
+        "the first session is unaffected by the second"
+    );
+
+    first.quit().await;
+    second.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+/// The transport a task-#119 backend endpoint presents on one accepted
+/// connection, fixed by accept index rather than inferred from the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendMode {
+    /// Plain `MySQL`: greeting first, no PROXY preamble.
+    Plain,
+    /// Expect a PROXY-v2 preamble before the `MySQL` stream.
+    ProxyV2,
+    /// Serve the `MySQL` stream inside TLS.
+    Tls,
+}
+
+/// A backend that serves accepted connections **concurrently**.
+///
+/// The shared `run_fake_backend` accepts serially — it awaits one connection's
+/// whole session before looping back to `accept()` — so a second proxy dial
+/// only reaches the kernel backlog while the first session is alive. That is
+/// invisible from the outside: the client sees a proxy greeting, admission
+/// succeeds, and `accepted_connections` stays at 1 because it is counted after
+/// the user-space accept. Any test needing two live sessions therefore needs
+/// its own endpoint, which is also what the later PROXY/TLS effect tests want
+/// when an old and a new seat must coexist.
+struct ConcurrentFakeBackend {
+    port: u16,
+    accepted: Arc<AtomicU64>,
+    proxy_headers: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: watch::Sender<bool>,
+    listener_task: tokio::task::JoinHandle<()>,
+}
+
+impl ConcurrentFakeBackend {
+    /// PROXY-v2 preambles captured per accepted connection, in accept order.
+    /// Read by the PROXY effect test; empty for a plain-only endpoint.
+    fn proxy_headers(&self) -> Vec<Vec<u8>> {
+        self.proxy_headers
+            .lock()
+            .map(|headers| headers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stops accepting and waits until every connection handler has actually
+    /// finished.
+    ///
+    /// The listener is asked to stop rather than aborted from outside, because
+    /// dropping a `JoinSet` only calls `abort()` on its children and does not
+    /// wait for them — the cancellations would still be in flight, with the
+    /// handles gone. Instead the listener leaves its loop, runs
+    /// `JoinSet::shutdown().await` (abort *and* join every child), and only
+    /// then returns; awaiting the listener here therefore means the whole tree
+    /// is finished.
+    async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let _ = self.listener_task.await;
+    }
+}
+
+/// Spawns the concurrent endpoint. `modes` is consumed by accept index; past
+/// its end the last entry repeats, so a one-element list is a uniform server.
+async fn spawn_concurrent_fake_backend(modes: Vec<BackendMode>) -> ConcurrentFakeBackend {
+    assert!(!modes.is_empty(), "at least one mode is required");
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let accepted = Arc::new(AtomicU64::new(0));
+    let proxy_headers = Arc::new(Mutex::new(Vec::new()));
+    let server_accepted = Arc::clone(&accepted);
+    let server_headers = Arc::clone(&proxy_headers);
+    let (stop, mut stop_rx) = watch::channel(false);
+    let listener_task = tokio::spawn(async move {
+        // The handlers are owned here and drained here: `shutdown()` below is
+        // the only thing that ends this loop, so the set is never merely
+        // dropped.
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut index = 0_usize;
+        loop {
+            let accepted_connection = tokio::select! {
+                biased;
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let Ok((stream, _)) = accepted_connection else {
+                break;
+            };
+            let mode = modes[index.min(modes.len() - 1)];
+            index += 1;
+            server_accepted.fetch_add(1, Ordering::Relaxed);
+            let headers = Arc::clone(&server_headers);
+            // One task per connection: the whole point of this endpoint.
+            handlers.spawn(async move {
+                let broad = fake_backend_capabilities(false);
+                let stream = if mode == BackendMode::ProxyV2 {
+                    let (mut read, write) = stream.into_split();
+                    let Some(header) = strip_inbound_proxy_v2(&mut read).await else {
+                        return;
+                    };
+                    if let Ok(mut captured) = headers.lock() {
+                        captured.push(header);
+                    }
+                    let Ok(stream) = read.reunite(write) else {
+                        return;
+                    };
+                    stream
+                } else {
+                    stream
+                };
+                if mode == BackendMode::Tls {
+                    run_fake_tls_backend_connection(
+                        stream,
+                        fake_backend_tls_config(),
+                        Arc::new(Mutex::new(Vec::new())),
+                        SnapshotReply::Valid,
+                        false,
+                    )
+                    .await;
+                    return;
+                }
+                let (read, write) = tokio::io::split(stream);
+                let mut reader = PacketReader::new(read);
+                let mut writer = PacketWriter::new(write);
+                let Some(auth) = fake_backend_auth(&mut reader, &mut writer, broad).await else {
+                    return;
+                };
+                let _ = run_fake_backend_commands(
+                    reader,
+                    writer,
+                    auth,
+                    Arc::new(Mutex::new(Vec::new())),
+                    SnapshotReply::Valid,
+                    broad,
+                    false,
+                )
+                .await;
+            });
+        }
+        // Abort every handler AND wait for it, which `Drop` alone does not do.
+        handlers.shutdown().await;
+    });
+    ConcurrentFakeBackend {
+        port: address.port(),
+        accepted,
+        proxy_headers,
+        stop,
+        listener_task,
+    }
+}
+
+/// Re-applies the stack's base config at a new generation with `proxy_protocol`
+/// or `require_backend_tls` changed, so a reload test states exactly what it
+/// varied.
+fn reloaded_engine_snapshot(
+    sql_port: u16,
+    backend_port: u16,
+    generation: u64,
+    proxy_v2: bool,
+    require_backend_tls: bool,
+) -> Arc<control_proto::snapshot::ValidatedSnapshot> {
+    let base = engine_snapshot(sql_port, backend_port, proxy_v2, None, require_backend_tls);
+    let raw = base.raw().clone();
+    let Ok(store) = control_proto::snapshot::SnapshotStore::new([]) else {
+        unreachable!("store")
+    };
+    let Ok(outcome) = store.apply(
+        generation,
+        raw,
+        control_proto::snapshot::UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+        control_proto::snapshot::SnapshotLineage::for_tests("go-fixture"),
+    ) else {
+        unreachable!("reload snapshot applies")
+    };
+    outcome.snapshot
+}
+
+/// CFG-001: reloading `proxy_protocol` to v2 makes the *next* session dial its
+/// backend with a PROXY-v2 preamble, while the session admitted before the
+/// reload keeps dialling without one.
+///
+/// Both sessions are alive at the same time, on one backend endpoint whose
+/// mode is fixed per accept index — the old seat's connection is plain, the
+/// new seat's expects the preamble — so nothing here infers a transport from
+/// the wire.
+#[tokio::test]
+async fn reloaded_proxy_protocol_binds_the_next_session_only() {
+    use proxy_io::proxy_protocol::{
+        EncodeAddresses, ProxyCommand, ProxyVersion, TransportProtocol, encode_proxy_v2,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let backend =
+        spawn_concurrent_fake_backend(vec![BackendMode::Plain, BackendMode::ProxyV2]).await;
+    let (stack, plane) = spawn_local_route_stack("root", backend.port).await;
+
+    // Generation 1: PROXY disabled. The first accepted backend connection is
+    // the plain one.
+    let Some(mut first) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!("first session")
+    };
+    assert!(first.query_ok("SELECT 1").await, "plain dial serves");
+    assert!(
+        backend.proxy_headers().is_empty(),
+        "generation 1 dialled without a PROXY preamble"
+    );
+
+    // Generation 2: PROXY v2.
+    assert!(
+        stack
+            .server_handle
+            .update_snapshot(reloaded_engine_snapshot(
+                stack.sql_port,
+                backend.port,
+                2,
+                true,
+                false,
+            ))
+            .is_ok(),
+        "the reload publishes"
+    );
+
+    // Enabling v2 arms both legs: the listener now also expects an inbound
+    // header from the LB, so the post-reload client presents one.
+    let Ok(src_ip) = "203.0.113.7".parse::<Ipv4Addr>() else {
+        unreachable!("source parses")
+    };
+    let Ok(dst_ip) = "203.0.113.9".parse::<Ipv4Addr>() else {
+        unreachable!("destination parses")
+    };
+    let Ok(inbound) = encode_proxy_v2(
+        ProxyVersion::V2,
+        ProxyCommand::PROXY,
+        TransportProtocol::STREAM,
+        EncodeAddresses::Ip {
+            src: (IpAddr::V4(src_ip), 31_234),
+            dst: (IpAddr::V4(dst_ip), 4_000),
+        },
+        &[],
+    ) else {
+        unreachable!("header encodes")
+    };
+    let Some(mut second) = timeout(
+        Duration::from_secs(5),
+        MysqlClient::connect_with_proxy_header(stack.sql_port, &inbound),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!("second session under the reloaded PROXY config")
+    };
+    assert!(second.query_ok("SELECT 2").await, "v2 dial serves");
+    assert_eq!(
+        backend.proxy_headers().len(),
+        1,
+        "the reload put a PROXY-v2 preamble on the NEW session's dial only"
+    );
+    assert_eq!(
+        backend.accepted.load(Ordering::Relaxed),
+        2,
+        "both seats hold their own backend connection"
+    );
+
+    // The pre-reload seat still runs on its admitted config.
+    assert!(
+        first.query_ok("SELECT 3").await,
+        "the established session is unaffected"
+    );
+    assert_eq!(
+        backend.proxy_headers().len(),
+        1,
+        "no preamble was retrofitted onto the established session"
+    );
+
+    first.quit().await;
+    second.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+/// CFG-001: reloading `require_backend_tls` binds the *next* session's dial to
+/// TLS while the session admitted before it keeps its plaintext transport.
+///
+/// One endpoint, two accept-indexed modes: the old seat's connection is
+/// plaintext and the new seat's is TLS. Both sessions stay alive, so the test
+/// shows the two transports coexisting rather than a global switch.
+#[tokio::test]
+async fn reloaded_backend_tls_requirement_binds_the_next_session_only() {
+    let backend = spawn_concurrent_fake_backend(vec![BackendMode::Plain, BackendMode::Tls]).await;
+    let (stack, plane) = spawn_local_route_stack("root", backend.port).await;
+
+    // Generation 1: TLS not required; the dial is plaintext.
+    let Some(mut first) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!("first session")
+    };
+    assert!(
+        first.query_ok("SELECT 1").await,
+        "a plaintext backend serves while TLS is optional"
+    );
+
+    // Generation 2: TLS required.
+    assert!(
+        stack
+            .server_handle
+            .update_snapshot(reloaded_engine_snapshot(
+                stack.sql_port,
+                backend.port,
+                2,
+                false,
+                true,
+            ))
+            .is_ok(),
+        "the reload publishes"
+    );
+
+    let Some(mut second) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        plane.shutdown().await;
+        backend.shutdown().await;
+        unreachable!("second session under the reloaded TLS requirement")
+    };
+    assert!(
+        second.query_ok("SELECT 2").await,
+        "the TLS backend serves once the reload requires TLS"
+    );
+    assert_eq!(
+        backend.accepted.load(Ordering::Relaxed),
+        2,
+        "both seats hold their own backend connection"
+    );
+
+    // The pre-reload seat keeps the transport it was admitted with.
+    assert!(
+        first.query_ok("SELECT 3").await,
+        "the established plaintext session is unaffected by the reload"
+    );
+
+    first.quit().await;
+    second.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
 }
