@@ -241,6 +241,8 @@ enum FakeAuth {
 const WIRE03_LARGE_QUERY: &[u8] = b"\x03SELECT wire03_large_response";
 const WIRE03_EXACT_MULTIPLE_QUERY: &[u8] = b"\x03SELECT wire03_exact_multiple_response";
 const WIRE03_LOCAL_INFILE_QUERY: &[u8] = b"\x03LOAD DATA LOCAL INFILE 'wire03.csv'";
+/// RSP-004: one command, two result sets (see `respond_to_multi_result`).
+const MULTI_RESULT_QUERY: &[u8] = b"\x03SELECT 0; SELECT 1";
 const WIRE03_LARGE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize + 257;
 const WIRE03_EXACT_MULTIPLE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize;
 
@@ -531,6 +533,52 @@ fn encode_resultset_terminator(status: StatusFlags, capabilities: CapabilityFlag
         Ok(packet) => packet,
         Err(_) => unreachable!("resultset OK terminator encodes"),
     }
+}
+
+/// RSP-004: two result sets for one command. The first terminator carries
+/// `SERVER_MORE_RESULTS_EXISTS`, so the proxy must keep reading the backend
+/// instead of handing the command back to the client; the second clears it and
+/// ends the command. A proxy that stops at the first terminator leaves the
+/// second result set unread in the backend socket and desynchronises the
+/// session, which the follow-up command in the test detects.
+async fn respond_to_multi_result<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    capabilities: CapabilityFlags,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.reset_sequence(reader.expected_sequence());
+    for (index, more) in [(0u8, true), (1u8, false)] {
+        for packet in [vec![0x01], result_column(b"c")] {
+            if writer.write_logical(&packet, true).await.is_err() {
+                return false;
+            }
+        }
+        // One text row carrying the result-set index, so the two sets are
+        // distinguishable on the wire rather than merely counted.
+        if writer
+            .write_logical(&[0x01, b'0' + index], true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let status = if more {
+            StatusFlags::AUTOCOMMIT | StatusFlags::MORE_RESULTS_EXISTS
+        } else {
+            StatusFlags::AUTOCOMMIT
+        };
+        if writer
+            .write_logical(&encode_resultset_terminator(status, capabilities), true)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
@@ -1017,6 +1065,12 @@ where
                 break;
             }
             in_transaction = false;
+            continue;
+        }
+        if packet.payload == MULTI_RESULT_QUERY {
+            if !respond_to_multi_result(&reader, &mut writer, broad).await {
+                break;
+            }
             continue;
         }
         if packet.payload == b"\x03SHOW SESSION_STATES" {
@@ -2330,6 +2384,30 @@ impl MysqlClient {
         response.payload.first() == Some(&0x00)
     }
 
+    /// RSP-004: sends one command and drains a two-result-set response,
+    /// returning the text rows in arrival order. Each set is column-count,
+    /// column definition, one row, terminator; the first terminator carries
+    /// `SERVER_MORE_RESULTS_EXISTS`. Returning the rows rather than a count
+    /// makes a proxy that forwarded only the first set distinguishable from
+    /// one that forwarded both.
+    async fn query_multi_result(&mut self, sql: &str) -> Option<Vec<u8>> {
+        let mut payload = vec![0x03_u8];
+        payload.extend_from_slice(sql.as_bytes());
+        self.writer.reset_sequence(0);
+        self.writer.write_logical(&payload, true).await.ok()?;
+        self.reader.reset_sequence(1);
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            let packet = self.reader.read_logical(64 * 1024).await.ok()?;
+            // A text row here is a one-byte length-encoded string; the
+            // column-count packet is the bare 0x01 and is one byte shorter.
+            if packet.payload.len() == 2 && packet.payload[0] == 0x01 {
+                rows.push(packet.payload[1]);
+            }
+        }
+        Some(rows)
+    }
+
     /// Sends one command and reads a large OK-shaped logical response that
     /// crosses `MySQL`'s 16 MiB physical-packet boundary. Returns
     /// `(physical_packets, sequence_mismatches, next_expected_sequence)` so
@@ -3026,6 +3104,50 @@ async fn session_path_emits_query_traffic_and_exact_quit_source() {
         "session observations reach the bounded queue"
     );
     assert!(saw_handshake && saw_query && saw_close);
+    stack.dispatch_task.abort();
+}
+
+/// PARITY-RSP-004 at the session engine, not just the observer.
+///
+/// `ResponseObserver` already models `SERVER_MORE_RESULTS_EXISTS` and the
+/// response corpus pins it per packet, but nothing exercised the engine's own
+/// `response_rounds` loop, whose `MoreResults` arm is what actually keeps
+/// reading the backend. Both halves must hold: the client receives both result
+/// sets in order, and -- the part a first-set-only proxy fails -- the session
+/// is still synchronised afterwards, since an unread second set would sit in
+/// the backend socket and answer the next command at the wrong sequence.
+#[tokio::test]
+async fn multi_result_command_forwards_every_set_and_keeps_the_session_synchronised() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+
+    let rows = timeout(
+        Duration::from_secs(5),
+        client.query_multi_result("SELECT 0; SELECT 1"),
+    )
+    .await;
+    assert_eq!(
+        rows.ok().flatten(),
+        Some(vec![b'0', b'1']),
+        "both result sets reach the client, in order"
+    );
+
+    // The discriminator: a proxy that stopped at the first terminator leaves
+    // the second set unread, so this command answers at the wrong sequence.
+    assert!(
+        timeout(Duration::from_secs(5), client.query_ok("SELECT 1"))
+            .await
+            .unwrap_or(false),
+        "the session is still synchronised after a multi-result command"
+    );
+    client.quit().await;
     stack.dispatch_task.abort();
 }
 
@@ -8436,5 +8558,155 @@ async fn query_immediately_after_commit_survives_redirect() {
     drop(client);
     let _ = stack.shutdown_tx.send(true);
     let _ = timeout(Duration::from_secs(5), stack.server_task).await;
+    stack.dispatch_task.abort();
+}
+
+/// PKT-003 request payload: larger than `COMMAND_PAYLOAD_LIMIT`, the 64 MiB
+/// ceiling the engine is willing to materialize. A proxy that reads the
+/// request before forwarding it cannot deliver this at all, which is what
+/// makes the property observable from outside.
+const STREAMED_QUERY_BYTES: u64 = 64 * 1024 * 1024 + 1024;
+
+/// A backend that drains one oversized command without materializing it
+/// either, reporting the exact logical length it received and the head of the
+/// payload. Draining into a sink through `forward_packet_to` keeps the test
+/// harness from becoming the thing that allocates 64 MiB.
+async fn spawn_streaming_fake_backend() -> (u16, Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)).await else {
+        unreachable!("backend bind")
+    };
+    let Ok(address) = listener.local_addr() else {
+        unreachable!("backend addr")
+    };
+    let received = Arc::new(AtomicU64::new(0));
+    let head = Arc::new(Mutex::new(Vec::new()));
+    let server_received = Arc::clone(&received);
+    let server_head = Arc::clone(&head);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let broad = fake_backend_capabilities(false);
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = PacketReader::new(read);
+            let mut writer = PacketWriter::new(write);
+            if fake_backend_auth(&mut reader, &mut writer, broad)
+                .await
+                .is_none()
+            {
+                continue;
+            }
+            loop {
+                reader.reset_sequence(0);
+                match reader.peek_packet().await {
+                    Ok(preview) if preview.sequence_id == 0 => {}
+                    _ => break,
+                }
+                // Oversized commands are drained; anything small enough to
+                // hold is read normally so the follow-up query still works.
+                let first_byte = {
+                    let mut sink = PacketWriter::new(tokio::io::sink());
+                    let Ok(progress) = reader.forward_packet_to(&mut sink, 64).await else {
+                        break;
+                    };
+                    let logical = progress.logical_payload_bytes();
+                    if logical >= STREAMED_QUERY_BYTES {
+                        server_received.store(logical, Ordering::Relaxed);
+                        if let Ok(mut head) = server_head.lock() {
+                            *head = progress.captured_prefix().to_vec();
+                        }
+                    }
+                    progress.captured_prefix().first().copied()
+                };
+                if first_byte == Some(0x01) {
+                    break; // COM_QUIT
+                }
+                writer.reset_sequence(reader.expected_sequence());
+                let Ok(ok) = encode_ok_packet(
+                    ResponseHeader::OK,
+                    0,
+                    0,
+                    StatusFlags::AUTOCOMMIT,
+                    0,
+                    b"",
+                    broad,
+                ) else {
+                    break;
+                };
+                if writer.write_logical(&ok, true).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (address.port(), received, head)
+}
+
+/// PKT-003: a command whose first physical packet is already maximal is
+/// relayed to the backend as it arrives, never held.
+///
+/// The request is deliberately larger than `COMMAND_PAYLOAD_LIMIT`: under the
+/// materializing path `read_logical(COMMAND_PAYLOAD_LIMIT)` refuses it and the
+/// session dies, so a passing run is itself the evidence that no copy was
+/// made. Both ends stream — the client writes from a generator and the backend
+/// drains into a sink — so the only participant that could have allocated 64
+/// MiB is the proxy.
+#[tokio::test]
+async fn oversized_command_streams_to_the_backend_without_being_materialized() {
+    let (backend_port, received, head) = spawn_streaming_fake_backend().await;
+    let stack = spawn_stack().await;
+    spawn_route_answer_to(&stack, 1, 2, backend_port);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        stack.dispatch_task.abort();
+        unreachable!("client connect")
+    };
+
+    // COM_QUERY followed by filler. `write_logical_from` fragments it into
+    // maximal physical packets, so the FIRST one already reaches
+    // `MAX_PAYLOAD_LEN` — the exact condition the streaming path keys on.
+    let mut source = (&b"\x03"[..]).chain(tokio::io::repeat(b'x').take(STREAMED_QUERY_BYTES - 1));
+    client.writer.reset_sequence(0);
+    assert!(
+        timeout(
+            Duration::from_secs(60),
+            client
+                .writer
+                .write_logical_from(&mut source, STREAMED_QUERY_BYTES, true),
+        )
+        .await
+        .is_ok_and(|written| written.is_ok()),
+        "the oversized command must reach the proxy"
+    );
+
+    client.reader.reset_sequence(1);
+    let response = timeout(
+        Duration::from_secs(60),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        response
+            .is_ok_and(|packet| packet.is_ok_and(|packet| packet.payload.first() == Some(&0x00))),
+        "the backend's OK must come back to the client"
+    );
+
+    assert_eq!(
+        received.load(Ordering::Relaxed),
+        STREAMED_QUERY_BYTES,
+        "every byte of the logical request must reach the backend"
+    );
+    let captured = head.lock().map(|head| head.clone()).unwrap_or_default();
+    assert_eq!(captured.first(), Some(&0x03), "COM_QUERY head preserved");
+    assert!(
+        captured[1..].iter().all(|byte| *byte == b'x'),
+        "the payload head must arrive unaltered"
+    );
+
+    // The session is still in sequence afterwards: a streamed command must
+    // leave the wire exactly where an ordinary one does.
+    assert!(client.query_ok("SELECT 1").await, "session stays usable");
+    client.quit().await;
     stack.dispatch_task.abort();
 }

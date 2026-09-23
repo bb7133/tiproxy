@@ -153,6 +153,69 @@ impl Command {
         self as u8
     }
 
+    /// The command for a wire byte, or `None` when the byte names none.
+    ///
+    /// The fallible `TryFrom` carries a dispatch error, which a caller holding
+    /// only a peeked header has nothing to do with; PKT-003's intake decision
+    /// needs the byte classified before any payload exists.
+    #[must_use]
+    pub const fn try_from_byte(byte: u8) -> Option<Self> {
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            let command = Self::ALL[index];
+            if command.as_byte() == byte {
+                return Some(command);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// The response shape this command expects.
+    ///
+    /// This depends only on the command byte, never on the request body, and
+    /// the streaming request path needs exactly that: a command whose first
+    /// physical packet reaches `MAX_PAYLOAD_LEN` is forwarded without being
+    /// materialized (PKT-003), so at the point the session must decide what to
+    /// read back, the peeked first byte is all that exists. [`dispatch`]
+    /// derives its own `response` from here so the two cannot drift.
+    ///
+    /// Every command is listed rather than defaulted, so adding one to the
+    /// wire enum fails to compile until its response shape is chosen.
+    #[must_use]
+    pub const fn expected_response(self) -> ExpectedResponse {
+        match self {
+            Self::Quit | Self::StmtSendLongData | Self::StmtClose => ExpectedResponse::None,
+            Self::Query | Self::ProcessInfo | Self::StmtExecute => ExpectedResponse::Query,
+            Self::FieldList => ExpectedResponse::FieldList,
+            Self::Statistics => ExpectedResponse::Statistics,
+            Self::ChangeUser => ExpectedResponse::ChangeUser,
+            Self::StmtPrepare => ExpectedResponse::Prepare,
+            Self::StmtFetch => ExpectedResponse::Fetch,
+            Self::Sleep
+            | Self::InitDb
+            | Self::CreateDb
+            | Self::DropDb
+            | Self::Refresh
+            | Self::DeprecatedShutdown
+            | Self::Connect
+            | Self::ProcessKill
+            | Self::Debug
+            | Self::Ping
+            | Self::Time
+            | Self::DelayedInsert
+            | Self::BinlogDump
+            | Self::TableDump
+            | Self::ConnectOut
+            | Self::RegisterSlave
+            | Self::StmtReset
+            | Self::SetOption
+            | Self::Daemon
+            | Self::BinlogDumpGtid
+            | Self::ResetConnection => ExpectedResponse::OnePacket,
+        }
+    }
+
     /// Returns the stable Go metrics/log label.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -507,7 +570,7 @@ pub fn dispatch(packet: CommandPacket<'_>) -> Result<CommandPlan<'_>, CommandDis
     let mut plan = CommandPlan {
         command,
         forwarding: RequestForwarding::Transparent,
-        response: ExpectedResponse::OnePacket,
+        response: command.expected_response(),
         after_forward: CommandStateEffects::default(),
         after_success: CommandStateEffects::default(),
     };
@@ -529,44 +592,34 @@ pub fn dispatch(packet: CommandPacket<'_>) -> Result<CommandPlan<'_>, CommandDis
         | Command::DeprecatedShutdown
         | Command::ProcessKill
         | Command::Debug
-        | Command::Ping => {}
+        | Command::Ping
+        // These carry no state effect either; their response shape is the only
+        // thing that distinguishes them and `expected_response` already owns it.
+        | Command::Query
+        | Command::ProcessInfo
+        | Command::FieldList
+        | Command::Statistics
+        | Command::StmtPrepare => {}
         Command::Quit => {
-            plan.response = ExpectedResponse::None;
             plan.after_forward = effects(Some(SessionMutation::MarkQuit), None);
         }
         Command::InitDb => {
             plan.after_success =
                 effects(Some(SessionMutation::SetCurrentDatabase(packet.data)), None);
         }
-        Command::Query | Command::ProcessInfo => {
-            plan.response = ExpectedResponse::Query;
-        }
-        Command::FieldList => {
-            plan.response = ExpectedResponse::FieldList;
-        }
-        Command::Statistics => {
-            plan.response = ExpectedResponse::Statistics;
-        }
         Command::ChangeUser => {
             plan.forwarding = RequestForwarding::RewriteChangeUser;
-            plan.response = ExpectedResponse::ChangeUser;
             plan.after_success = effects(None, Some(PreparedMutation::ClearAll));
-        }
-        Command::StmtPrepare => {
-            plan.response = ExpectedResponse::Prepare;
         }
         Command::StmtExecute => {
             let _ = statement_id(command, packet.data)?;
-            plan.response = ExpectedResponse::Query;
         }
         Command::StmtSendLongData => {
             let statement_id = statement_id(command, packet.data)?;
-            plan.response = ExpectedResponse::None;
             plan.after_forward = effects(None, Some(PreparedMutation::LongData(statement_id)));
         }
         Command::StmtClose => {
             let statement_id = statement_id(command, packet.data)?;
-            plan.response = ExpectedResponse::None;
             plan.after_forward = effects(None, Some(PreparedMutation::Close(statement_id)));
         }
         Command::StmtReset => {
@@ -579,7 +632,6 @@ pub fn dispatch(packet: CommandPacket<'_>) -> Result<CommandPlan<'_>, CommandDis
         }
         Command::StmtFetch => {
             let _ = statement_id(command, packet.data)?;
-            plan.response = ExpectedResponse::Fetch;
         }
         Command::ResetConnection => {
             plan.after_success = effects(

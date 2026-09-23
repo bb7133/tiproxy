@@ -1011,6 +1011,50 @@ mod tests {
             .snapshot)
     }
 
+    /// A snapshot that starts from [`snapshot`]'s baseline and applies one
+    /// field change, so a reload test states exactly what it varied.
+    fn snapshot_with(
+        generation: u64,
+        listeners: Vec<Listener>,
+        mutate: impl FnOnce(&mut ConfigSnapshot),
+    ) -> Result<Arc<ValidatedSnapshot>, Box<dyn Error>> {
+        let keepalive = SnapshotKeepalive {
+            enabled: true,
+            idle_millis: 0,
+            probe_count: 0,
+            interval_millis: 0,
+            user_timeout_millis: 0,
+        };
+        let mut config = ConfigSnapshot {
+            max_connections: 0,
+            high_memory_reject_threshold: 0.0,
+            connection_buffer_bytes: 4096,
+            frontend_keepalive: Some(keepalive),
+            healthy_backend_keepalive: Some(keepalive),
+            unhealthy_backend_keepalive: Some(keepalive),
+            proxy_protocol: ProxyProtocolMode::Disabled as i32,
+            listeners,
+            server_version: "TiProxy-test".to_owned(),
+            frontend_tls: Some(TlsPolicy::default()),
+            backend_tls: Some(TlsPolicy::default()),
+            ..Default::default()
+        };
+        mutate(&mut config);
+        let raw = StateSnapshot {
+            config: Some(config),
+            ..Default::default()
+        };
+        let store = SnapshotStore::new([])?;
+        Ok(store
+            .apply(
+                generation,
+                raw,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+                SnapshotLineage::for_tests("go-fixture"),
+            )?
+            .snapshot)
+    }
+
     fn one_listener() -> Vec<Listener> {
         vec![Listener {
             address: "127.0.0.1".to_owned(),
@@ -1264,6 +1308,22 @@ mod tests {
         let metrics = handle.metrics();
         assert_eq!(metrics.active_connections, 2);
         assert_eq!(metrics.rejected_max_connections_total, 1);
+
+        // `0` means unlimited, and the bounded reject above happened
+        // BEFORE an ID was created: the next admitted connection takes 3,
+        // not 4, and the old bound of 2 no longer holds any of them back.
+        let mut unlimited = Vec::new();
+        handle.update_snapshot(snapshot(2, 0, 0.0, one_listener())?)?;
+        for expected_id in 3_u64..=5 {
+            unlimited.push(TcpStream::connect(actual).await?);
+            let id = timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("accepted connection not reported")?;
+            assert_eq!(id.get(), expected_id, "a reject must not consume an ID");
+        }
+        assert_eq!(handle.registry().len(), 5);
+        assert_eq!(handle.metrics().rejected_max_connections_total, 1);
+
         handle.shutdown();
         owner.await??;
         assert!(handle.registry().is_empty());
@@ -1341,7 +1401,37 @@ mod tests {
             .map(|listener| listener.actual_address.port())
             .collect();
         assert_eq!(actual, (start..=end).collect::<Vec<_>>());
-        let owner = tokio::spawn(server.run(|_connection: AcceptedConnection| async {}));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().clone());
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        // Each expanded port accepts on its own owner: the handler for the
+        // first connection never returns, and the later listeners still
+        // serve their own clients under their own name/address.
+        let expected: Vec<(String, SocketAddr)> = handle
+            .listeners()
+            .iter()
+            .map(|listener| (listener.name.to_string(), listener.actual_address))
+            .collect();
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for (_, address) in &expected {
+            clients.push(TcpStream::connect(*address).await?);
+            let metadata = timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("listener did not accept")?;
+            accepted.push((
+                metadata.listener_name.to_string(),
+                metadata.listener_address,
+            ));
+        }
+        assert_eq!(accepted, expected);
+
         handle.shutdown();
         owner.await??;
         for address in handle
@@ -1351,6 +1441,177 @@ mod tests {
         {
             assert!(TcpStream::connect(address).await.is_err());
         }
+        Ok(())
+    }
+
+    /// CFG-001: a reloaded buffer size reaches the next admission and leaves
+    /// the established session's reservation alone.
+    ///
+    /// The gauge is the observable: each connection reserves
+    /// `connection_buffer_bytes * 2`, so a session admitted before the reload
+    /// and one admitted after must contribute *different* amounts. Asserting
+    /// the new snapshot's contents would prove nothing about admission.
+    #[tokio::test]
+    async fn reloaded_buffer_size_applies_to_the_next_admission_only() -> Result<(), Box<dyn Error>>
+    {
+        let snap = snapshot_with(1, one_listener(), |config| {
+            config.connection_buffer_bytes = 4096;
+        })?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(connection.metadata().reserved_buffer_bytes);
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        let _first = TcpStream::connect(actual).await?;
+        let first = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("first handler did not report")?;
+        assert_eq!(first, 8192, "4 KiB buffer reserves double");
+        assert_eq!(handle.metrics().connection_buffer_bytes, 8192);
+
+        handle.update_snapshot(snapshot_with(2, one_listener(), |config| {
+            config.connection_buffer_bytes = 16384;
+        })?)?;
+
+        let _second = TcpStream::connect(actual).await?;
+        let second = timeout(TokioDuration::from_secs(2), rx.recv())
+            .await?
+            .ok_or("second handler did not report")?;
+        assert_eq!(second, 32768, "the reload reached the new admission");
+        assert_eq!(
+            handle.metrics().connection_buffer_bytes,
+            8192 + 32768,
+            "the established session keeps its own reservation"
+        );
+
+        handle.shutdown();
+        owner.await??;
+        assert_eq!(handle.metrics().connection_buffer_bytes, 0);
+        Ok(())
+    }
+
+    /// CFG-001: a reloaded frontend keepalive is applied to the next accepted
+    /// socket, read back from the socket rather than from the snapshot.
+    ///
+    /// Enablement is the portable observable — idle/probe/interval readback is
+    /// platform-dependent, so flipping `enabled` is what every Unix runner can
+    /// discriminate.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn reloaded_frontend_keepalive_reaches_the_next_socket() -> Result<(), Box<dyn Error>> {
+        let snap = snapshot_with(1, one_listener(), |config| {
+            if let Some(keepalive) = config.frontend_keepalive.as_mut() {
+                keepalive.enabled = true;
+            }
+        })?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let enabled = proxy_io::socket::read_keepalive(connection.stream())
+                    .map(|state| state.enabled)
+                    .unwrap_or(false);
+                let _ = tx.send(enabled);
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        let _first = TcpStream::connect(actual).await?;
+        assert!(
+            timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("first handler did not report")?,
+            "the first socket has keepalive on"
+        );
+
+        handle.update_snapshot(snapshot_with(2, one_listener(), |config| {
+            if let Some(keepalive) = config.frontend_keepalive.as_mut() {
+                keepalive.enabled = false;
+            }
+        })?)?;
+
+        let _second = TcpStream::connect(actual).await?;
+        assert!(
+            !timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("second handler did not report")?,
+            "the reload reached the next accepted socket"
+        );
+
+        handle.shutdown();
+        owner.await??;
+        Ok(())
+    }
+
+    /// CFG-001: public-endpoint classification is taken from the admitting
+    /// snapshot, so a CIDR reload changes the next connection's class while the
+    /// established session keeps the class it was admitted under.
+    ///
+    /// This is the accept-time freeze in ADM-004's note, driven rather than
+    /// asserted: the handler classifies through the same
+    /// `metering::is_public_endpoint` call the session path uses, against the
+    /// connection's own seat.
+    #[tokio::test]
+    async fn reloaded_public_cidrs_change_only_the_next_connections_class()
+    -> Result<(), Box<dyn Error>> {
+        let snap = snapshot_with(1, one_listener(), |config| {
+            config.public_cidrs = Vec::new();
+        })?;
+        let server = ephemeral_server(snap, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        let actual = handle.listeners()[0].actual_address;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
+            let tx = tx.clone();
+            async move {
+                let public = crate::metering::is_public_endpoint(
+                    connection.metadata().peer_address.ip(),
+                    connection
+                        .snapshot()
+                        .raw()
+                        .config
+                        .as_ref()
+                        .map_or(&[][..], |config| config.public_cidrs.as_slice()),
+                );
+                let _ = tx.send(public);
+                std::future::pending::<()>().await;
+            }
+        }));
+
+        let _first = TcpStream::connect(actual).await?;
+        assert!(
+            !timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("first handler did not report")?,
+            "loopback is private with no CIDRs configured"
+        );
+
+        // Naming loopback explicitly is the only way to flip a test peer's
+        // class: it is private, so the ADM-004 non-private fallback cannot.
+        handle.update_snapshot(snapshot_with(2, one_listener(), |config| {
+            config.public_cidrs = vec!["127.0.0.0/8".to_owned()];
+        })?)?;
+
+        let _second = TcpStream::connect(actual).await?;
+        assert!(
+            timeout(TokioDuration::from_secs(2), rx.recv())
+                .await?
+                .ok_or("second handler did not report")?,
+            "the reload reached the next admission's seat"
+        );
+
+        handle.shutdown();
+        owner.await??;
         Ok(())
     }
 

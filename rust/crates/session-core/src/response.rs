@@ -1083,6 +1083,56 @@ mod tests {
         Ok(())
     }
 
+    /// RSP-002/RSP-003: an ERR that arrives *while rows stream* still ends
+    /// the command as a non-fatal error at a protocol boundary, and does not
+    /// adopt state from a statusless ERR.
+    ///
+    /// Both existing ERR proofs feed the error to an observer still at
+    /// `QueryStart`: the corpus `query-error` case, and
+    /// `errors_are_nonfatal_command_results_and_preserve_transaction` above.
+    /// The row's "errors occurring while rows stream" clause runs through the
+    /// `QueryClassicRows` and `QueryDeprecateData` arms instead, and nothing
+    /// reached them. Both EOF modes are driven, because they are different
+    /// arms: classic needs a metadata EOF to enter the row stream, deprecated
+    /// EOF does not.
+    #[test]
+    fn errors_during_row_streaming_complete_the_command_in_both_eof_modes()
+    -> Result<(), ResponseObserverError> {
+        for (caps, metadata_eof) in [(LEGACY_CAPS, true), (MODERN_CAPS, false)] {
+            let mut current = observer(ExpectedResponse::Query, caps, true, 1024);
+            assert_eq!(
+                current.observe_backend(packet(&[0x01]))?.role,
+                PacketRole::ResultsetHeader
+            );
+            current.observe_backend(packet(&[0x03, b'a', b'b', b'c']))?;
+            if metadata_eof {
+                current.observe_backend(packet(&[0xfe, 0, 0, 0, 0]))?;
+            }
+            // One row first: the observer must genuinely be inside the row
+            // stream, not still deciding the result-set shape.
+            let row = current.observe_backend(packet(&[0x01, b'x']))?;
+            assert!(
+                matches!(row.role, PacketRole::Row | PacketRole::ResultsetData),
+                "row stream entered"
+            );
+            let effect = current.observe_backend(packet(&error(1317)))?;
+            assert_eq!(
+                effect.disposition,
+                ResponseDisposition::CompleteError { code: 1317 },
+                "a mid-stream ERR completes the command"
+            );
+            assert_eq!(effect.role, PacketRole::Error);
+            assert_eq!(
+                effect.flush,
+                FlushAction::ProtocolBoundary,
+                "the terminal ERR is a flush boundary"
+            );
+            assert!(effect.in_transaction, "retained, not taken from the ERR");
+            assert_eq!(effect.status, None, "a statusless ERR carries no status");
+        }
+        Ok(())
+    }
+
     #[test]
     fn errors_are_nonfatal_command_results_and_preserve_transaction()
     -> Result<(), ResponseObserverError> {

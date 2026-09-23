@@ -2995,6 +2995,10 @@ mod tests {
         ExportTotals {
             registered: 3,
             rejected_max: 1,
+            // ADM-001's label. Without a recorded delta here the golden only
+            // ever compared `type="max_connections"`, so the memory reason
+            // -- a different Go counter path -- was never rendered at all.
+            rejected_memory: 1,
             accept_errors: 1,
             reconnect_attempts: 1,
             dispatch_stale: 2,

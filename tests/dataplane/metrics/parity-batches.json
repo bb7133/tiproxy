@@ -25,6 +25,7 @@
     {"name": "tiproxy_server_create_connection_total", "labels": {}, "counter_delta": 1, "gauge": 0, "histogram_bucket_deltas": []},
     {"name": "tiproxy_server_disconnection_total", "labels": {"type": "client network break"}, "counter_delta": 1, "gauge": 0, "histogram_bucket_deltas": []},
     {"name": "tiproxy_server_err", "labels": {"type": "rust_control_stale_dropped"}, "counter_delta": 2, "gauge": 0, "histogram_bucket_deltas": []},
+    {"name": "tiproxy_server_reject_connection_total", "labels": {"type": "memory"}, "counter_delta": 1, "gauge": 0, "histogram_bucket_deltas": []},
     {"name": "tiproxy_session_conn_lifetime_seconds", "labels": {}, "counter_delta": 1, "gauge": 12.5, "histogram_bucket_deltas": [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]},
     {"name": "tiproxy_session_query_duration_seconds", "labels": {"backend": "10.0.0.1:4000", "cmd_type": "Query"}, "counter_delta": 1, "gauge": 2, "histogram_bucket_deltas": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]},
     {"name": "tiproxy_session_query_duration_seconds", "labels": {"backend": "10.0.0.2:4000", "cmd_type": "StmtExecute"}, "counter_delta": 1, "gauge": 0.062, "histogram_bucket_deltas": [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]},

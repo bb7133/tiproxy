@@ -85,6 +85,7 @@ use control_router::{
     MigrationCommand, RouteCommandEnvelope, RouteCommandReceiver, RouteError, RoutePlaneHandle,
 };
 use control_routing::{RouteAssignment, RouteResult};
+use mysql_wire::limits::MAX_PHYSICAL_PAYLOAD_LEN;
 use mysql_wire::{
     Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
     encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
@@ -335,6 +336,11 @@ where
 const HANDSHAKE_PAYLOAD_LIMIT: usize = 64 * 1024;
 /// Client command / infile chunk payload bound for this slice.
 const COMMAND_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
+/// PKT-003: bytes retained from a streamed command. Go keeps the same 1024
+/// (`forwardCommand` -> `ForwardPacketTo(backendIO, 1024)`) with the note
+/// "generally, the stmtID is enough" — the prefix exists to recover command
+/// state, never to hold the request.
+const STREAMED_COMMAND_CAPTURE: usize = 1024;
 /// Streaming prefix capture for response classification.
 const RESPONSE_CAPTURE: usize = 23;
 /// Engine effect-command queue depth (FSM effects per event are few).
@@ -1221,12 +1227,66 @@ fn backend_health_in_snapshot(
     })
 }
 
+/// What the peeked command header alone allows the intake to do (PKT-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeekDecision {
+    /// Read the logical request in full.
+    Materialize,
+    /// Relay it without reading; this command byte is all that is known.
+    Stream(Command),
+    /// Oversized, and its first byte is not a command at all.
+    RejectUnknown,
+}
+
+/// Decides the intake from the peeked header, before a single payload byte is
+/// read.
+///
+/// Go's `streamingForwardThreshold` is exactly `MaxPayloadLen`: once the FIRST
+/// physical packet is already maximal the logical request continues into
+/// further fragments, and materializing it is what invites the OOM. Go takes
+/// the command from the peeked first byte in every case — that is the only
+/// reason it can decide this before reading — and exempts `COM_CHANGE_USER`,
+/// which is rewritten before forwarding and so must be read in full whatever
+/// its size.
+const fn classify_intake(first_byte: Option<u8>, first_packet_length: u32) -> PeekDecision {
+    if (first_packet_length as usize) < MAX_PHYSICAL_PAYLOAD_LEN {
+        return PeekDecision::Materialize;
+    }
+    let Some(byte) = first_byte else {
+        return PeekDecision::Materialize;
+    };
+    match Command::try_from_byte(byte) {
+        // Rewritten before forwarding: it cannot be relayed unread.
+        Some(Command::ChangeUser) => PeekDecision::Materialize,
+        Some(command) => PeekDecision::Stream(command),
+        None => PeekDecision::RejectUnknown,
+    }
+}
+
+/// How the next client command arrived.
+enum CommandIntake {
+    /// The logical request was read in full.
+    Materialized(Vec<u8>),
+    /// PKT-003: the first physical packet is already maximal, so nothing was
+    /// read. Only the peeked command byte is known; the request is relayed at
+    /// the forward point and the bounded prefix comes back from that relay.
+    Streamed(Command),
+}
+
 /// One client command held between its event and the FSM's forward
 /// authorization.
 struct PendingCommand {
+    /// The logical request, or — once a streamed command has been
+    /// forwarded — the bounded prefix that replaces it. Never the whole
+    /// request in the streamed case; see [`PendingCommand::streamed`].
     payload: Vec<u8>,
     command: Command,
     expected: ExpectedResponse,
+    /// PKT-003. The request was relayed to the backend as it arrived and was
+    /// never held in memory, so `payload` is at most
+    /// [`STREAMED_COMMAND_CAPTURE`] bytes and the forward has already
+    /// happened by the time the ordinary forward point is reached.
+    streamed: bool,
     started: tokio::time::Instant,
     since_connection: Duration,
     traffic_before: BackendTraffic,
@@ -2489,7 +2549,7 @@ impl Engine {
             // header is visible the logical read runs uncontended; a
             // client stalling mid-frame is bounded by the owner's force
             // deadline, like any other mid-command stall.
-            let (payload, command_started) = tokio::select! {
+            let (intake, command_started) = tokio::select! {
                 changed = self.snapshot_updates.changed(), if snapshot_updates_open => {
                     if changed.is_err() {
                         snapshot_updates_open = false;
@@ -2518,19 +2578,43 @@ impl Engine {
                     }
                 }
                 peeked = self.client_io.peek_packet() => {
-                    if let Err(error) = peeked {
-                        let source = self.client_read_end(&error).await;
-                        return Some(source);
-                    }
+                    let preview = match peeked {
+                        Ok(preview) => preview,
+                        Err(error) => {
+                            let source = self.client_read_end(&error).await;
+                            return Some(source);
+                        }
+                    };
                     // The idle wait ends when the packet header becomes
                     // visible. Match Go's ExecuteCmd timer: include packet
                     // read/dispatch/response work, never connection idle time.
                     let started = tokio::time::Instant::now();
-                    match self.client_io.read_logical(COMMAND_PAYLOAD_LIMIT).await {
-                        Ok(packet) => (packet.payload, started),
-                        Err(error) => {
-                            let source = self.client_read_end(&error).await;
-                            return Some(source);
+                    match classify_intake(preview.first_byte, preview.first_packet_length) {
+                        // An oversized packet whose first byte is not a
+                        // command. Go streams it to the backend anyway, but
+                        // Rust already refuses unknown commands before
+                        // forwarding, and reading the request only to reject it
+                        // would reintroduce exactly the allocation this row
+                        // exists to remove — so it is refused from the header.
+                        PeekDecision::RejectUnknown => {
+                            let _ = self
+                                .write_client_error(1047, *b"08S01", "Unknown command")
+                                .await;
+                            continue;
+                        }
+                        PeekDecision::Stream(command) => {
+                            (CommandIntake::Streamed(command), started)
+                        }
+                        PeekDecision::Materialize => {
+                            match self.client_io.read_logical(COMMAND_PAYLOAD_LIMIT).await {
+                                Ok(packet) => {
+                                    (CommandIntake::Materialized(packet.payload), started)
+                                }
+                                Err(error) => {
+                                    let source = self.client_read_end(&error).await;
+                                    return Some(source);
+                                }
+                            }
                         }
                     }
                 }
@@ -2538,14 +2622,28 @@ impl Engine {
             self.client_io.reset_write_sequence(1);
             // Extract the plan's owned facts before the payload moves:
             // CommandPlan borrows the packet bytes.
-            let planned = {
-                let Ok(command_packet) = CommandPacket::decode(&payload) else {
-                    let _ = self.events.send(SessionEvent::ClientIoError).await;
-                    return Some(WireErrorSource::ClientNetwork);
-                };
-                dispatch(command_packet)
-                    .map(|plan| (plan.command, plan.response))
-                    .ok()
+            let (payload, streamed, planned) = match intake {
+                CommandIntake::Materialized(payload) => {
+                    let planned = {
+                        let Ok(command_packet) = CommandPacket::decode(&payload) else {
+                            let _ = self.events.send(SessionEvent::ClientIoError).await;
+                            return Some(WireErrorSource::ClientNetwork);
+                        };
+                        dispatch(command_packet)
+                            .map(|plan| (plan.command, plan.response))
+                            .ok()
+                    };
+                    (payload, false, planned)
+                }
+                // The request has not been read and must not be. The response
+                // shape follows from the command byte alone, and the state
+                // effects are recovered from the captured prefix after the
+                // relay — which is where Go reads them too.
+                CommandIntake::Streamed(command) => (
+                    Vec::new(),
+                    true,
+                    Some((command, command.expected_response())),
+                ),
             };
             let Some((command, expected)) = planned else {
                 // Unknown command byte: rejected before any forward.
@@ -2563,6 +2661,7 @@ impl Engine {
                 payload,
                 command,
                 expected,
+                streamed,
                 started: command_started,
                 since_connection: command_started.saturating_duration_since(self.accepted_at),
                 traffic_before: self.backend_traffic(),
@@ -2585,7 +2684,7 @@ impl Engine {
             ) {
                 return None;
             }
-            let Some(pending) = self.pending_command.take() else {
+            let Some(mut pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
             // SES-07/MIG-005: hold a transaction-opening BEGIN while a redirect
@@ -2593,7 +2692,12 @@ impl Engine {
             // replay the BEGIN exactly once. This is a single non-looping check
             // before the forward, so the replay falls through to the ordinary
             // forward/response below and is therefore never re-held.
+            // Go gates the hold on `!streamingForward` as well: a request whose
+            // first physical packet is already maximal cannot be the `BEGIN`
+            // this path exists to hold, and its bytes are gone downstream by
+            // the time the prefix exists.
             if self.redirect_target.is_some()
+                && !pending.streamed
                 && need_hold_request(
                     pending.command,
                     &pending.payload,
@@ -2646,7 +2750,7 @@ impl Engine {
                 }
                 continue;
             }
-            if let Some(source) = self.forward_command_to_backend(&pending).await {
+            if let Some(source) = self.forward_command_to_backend(&mut pending).await {
                 self.record_command(&pending);
                 return Some(source);
             }
@@ -2921,7 +3025,7 @@ impl Engine {
     /// answers from one.
     async fn forward_command_to_backend(
         &mut self,
-        pending: &PendingCommand,
+        pending: &mut PendingCommand,
     ) -> Option<WireErrorSource> {
         let Some(backend) = self.backend.as_mut() else {
             return Some(WireErrorSource::Proxy);
@@ -2940,14 +3044,58 @@ impl Engine {
         };
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
-        if backend
-            .backend_io
-            .write_logical(&pending.payload, true)
-            .await
-            .is_err()
+        if !pending.streamed {
+            if backend
+                .backend_io
+                .write_logical(&pending.payload, true)
+                .await
+                .is_err()
+            {
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+                return Some(WireErrorSource::BackendNetwork);
+            }
+            return None;
+        }
+        // PKT-003. Relay the request fragment by fragment straight into the
+        // backend, retaining only the bounded prefix. The destination
+        // regenerates its own headers, so the client's fragmentation is not
+        // what reaches TiDB — only the logical request is.
+        let Self {
+            client_io, backend, ..
+        } = self;
+        let Some(backend) = backend.as_mut() else {
+            return Some(WireErrorSource::Proxy);
+        };
+        let progress = match PacketIo::forward_packet_to(
+            client_io,
+            &mut backend.backend_io,
+            STREAMED_COMMAND_CAPTURE,
+        )
+        .await
         {
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Some(WireErrorSource::BackendNetwork);
+            Ok(progress) => progress,
+            Err(error) => {
+                // The relay reads the client and writes the backend, so the
+                // failing side decides the attribution exactly as it does for
+                // a materialized command.
+                let source = self.client_read_end(&error).await;
+                return Some(source);
+            }
+        };
+        pending.payload = progress.captured_prefix().to_vec();
+        // The state effects come from the prefix, which is where Go reads them
+        // too (`forwardCommand` reuses `ForwardPacketTo`'s return as `request`,
+        // "generally, the stmtID is enough"). A prefix that does not decode is
+        // a request the session can no longer reason about, and the backend has
+        // already seen it: fail closed rather than continue on unknown state.
+        if CommandPacket::decode(&pending.payload)
+            .ok()
+            .and_then(|packet| dispatch(packet).ok())
+            .is_none()
+        {
+            self.quit_source = QuitSource::ProxyMalformed;
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Some(WireErrorSource::Proxy);
         }
         None
     }
@@ -5411,5 +5559,63 @@ mod tls_wiring_tests {
             "a restored database fails closed when the candidate cannot encode it"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::{Command, MAX_PHYSICAL_PAYLOAD_LEN, PeekDecision, classify_intake};
+
+    /// PKT-003 intake decision, driven from the header alone.
+    ///
+    /// The threshold and the `COM_CHANGE_USER` exemption are the two facts an
+    /// end-to-end test cannot reach cheaply: a 16 MiB change-user would have
+    /// to be sent to observe the exemption at all. Driving the decision
+    /// directly keeps both discriminable.
+    #[test]
+    fn oversized_headers_stream_unless_the_command_must_be_rewritten() {
+        let maximal =
+            u32::try_from(MAX_PHYSICAL_PAYLOAD_LEN).unwrap_or_else(|_| unreachable!("u24 fits"));
+
+        // Below the threshold nothing streams, whatever the command is.
+        for byte in [
+            Command::Query.as_byte(),
+            Command::ChangeUser.as_byte(),
+            Command::StmtSendLongData.as_byte(),
+            0xfe,
+        ] {
+            assert_eq!(
+                classify_intake(Some(byte), maximal - 1),
+                PeekDecision::Materialize,
+                "command {byte:#04x} below the threshold"
+            );
+        }
+
+        // At and above it, an ordinary command streams.
+        for length in [maximal, maximal.saturating_add(1)] {
+            assert_eq!(
+                classify_intake(Some(Command::Query.as_byte()), length),
+                PeekDecision::Stream(Command::Query)
+            );
+            assert_eq!(
+                classify_intake(Some(Command::StmtSendLongData.as_byte()), length),
+                PeekDecision::Stream(Command::StmtSendLongData),
+                "long data is the command this path exists for"
+            );
+            // Go exempts it and so must this: the packet is rewritten before
+            // it is forwarded, so it cannot be relayed unread at any size.
+            assert_eq!(
+                classify_intake(Some(Command::ChangeUser.as_byte()), length),
+                PeekDecision::Materialize,
+                "COM_CHANGE_USER is never streamed"
+            );
+            // Not a command: refused from the header instead of read first.
+            assert_eq!(
+                classify_intake(Some(0xfe), length),
+                PeekDecision::RejectUnknown
+            );
+            // An empty physical packet has no command byte to classify.
+            assert_eq!(classify_intake(None, length), PeekDecision::Materialize);
+        }
     }
 }
