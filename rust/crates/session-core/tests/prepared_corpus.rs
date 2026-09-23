@@ -209,6 +209,19 @@ fn lifecycle_registry() -> PreparedRegistry {
     registry
 }
 
+/// Per-statement guard snapshot for the two statement IDs the lifecycle trace
+/// drives. `PreparedRegistry::has_pending` is an OR across every statement, so
+/// it cannot say *which* statement is pending, nor whether the guard is a
+/// cursor or outstanding long data. PARITY-PS-002 and PARITY-PS-003 are
+/// claims about one specific statement while another is also pending, so they
+/// need this shape to be falsifiable at all.
+fn guards(registry: &PreparedRegistry) -> (Option<PreparedGuard>, Option<PreparedGuard>) {
+    (
+        registry.get(7).map(PreparedStatementState::guard),
+        registry.get(8).map(PreparedStatementState::guard),
+    )
+}
+
 #[test]
 fn parity_rsp_006_prepare_metadata_modes_match_go_corpus() -> Result<(), Box<dyn Error>> {
     for (case_id, capabilities, expected) in [
@@ -321,6 +334,7 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
     let mut fsm = ready_fsm()?;
     let mut current = None;
     let mut pending_after_command = Vec::new();
+    let mut guards_after_command = Vec::new();
 
     for record in &records {
         match record.direction {
@@ -352,6 +366,7 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
                 if plan.response == ExpectedResponse::None {
                     fsm.on_event(SessionEvent::NoResponseCommandComplete)?;
                     pending_after_command.push(registry.has_pending());
+                    guards_after_command.push(guards(&registry));
                 } else {
                     current = Some((
                         plan.command,
@@ -384,6 +399,7 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
                 }
                 assert_eq!(fsm.state(), SessionState::Ready);
                 pending_after_command.push(registry.has_pending());
+                guards_after_command.push(guards(&registry));
             }
             other => {
                 return Err(IoError::new(
@@ -396,6 +412,36 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
     }
 
     assert!(current.is_none());
+    // The per-statement sequence, which `pending_after_command` cannot express.
+    // Step 2 is PARITY-PS-003: statement 7's execute returns ERR after long
+    // data, and its guard must survive that ERR. The aggregate boolean stays
+    // `true` at that step purely because statement 8 holds a cursor, so it
+    // would not notice statement 7 being cleared. Step 4 is PARITY-PS-001:
+    // resetting 7 must not disturb 8's cursor. Steps 1..5 are PARITY-PS-002:
+    // the cursor opens on execute, survives the first fetch, and only clears
+    // when the second fetch reports the last row.
+    assert_eq!(
+        guards_after_command,
+        [
+            (Some(PreparedGuard::LongDataPending), Some(PreparedGuard::Idle)),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (Some(PreparedGuard::Idle), Some(PreparedGuard::CursorOpen)),
+            (Some(PreparedGuard::Idle), Some(PreparedGuard::Idle)),
+            (Some(PreparedGuard::Idle), None),
+        ],
+        "PARITY-PS-001/PS-002/PS-003 per-statement guard sequence"
+    );
     assert_eq!(
         pending_after_command,
         [true, true, true, true, true, false, false]
