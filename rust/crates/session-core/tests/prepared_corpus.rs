@@ -490,10 +490,11 @@ fn drive_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Command
 ///
 /// Their dispatch half -- command identity, byte index and response shape --
 /// is already replayed for every command byte by
-/// `parity_cmd_000_through_031_dispatch_from_go_corpus`. What that replay
-/// cannot show is each command's effect on prepared state, which is the
-/// clause these rows actually carry. One Go corpus trace per command keeps a
-/// failure pointing at one row.
+/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, which loads these
+/// very traces. What that replay cannot show is each command's effect on
+/// prepared state, which is the clause these rows actually carry. The traces
+/// were never unread; they were read without any prepared-state assertion.
+/// One trace per command here keeps a failure pointing at one row.
 #[test]
 fn parity_cmd_024_025_026_028_state_effects_match_go_corpus() -> Result<(), Box<dyn Error>> {
     // PARITY-CMD-024: forwarded with no response, and the statement is left
@@ -579,10 +580,14 @@ fn parity_cmd_024_025_026_028_state_effects_match_go_corpus() -> Result<(), Box<
 ///
 /// The `COM_CHANGE_USER` half is
 /// `prepared_lifecycle::change_user_clears_all_only_after_relay_success`.
-/// The reset-connection corpus trace was replayed only for dispatch, by
-/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, which says nothing
-/// about prepared state -- so the guard-clearing clause had no Rust evidence
-/// on this path at all.
+/// The plan-level guarantee -- that `Command::ResetConnection` declares
+/// `PreparedMutation::ClearAll` -- is already pinned by the lib unit test
+/// `command::tests::state_changes_apply_only_at_declared_boundary`. This test
+/// is not what makes that detectable. What it adds is the state half: the
+/// `reset-connection` Go trace was replayed only by
+/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, for command identity
+/// and response shape, so nothing checked that replaying it against a
+/// registry holding a real guard leaves nothing behind.
 #[test]
 fn parity_ps_005_reset_connection_clears_every_guard() -> Result<(), Box<dyn Error>> {
     let mut registry = lifecycle_registry();
