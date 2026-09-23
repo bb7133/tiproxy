@@ -67,6 +67,22 @@ stop_owned_process() {
 		[[ -z $process_state || $process_state == Z* ]] && return 0
 		sleep 0.1
 	done
+	# Re-verify identity before the SECOND signal. The first check happened up
+	# to `int_budget` ago — 120s for a cluster — and the process may have
+	# exited between two polls and had its PID reused, or exec'd into
+	# something else under the same PID. Signalling on the strength of the
+	# earlier check would break the marker-before-signal invariant precisely
+	# when the window is widest.
+	command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ -z $command_line ]]; then
+		# It exited during or just after the INT budget: that is a success.
+		return 0
+	fi
+	if [[ $command_line != *"$expected"* ]]; then
+		echo "refusing to TERM PID $pid: command no longer contains '$expected'" >&2
+		echo "  command=$command_line" >&2
+		return 1
+	fi
 	kill -s TERM "$pid" 2>/dev/null || true
 	for ((i = 0; i < term_budget; i++)); do
 		process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
@@ -77,6 +93,10 @@ stop_owned_process() {
 	# out which owned process it was meant downloading the CI artifact.
 	process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
 	local children
+	# Report the most recent verified command line, not the one read before
+	# SIGINT, so the diagnostic describes the process that was actually
+	# signalled twice.
+	command_line=$(ps -p "$pid" -o command= 2>/dev/null || echo "$command_line")
 	# GNU ps; absent on macOS, where this block is only read by a developer
 	# reproducing locally, so print the line only when there is something.
 	children=$(ps --ppid "$pid" -o pid=,state=,command= 2>/dev/null || true)
