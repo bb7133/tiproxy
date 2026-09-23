@@ -8762,11 +8762,14 @@ struct LocalRoutePlane {
 }
 
 impl LocalRoutePlane {
-    /// Stops both module tasks. Called at the end of every test that builds
-    /// one, so a leaked task is never mistaken for a product defect.
-    fn shutdown(self) {
+    /// Stops both module tasks and waits for them, so a leaked task is never
+    /// mistaken for a product defect and the runtime is released before the
+    /// test returns.
+    async fn shutdown(self) {
         self.topology_task.abort();
         self.plane_task.abort();
+        let _ = self.topology_task.await;
+        let _ = self.plane_task.await;
     }
 }
 
@@ -8805,7 +8808,7 @@ async fn spawn_local_route_plane(user: &str, backend_port: u16) -> LocalRoutePla
         unreachable!("namespace store")
     };
 
-    let registry = Box::leak(Box::new(control_plane::OwnershipRegistry::new()));
+    let registry = control_plane::OwnershipRegistry::new();
     let Ok(control_config) = ControlConfig::new(
         1,
         Duration::from_secs(30),
@@ -8817,7 +8820,7 @@ async fn spawn_local_route_plane(user: &str, backend_port: u16) -> LocalRoutePla
         unreachable!("control config")
     };
     let Ok(runtime) = ControlRuntime::claim_process(
-        registry,
+        &registry,
         "dataplane-local-route-fixture",
         control_config,
         Arc::new(SilentSink),
@@ -8920,8 +8923,8 @@ async fn local_route_stack_admits_two_sequential_sessions() {
         .flatten()
     else {
         stack.dispatch_task.abort();
-        plane.shutdown();
-        backend.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!("stage admit: the first session never completed its handshake")
     };
     assert!(first.query_ok("SELECT 1").await, "first session serves");
@@ -8937,7 +8940,8 @@ async fn local_route_stack_admits_two_sequential_sessions() {
         .flatten()
     else {
         stack.dispatch_task.abort();
-        plane.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!(
             "stage admit: the SECOND session never completed — the fixture still cannot admit one"
         )
@@ -8958,8 +8962,8 @@ async fn local_route_stack_admits_two_sequential_sessions() {
     first.quit().await;
     second.quit().await;
     stack.dispatch_task.abort();
-    plane.shutdown();
-    backend.shutdown();
+    plane.shutdown().await;
+    backend.shutdown().await;
 }
 
 /// The transport a task-#119 backend endpoint presents on one accepted
@@ -9001,8 +9005,15 @@ impl ConcurrentFakeBackend {
             .unwrap_or_default()
     }
 
-    fn shutdown(self) {
+    /// Cancels the listener and every connection handler it owns, then waits
+    /// for the listener task to actually finish.
+    ///
+    /// The handlers live in a `JoinSet` owned by the listener task, so
+    /// aborting the listener drops that set and cancels its children with it —
+    /// nothing is left running that the fixture cannot name.
+    async fn shutdown(self) {
         self.listener_task.abort();
+        let _ = self.listener_task.await;
     }
 }
 
@@ -9021,6 +9032,9 @@ async fn spawn_concurrent_fake_backend(modes: Vec<BackendMode>) -> ConcurrentFak
     let server_accepted = Arc::clone(&accepted);
     let server_headers = Arc::clone(&proxy_headers);
     let listener_task = tokio::spawn(async move {
+        // Owning the handlers here is what makes `shutdown()` deterministic:
+        // the set is dropped with this task, cancelling every child.
+        let mut handlers = tokio::task::JoinSet::new();
         let mut index = 0_usize;
         while let Ok((stream, _)) = listener.accept().await {
             let mode = modes[index.min(modes.len() - 1)];
@@ -9028,7 +9042,7 @@ async fn spawn_concurrent_fake_backend(modes: Vec<BackendMode>) -> ConcurrentFak
             server_accepted.fetch_add(1, Ordering::Relaxed);
             let headers = Arc::clone(&server_headers);
             // One task per connection: the whole point of this endpoint.
-            tokio::spawn(async move {
+            handlers.spawn(async move {
                 let broad = fake_backend_capabilities(false);
                 let stream = if mode == BackendMode::ProxyV2 {
                     let (mut read, write) = stream.into_split();
@@ -9136,8 +9150,8 @@ async fn reloaded_proxy_protocol_binds_the_next_session_only() {
         .flatten()
     else {
         stack.dispatch_task.abort();
-        plane.shutdown();
-        backend.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!("first session")
     };
     assert!(first.query_ok("SELECT 1").await, "plain dial serves");
@@ -9189,8 +9203,8 @@ async fn reloaded_proxy_protocol_binds_the_next_session_only() {
     .ok()
     .flatten() else {
         stack.dispatch_task.abort();
-        plane.shutdown();
-        backend.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!("second session under the reloaded PROXY config")
     };
     assert!(second.query_ok("SELECT 2").await, "v2 dial serves");
@@ -9219,8 +9233,8 @@ async fn reloaded_proxy_protocol_binds_the_next_session_only() {
     first.quit().await;
     second.quit().await;
     stack.dispatch_task.abort();
-    plane.shutdown();
-    backend.shutdown();
+    plane.shutdown().await;
+    backend.shutdown().await;
 }
 
 /// CFG-001: reloading `require_backend_tls` binds the *next* session's dial to
@@ -9241,8 +9255,8 @@ async fn reloaded_backend_tls_requirement_binds_the_next_session_only() {
         .flatten()
     else {
         stack.dispatch_task.abort();
-        plane.shutdown();
-        backend.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!("first session")
     };
     assert!(
@@ -9271,8 +9285,8 @@ async fn reloaded_backend_tls_requirement_binds_the_next_session_only() {
         .flatten()
     else {
         stack.dispatch_task.abort();
-        plane.shutdown();
-        backend.shutdown();
+        plane.shutdown().await;
+        backend.shutdown().await;
         unreachable!("second session under the reloaded TLS requirement")
     };
     assert!(
@@ -9294,6 +9308,6 @@ async fn reloaded_backend_tls_requirement_binds_the_next_session_only() {
     first.quit().await;
     second.quit().await;
     stack.dispatch_task.abort();
-    plane.shutdown();
-    backend.shutdown();
+    plane.shutdown().await;
+    backend.shutdown().await;
 }
