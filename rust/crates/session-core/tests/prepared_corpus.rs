@@ -25,7 +25,7 @@ use mysql_wire::{
     CapabilityFlags, ColumnType, CommandCode, CommandPacket, MAX_PAYLOAD_LEN, ParameterType,
     ParameterValue, PhysicalPacket,
 };
-use session_core::command::{Command, ExpectedResponse, dispatch};
+use session_core::command::{Command, ExpectedResponse, PreparedMutation, dispatch};
 use session_core::fsm::{SessionEvent, SessionFsm, SessionState};
 use session_core::prepared::{
     PrepareDisposition, PrepareMetadata, PrepareObserver, PreparedGuard, PreparedRegistry,
@@ -209,6 +209,19 @@ fn lifecycle_registry() -> PreparedRegistry {
     registry
 }
 
+/// Per-statement guard snapshot for the two statement IDs the lifecycle trace
+/// drives. `PreparedRegistry::has_pending` is an OR across every statement, so
+/// it cannot say *which* statement is pending, nor whether the guard is a
+/// cursor or outstanding long data. PARITY-PS-002 and PARITY-PS-003 are
+/// claims about one specific statement while another is also pending, so they
+/// need this shape to be falsifiable at all.
+fn guards(registry: &PreparedRegistry) -> (Option<PreparedGuard>, Option<PreparedGuard>) {
+    (
+        registry.get(7).map(PreparedStatementState::guard),
+        registry.get(8).map(PreparedStatementState::guard),
+    )
+}
+
 #[test]
 fn parity_rsp_006_prepare_metadata_modes_match_go_corpus() -> Result<(), Box<dyn Error>> {
     for (case_id, capabilities, expected) in [
@@ -316,23 +329,100 @@ fn parity_ps_004_execute_types_and_reuse_match_go_corpus() -> Result<(), Box<dyn
 
 #[test]
 fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box<dyn Error>> {
-    let records = load_trace("stmt-lifecycle-independent")?;
     let mut registry = lifecycle_registry();
-    let mut fsm = ready_fsm()?;
-    let mut current = None;
-    let mut pending_after_command = Vec::new();
+    let replay = replay_trace("stmt-lifecycle-independent", &mut registry)?;
 
+    assert_eq!(
+        replay.pending_after_command,
+        [true, true, true, true, true, false, false]
+    );
+    // The per-statement sequence, which `pending_after_command` cannot express.
+    // Step 2 is PARITY-PS-003: statement 7's execute returns ERR after long
+    // data, and its guard must survive that ERR. The aggregate boolean stays
+    // `true` at that step purely because statement 8 holds a cursor, so it
+    // would not notice statement 7 being cleared. Step 4 is PARITY-PS-001:
+    // resetting 7 must not disturb 8's cursor. Steps 1..5 are PARITY-PS-002:
+    // the cursor opens on execute, survives the first fetch, and only clears
+    // when the second fetch reports the last row.
+    assert_eq!(
+        replay.guards_after_command,
+        [
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::Idle)
+            ),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (
+                Some(PreparedGuard::LongDataPending),
+                Some(PreparedGuard::CursorOpen)
+            ),
+            (Some(PreparedGuard::Idle), Some(PreparedGuard::CursorOpen)),
+            (Some(PreparedGuard::Idle), Some(PreparedGuard::Idle)),
+            (Some(PreparedGuard::Idle), None),
+        ],
+        "PARITY-PS-001/PS-002/PS-003 per-statement guard sequence"
+    );
+    // Restores an assertion the pre-extraction version of this test had: the
+    // FSM's own `prepared_pending` flag, which is a different value from the
+    // registry aggregate and only follows it because the replay feeds
+    // `registry.session_event()` in. Asserting the registry sequence alone
+    // would not notice the flag falling out of sync.
+    assert_eq!(
+        replay.fsm_pending_after_command, replay.pending_after_command,
+        "the FSM flag must track the registry aggregate at every step"
+    );
+    assert_eq!(replay.fsm_pending_after_command.last(), Some(&false));
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::Idle)
+    );
+    assert!(registry.get(8).is_none());
+    Ok(())
+}
+
+/// Replays a Go corpus trace against `registry`, applying the same
+/// forward-time and response-time mutations, and records what the registry
+/// looked like after each completed command.
+struct Replay {
+    commands: Vec<Command>,
+    pending_after_command: Vec<bool>,
+    /// The FSM's own `prepared_pending` flag, which is a separate value from
+    /// `PreparedRegistry::has_pending()` and only tracks it because the replay
+    /// feeds `registry.session_event()` into the FSM. Recorded so a desync
+    /// between the two is visible.
+    fsm_pending_after_command: Vec<bool>,
+    guards_after_command: Vec<(Option<PreparedGuard>, Option<PreparedGuard>)>,
+}
+
+fn replay_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Replay, Box<dyn Error>> {
+    let records = load_trace(case_id)?;
+    let mut fsm = ready_fsm()?;
+    let mut awaiting: Option<(
+        Command,
+        ExpectedResponse,
+        Option<PreparedMutation>,
+        Option<u32>,
+    )> = None;
+    let mut replay = Replay {
+        commands: Vec::new(),
+        pending_after_command: Vec::new(),
+        fsm_pending_after_command: Vec::new(),
+        guards_after_command: Vec::new(),
+    };
     for record in &records {
         match record.direction {
             1 => {
-                assert!(
-                    current.is_none(),
-                    "previous command still awaits a response"
-                );
-                assert_eq!(fsm.state(), SessionState::Ready);
+                assert!(awaiting.is_none(), "{case_id}: previous command unanswered");
+                assert_eq!(fsm.state(), SessionState::Ready, "{case_id}");
                 let payload = only_client_payload(record)?;
-                let packet = CommandPacket::decode(&payload)?;
-                let plan = dispatch(packet)?;
+                let plan = dispatch(CommandPacket::decode(&payload)?)?;
                 let statement_id = match plan.command {
                     Command::StmtExecute
                     | Command::StmtSendLongData
@@ -349,11 +439,16 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
                     registry.apply_mutation(mutation);
                 }
                 fsm.on_event(registry.session_event())?;
+                replay.commands.push(plan.command);
                 if plan.response == ExpectedResponse::None {
                     fsm.on_event(SessionEvent::NoResponseCommandComplete)?;
-                    pending_after_command.push(registry.has_pending());
+                    replay.pending_after_command.push(registry.has_pending());
+                    replay
+                        .fsm_pending_after_command
+                        .push(fsm.flags().prepared_pending);
+                    replay.guards_after_command.push(guards(registry));
                 } else {
-                    current = Some((
+                    awaiting = Some((
                         plan.command,
                         plan.response,
                         plan.after_success.prepared,
@@ -363,7 +458,7 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
             }
             3 => {
                 let (command, response, after_success, statement_id) =
-                    current.take().ok_or_else(|| {
+                    awaiting.take().ok_or_else(|| {
                         IoError::new(ErrorKind::InvalidData, "orphan backend response")
                     })?;
                 for effect in observe_record(record, response)? {
@@ -382,8 +477,12 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
                     }
                     fsm.on_event(effect.session_event())?;
                 }
-                assert_eq!(fsm.state(), SessionState::Ready);
-                pending_after_command.push(registry.has_pending());
+                assert_eq!(fsm.state(), SessionState::Ready, "{case_id}");
+                replay.pending_after_command.push(registry.has_pending());
+                replay
+                    .fsm_pending_after_command
+                    .push(fsm.flags().prepared_pending);
+                replay.guards_after_command.push(guards(registry));
             }
             other => {
                 return Err(IoError::new(
@@ -394,19 +493,184 @@ fn parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus() -> Result<(), Box
             }
         }
     }
+    assert!(awaiting.is_none(), "{case_id} left a command unanswered");
+    Ok(replay)
+}
 
-    assert!(current.is_none());
+fn drive_trace(case_id: &str, registry: &mut PreparedRegistry) -> Result<Command, Box<dyn Error>> {
+    let replay = replay_trace(case_id, registry)?;
+    replay.commands.last().copied().ok_or_else(|| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            format!("{case_id} has no client command"),
+        )
+        .into()
+    })
+}
+
+/// The state half of PARITY-CMD-024/025/026/028 and PARITY-PS-002.
+///
+/// Their dispatch half -- command identity, byte index and response shape --
+/// is already replayed for every command byte by
+/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, which loads these
+/// very traces. What that replay cannot show is each command's effect on
+/// prepared state, which is the clause these rows actually carry. The traces
+/// were never unread; they were read without any prepared-state assertion.
+/// One trace per command here keeps a failure pointing at one row.
+#[test]
+fn parity_cmd_024_025_026_028_state_effects_match_go_corpus() -> Result<(), Box<dyn Error>> {
+    // PARITY-CMD-024: forwarded with no response, and the statement is left
+    // blocked until an execute/reset/close boundary.
+    let mut registry = lifecycle_registry();
     assert_eq!(
-        pending_after_command,
-        [true, true, true, true, true, false, false]
+        drive_trace("stmt-long-data", &mut registry)?,
+        Command::StmtSendLongData
     );
     assert_eq!(
         registry.get(7).map(PreparedStatementState::guard),
-        Some(PreparedGuard::Idle)
+        Some(PreparedGuard::LongDataPending),
+        "PARITY-CMD-024"
     );
-    assert!(registry.get(8).is_none());
-    assert!(!fsm.flags().prepared_pending);
-    assert_eq!(fsm.state(), SessionState::Ready);
+    assert_eq!(
+        registry.get(8).map(PreparedStatementState::guard),
+        Some(PreparedGuard::Idle),
+        "PARITY-CMD-024 must not touch another statement"
+    );
+
+    // PARITY-CMD-025: forwarded with no response, and it clears only the
+    // statement it names -- driven from the blocked state above, so a close
+    // that silently cleared nothing would be visible.
+    let mut registry = lifecycle_registry();
+    drive_trace("stmt-long-data", &mut registry)?;
+    assert_eq!(
+        drive_trace("stmt-close", &mut registry)?,
+        Command::StmtClose
+    );
+    assert!(registry.get(7).is_none(), "PARITY-CMD-025");
+    assert_eq!(
+        registry.get(8).map(PreparedStatementState::guard),
+        Some(PreparedGuard::Idle),
+        "PARITY-CMD-025 must not touch another statement"
+    );
+    assert!(!registry.has_pending());
+
+    // PARITY-CMD-026: generic OK, and the pending guard clears because that
+    // response completed the statement. The statement itself survives.
+    let mut registry = lifecycle_registry();
+    drive_trace("stmt-long-data", &mut registry)?;
+    assert_eq!(
+        drive_trace("stmt-reset", &mut registry)?,
+        Command::StmtReset
+    );
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::Idle),
+        "PARITY-CMD-026"
+    );
+    assert!(!registry.has_pending());
+
+    // PARITY-PS-002 / PARITY-CMD-023: execute opens the cursor.
+    let mut registry = lifecycle_registry();
+    assert_eq!(
+        drive_trace("stmt-execute-cursor", &mut registry)?,
+        Command::StmtExecute
+    );
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::CursorOpen),
+        "PARITY-PS-002"
+    );
+
+    // PARITY-CMD-028: a fetch whose status reports the last row releases the
+    // cursor. The other half of the clause -- a fetch that is *not* the last
+    // row keeps it -- is step 3 of
+    // `parity_ps_001_002_003_005_006_lifecycle_matches_go_corpus`.
+    assert_eq!(
+        drive_trace("stmt-fetch", &mut registry)?,
+        Command::StmtFetch
+    );
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::Idle),
+        "PARITY-CMD-028"
+    );
+    assert!(!registry.has_pending());
+    Ok(())
+}
+
+/// The `COM_RESET_CONNECTION` half of PARITY-PS-005.
+///
+/// The `COM_CHANGE_USER` half is
+/// `prepared_lifecycle::change_user_clears_all_only_after_relay_success`.
+/// The plan-level guarantee -- that `Command::ResetConnection` declares
+/// `PreparedMutation::ClearAll` -- is already pinned by the lib unit test
+/// `command::tests::state_changes_apply_only_at_declared_boundary`. This test
+/// is not what makes that detectable. What it adds is the state half: the
+/// `reset-connection` Go trace was replayed only by
+/// `parity_cmd_000_through_031_dispatch_from_go_corpus`, for command identity
+/// and response shape, so nothing checked that replaying it against a
+/// registry holding a real guard leaves nothing behind.
+#[test]
+fn parity_ps_005_reset_connection_clears_every_guard() -> Result<(), Box<dyn Error>> {
+    let mut registry = lifecycle_registry();
+    drive_trace("stmt-long-data", &mut registry)?;
+    assert_eq!(
+        registry.get(7).map(PreparedStatementState::guard),
+        Some(PreparedGuard::LongDataPending),
+        "precondition: statement 7 is blocked before the reset"
+    );
+    assert!(registry.has_pending());
+
+    assert_eq!(
+        drive_trace("reset-connection", &mut registry)?,
+        Command::ResetConnection
+    );
+
+    // Nothing survives the successful reset: no statement is left holding a
+    // guard, and the blocked statement 7 in particular is gone rather than
+    // merely idle.
+    assert!(!registry.has_pending(), "PARITY-PS-005");
+    assert!(registry.get(7).is_none(), "PARITY-PS-005");
+    assert!(registry.get(8).is_none(), "PARITY-PS-005");
+    assert!(registry.is_empty(), "PARITY-PS-005");
+    Ok(())
+}
+
+/// PARITY-CMD-026's ERR branch.
+///
+/// The Go corpus `stmt-reset` trace carries an OK, so replaying it shows the
+/// success path only. The row also says the pending state clears *only* when
+/// the response completes the statement -- an ERR must leave the guard alone
+/// -- and there is no corpus trace for a reset that fails.
+///
+/// What makes the ERR branch correct is where the mutation is declared:
+/// `StmtReset` puts `Reset` in `after_success`, which is applied only on a
+/// successful completion. Moving it to `after_forward` would clear the guard
+/// on an ERR, and nothing asserted that placement.
+///
+/// The sibling no-response commands are **already** covered: the lib test
+/// `command::tests::no_response_commands_never_wait_and_apply_after_forward`
+/// asserts `after_forward.prepared` and a default `after_success` for both
+/// `StmtClose` (PARITY-CMD-025) and `StmtSendLongData` (PARITY-CMD-024).
+/// `StmtReset` was the one boundary with no assertion on it.
+#[test]
+fn parity_cmd_026_reset_declares_its_mutation_after_success() -> Result<(), Box<dyn Error>> {
+    let records = load_trace("stmt-reset")?;
+    let payload = only_client_payload(&records[0])?;
+    let plan = dispatch(CommandPacket::decode(&payload)?)?;
+    assert_eq!(plan.command, Command::StmtReset);
+    let statement_id =
+        PreparedRegistry::statement_id(&payload, CommandCode::from_byte(plan.command.as_byte()))?;
+    assert_eq!(
+        plan.after_forward.prepared, None,
+        "PARITY-CMD-026: a reset that fails must not clear the guard, so the \
+         mutation cannot be declared at forward time"
+    );
+    assert_eq!(
+        plan.after_success.prepared,
+        Some(PreparedMutation::Reset(statement_id)),
+        "PARITY-CMD-026"
+    );
     Ok(())
 }
 
