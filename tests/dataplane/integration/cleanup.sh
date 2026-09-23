@@ -24,32 +24,106 @@ if [[ -f $run_dir/state.env ]]; then
 	source "$run_dir/state.env"
 fi
 
+# Deciseconds allowed after SIGINT, then after SIGTERM, before giving up.
+#
+# A single helper (faultproxy, a dropper, one tiproxy) exits promptly. A
+# `tiup playground` has to stop an entire cluster — PD, TiKV, two TiDB and a
+# TiProxy — and on a loaded CI runner that legitimately takes longer than the
+# 30s/10s a helper needs. Issue #274: one uniform budget made a passing test
+# fail during teardown, twice, on two different integration targets.
+readonly STOP_INT_DECISECONDS=300
+readonly STOP_TERM_DECISECONDS=100
+readonly STOP_INT_DECISECONDS_CLUSTER=1200
+readonly STOP_TERM_DECISECONDS_CLUSTER=300
+
+# stop_owned_process PID EXPECTED_MARKER [class]
+#
+# `class` selects the shutdown budget: "cluster" for a whole playground,
+# anything else (default) for a single helper process.
 stop_owned_process() {
 	local pid=$1
 	local expected=$2
+	local class=${3:-helper}
 	local signal=INT
 	local command_line
 	local process_state
+	local int_budget=$STOP_INT_DECISECONDS
+	local term_budget=$STOP_TERM_DECISECONDS
+	if [[ $class == cluster ]]; then
+		int_budget=$STOP_INT_DECISECONDS_CLUSTER
+		term_budget=$STOP_TERM_DECISECONDS_CLUSTER
+	fi
 	[[ $pid =~ ^[0-9]+$ ]] || return 0
 	command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
 	[[ -n $command_line ]] || return 0
+	# Marker check first: never signal a PID this run does not own.
 	if [[ $command_line != *"$expected"* ]]; then
 		echo "refusing to signal PID $pid: command does not contain '$expected'" >&2
 		return 1
 	fi
 	kill -s "$signal" "$pid" 2>/dev/null || true
-	for _ in {1..300}; do
+	for ((i = 0; i < int_budget; i++)); do
 		process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
 		[[ -z $process_state || $process_state == Z* ]] && return 0
 		sleep 0.1
 	done
+	# Re-verify identity before the SECOND signal. The first check happened up
+	# to `int_budget` ago — 120s for a cluster — and the process may have
+	# exited between two polls and had its PID reused, or exec'd into
+	# something else under the same PID. Signalling on the strength of the
+	# earlier check would break the marker-before-signal invariant precisely
+	# when the window is widest.
+	command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ -z $command_line ]]; then
+		# It exited during or just after the INT budget: that is a success.
+		return 0
+	fi
+	if [[ $command_line != *"$expected"* ]]; then
+		echo "refusing to TERM PID $pid: command no longer contains '$expected'" >&2
+		echo "  command=$command_line" >&2
+		return 1
+	fi
 	kill -s TERM "$pid" 2>/dev/null || true
-	for _ in {1..100}; do
+	for ((i = 0; i < term_budget; i++)); do
 		process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
 		[[ -z $process_state || $process_state == Z* ]] && return 0
 		sleep 0.1
 	done
-	echo "owned process $pid did not exit after INT and TERM" >&2
+	# Name what failed. The previous message carried only the PID, so working
+	# out which owned process it was meant downloading the CI artifact.
+	process_state=$(ps -p "$pid" -o state= 2>/dev/null || true)
+	local children=
+	local latest_command
+	# Report anything read from this PID only while it still proves
+	# ownership. An unverified re-read could print a bystander's full
+	# command line — the PID may have been reused after the process exited
+	# during the TERM wait — into a public CI log, labelled as the process
+	# we signalled. The children are attributed to the same PID, so they
+	# live behind the same proof. Anything else keeps the pre-TERM verified
+	# command, says why, and enumerates nothing.
+	latest_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+	if [[ -z $latest_command ]]; then
+		command_line="$command_line (exited after the last verified read)"
+	elif [[ $latest_command == *"$expected"* ]]; then
+		command_line=$latest_command
+		# GNU ps; absent on macOS, where this block is only read by a
+		# developer reproducing locally, so print the line only when there
+		# is something.
+		children=$(ps --ppid "$pid" -o pid=,state=,command= 2>/dev/null || true)
+	else
+		command_line="$command_line (PID identity changed after the last verified read)"
+	fi
+	{
+		echo "owned process $pid did not exit after INT and TERM"
+		echo "  class=$class budget=INT ${int_budget}ds then TERM ${term_budget}ds"
+		echo "  marker=$expected"
+		echo "  state=${process_state:-<gone>}"
+		echo "  command=$command_line"
+		[[ -n $children ]] && printf '  children:\n%s\n' "$(echo "$children" | sed 's/^/    /')"
+	} >&2
+	# Bounded either way: report and let the caller set cleanup_status. Whether
+	# to add a final SIGKILL backstop is deliberately left to issue #274, since
+	# it trades guaranteed teardown against losing a hung process's state.
 	return 1
 }
 
@@ -176,7 +250,7 @@ fi
 if [[ ${TIUP_PID:-} =~ ^[0-9]+$ ]] && command -v tiup >/dev/null 2>&1; then
 	tiup clean "$tag" >>"$run_dir/cleanup.log" 2>&1 || true
 fi
-stop_owned_process "${TIUP_PID:-}" "$tag" || cleanup_status=1
+stop_owned_process "${TIUP_PID:-}" "$tag" cluster || cleanup_status=1
 
 # If the launcher failed before or during TiUP cleanup, delete only a directory
 # bearing the marker written by this exact run. The validated tag and marker
@@ -205,7 +279,7 @@ if [[ ${TAG_B:-} == "$tag-b" ]]; then
 	if [[ ${TIUP_B_PID:-} =~ ^[0-9]+$ ]] && command -v tiup >/dev/null 2>&1; then
 		tiup clean "$TAG_B" >>"$run_dir/cleanup.log" 2>&1 || true
 	fi
-	stop_owned_process "${TIUP_B_PID:-}" "$TAG_B" || cleanup_status=1
+	stop_owned_process "${TIUP_B_PID:-}" "$TAG_B" cluster || cleanup_status=1
 	tiup_data_b="$tiup_root/data/$TAG_B"
 	marker_b="$tiup_data_b/.tiproxy-integration-owned"
 	if [[ -d $tiup_data_b ]]; then
