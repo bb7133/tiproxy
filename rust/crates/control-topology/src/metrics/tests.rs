@@ -434,3 +434,53 @@ fn owner_output_stops_before_exceeding_wire_byte_limit() -> Result<(), Box<dyn s
     assert_eq!(history.owner_json(&[])?, b"{}");
     Ok(())
 }
+
+#[test]
+fn parity_221_prometheus_and_backend_fallback_expose_the_same_factor_input() {
+    // #221 close evidence: the balance metricsreader reads Prometheus first and
+    // falls back to the backend `/metrics` endpoint. Whichever source supplies a
+    // round, the value the reader exposes to the factor input must be identical
+    // and the recorded source must reflect where it came from. (Wire-format decode
+    // equivalence for the two sources is covered by the `source`/`prom_decode`/
+    // `backend_decode` fixture cases above; this pins the reader-level integration
+    // that ties Prometheus-first + backend fallback to a single factor input.)
+    let value = 0.625_f64;
+    let sample = || {
+        BTreeMap::from([(
+            QueryId::Memory,
+            QueryResult {
+                kind: ValueKind::Vector,
+                series: vec![Series {
+                    labels: BTreeMap::default(),
+                    samples: vec![Sample {
+                        timestamp_ms: 1,
+                        value,
+                    }],
+                }],
+                updated_nanos: Some(1),
+            },
+        )])
+    };
+    let read = |reader: &ReaderState| {
+        reader
+            .get(QueryId::Memory)
+            .map(|result| result.series[0].samples[0].value)
+    };
+
+    // Prometheus-first path.
+    let mut prometheus = ReaderState::default();
+    prometheus.complete_prom(sample());
+    assert_eq!(prometheus.source(), Source::Prometheus);
+    let prometheus_value = read(&prometheus);
+    assert_eq!(prometheus_value, Some(value));
+
+    // Backend `/metrics` fallback path (Prometheus unavailable this round).
+    let mut backend = ReaderState::default();
+    backend.complete_backend(sample(), true);
+    assert_eq!(backend.source(), Source::Backend);
+    let backend_value = read(&backend);
+    assert_eq!(backend_value, Some(value));
+
+    // The differential: both source paths feed the factor the same value.
+    assert_eq!(prometheus_value, backend_value);
+}
