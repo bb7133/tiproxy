@@ -1129,6 +1129,9 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Ok(()))
         }
         () = &mut termination => {
+            // Close readiness as soon as SIGTERM wins the select, even if an
+            // in-flight config apply briefly delays the applied-snapshot read.
+            lb_readiness.mark_unhealthy();
             let lb_wait = serving.graceful_wait_before_shutdown().await;
             let event = async {
                 tokio::select! {
