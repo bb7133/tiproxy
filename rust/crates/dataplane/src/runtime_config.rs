@@ -365,6 +365,16 @@ impl SnapshotConsumer for DataplaneSnapshotConsumer {
 }
 
 impl DataplaneServingHandle {
+    /// Returns the load-balancer removal window from the last applied SQL
+    /// serving generation. It is zero before the first bind.
+    pub async fn graceful_wait_before_shutdown(&self) -> Duration {
+        let serving = self.state.lock().await;
+        serving.handle.as_ref().map_or(
+            Duration::ZERO,
+            DataplaneHandle::graceful_wait_before_shutdown,
+        )
+    }
+
     /// Observes every Rust-owned config generation a successful serving
     /// apply installed (initial bind, bridge apply, and recomposition alike).
     /// The generation is read from the validated view that was installed, so

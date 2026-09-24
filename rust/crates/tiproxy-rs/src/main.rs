@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config_composition::{
@@ -874,6 +875,9 @@ async fn run(options: Options) -> Result<(), String> {
     // recovers (it answers not-ready until the SQL gate opens).
     let meter_slot: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>> =
         Arc::new(std::sync::OnceLock::new());
+    // LB readiness must turn off before stop-accept without changing the
+    // process lifecycle: Quiescing also revokes route admission authority.
+    let lb_readiness = LbReadiness::new(in_process.handle());
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
@@ -884,7 +888,10 @@ async fn run(options: Options) -> Result<(), String> {
         route_config_source,
         topology_handle,
         Arc::clone(&runtime_stats),
-        Arc::clone(&meter_slot),
+        HealthGates {
+            lb_readiness: lb_readiness.clone(),
+            meter: Arc::clone(&meter_slot),
+        },
     )
     .await
     {
@@ -930,7 +937,7 @@ async fn run(options: Options) -> Result<(), String> {
     let admin_app = match spawn_admin(
         admin_address,
         admin_hooks(
-            &in_process,
+            lb_readiness.clone(),
             &config_owner.handle,
             &serving,
             &metrics_registry,
@@ -1122,9 +1129,63 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Ok(()))
         }
         () = &mut termination => {
-            in_process
-                .begin_shutdown(ShutdownReason::Signal)
-                .map_err(|error| format!("begin signal shutdown: {error}"))?;
+            // Both health surfaces return 503 while the lifecycle stays Ready
+            // and SQL remains usable. Quiescing here would revoke route
+            // admission authority and cause config modules to exit early.
+            lb_readiness.mark_unhealthy();
+            // A failing owner preempts the LB wait and stops admission.
+            let lb_wait = serving.graceful_wait_before_shutdown().await;
+            let mut early_control = None;
+            let mut early_sampler = None;
+            let mut module_result = Ok(());
+            let interruption = wait_for_lb_removal_or(lb_wait, async {
+                tokio::select! {
+                    control = &mut control_runtime => OrderedWaitExit::Control(match control {
+                        Ok(Ok(())) => Err("control runtime exited during load-balancer wait".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("control runtime supervisor panicked".to_owned()),
+                    }),
+                    sampler = &mut metering_sampler => OrderedWaitExit::Sampler(match sampler {
+                        Ok(Ok(())) => Err("metering sampler exited during load-balancer wait".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("metering sampler panicked".to_owned()),
+                    }),
+                    admin = &mut admin_exit => OrderedWaitExit::Admin(match admin {
+                        Ok(()) => "control admin server exited during load-balancer wait".to_owned(),
+                        Err(_) => "control admin server panicked".to_owned(),
+                    }),
+                    module = modules.join_next() => OrderedWaitExit::Module(match module {
+                        Some(exit) => match exit.result {
+                            Ok(()) => format!("control module {} exited during load-balancer wait", exit.module),
+                            Err(error) => format!("control module {} failed: {error}", exit.module),
+                        },
+                        None => "control module executor became empty during load-balancer wait".to_owned(),
+                    }),
+                }
+            }).await;
+            match interruption {
+                None => {
+                    in_process
+                        .begin_shutdown(ShutdownReason::Signal)
+                        .map_err(|error| format!("begin signal shutdown: {error}"))?;
+                }
+                Some(OrderedWaitExit::Control(control)) => {
+                    early_control = Some(control);
+                    in_process.fail("legacy_bridge", "runtime_failure");
+                }
+                Some(OrderedWaitExit::Sampler(sampler)) => {
+                    early_sampler = Some(sampler);
+                    in_process.fail("metering_sampler", "runtime_failure");
+                }
+                Some(OrderedWaitExit::Admin(failure)) => {
+                    module_result = Err(failure);
+                    in_process.fail("control_admin", "runtime_failure");
+                }
+                Some(OrderedWaitExit::Module(failure)) => {
+                    module_result = Err(failure);
+                    in_process.fail("control_module", "runtime_failure");
+                }
+            }
             let serving_result = stop_drain_and_join_sessions(
                 &in_process,
                 &serving,
@@ -1132,16 +1193,22 @@ async fn run(options: Options) -> Result<(), String> {
                 &session_shutdown_tx,
             ).await;
             metering_shutdown_tx.send_replace(true);
-            let sampler = match metering_sampler.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err("metering sampler panicked".to_owned()),
+            let sampler = match early_sampler {
+                Some(result) => result,
+                None => match metering_sampler.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("metering sampler panicked".to_owned()),
+                },
             };
             shared_client.shutdown();
-            let control = match control_runtime.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            let control = match early_control {
+                Some(result) => result,
+                None => match control_runtime.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("control runtime supervisor panicked".to_owned()),
+                },
             };
-            (control, sampler, serving_result, Ok(()))
+            (control, sampler, serving_result, module_result)
         }
         admin = &mut admin_exit => {
             let failure = match admin {
@@ -1246,6 +1313,33 @@ fn prefer_control_failure(
     sampler
 }
 
+enum OrderedWaitExit {
+    Control(Result<(), String>),
+    Sampler(Result<(), String>),
+    Admin(String),
+    Module(String),
+}
+
+/// The orderly signal path keeps its SQL listener open until the LB removal
+/// deadline, unless a supervised owner exits. Dropping the timer on that exit
+/// lets the caller stop admission immediately.
+async fn wait_for_lb_removal_or<F: Future>(duration: Duration, event: F) -> Option<F::Output> {
+    tokio::select! {
+        () = sleep_lb_window(duration) => None,
+        event = event => Some(event),
+    }
+}
+
+async fn sleep_lb_window(mut remaining: Duration) {
+    // The wire field is u64 milliseconds. Split extreme, but valid, values
+    // so Tokio never adds an overflowing duration to its monotonic clock.
+    while !remaining.is_zero() {
+        let chunk = remaining.min(Duration::from_secs(24 * 60 * 60));
+        tokio::time::sleep(chunk).await;
+        remaining -= chunk;
+    }
+}
+
 async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
     join_modules_with_timeout(modules, CONTROL_MODULE_SHUTDOWN_TIMEOUT).await
 }
@@ -1320,7 +1414,7 @@ async fn spawn_health(
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
     dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
-    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
+    gates: HealthGates,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -1333,11 +1427,15 @@ async fn spawn_health(
     let ledger_routes = routes.clone();
     let topology_status = topology.status();
     let routing = topology.routing_handle();
+    let HealthGates {
+        lb_readiness,
+        meter,
+    } = gates;
     Ok(Some(tokio::spawn(health::serve(
         listener,
         serving,
         // Before the native meter opens the SQL gate is closed anyway.
-        Arc::new(move || meter.get().is_none_or(|meter| meter.healthy())),
+        Arc::new(move || lb_readiness.ready() && meter.get().is_none_or(|meter| meter.healthy())),
         Arc::new(move || routes.route_input_evidence()),
         Arc::new(move || ledger_routes.route_ledger_evidence()),
         Arc::new(move || {
@@ -1355,12 +1453,45 @@ async fn spawn_health(
                 routing_client_epoch: routing.as_ref().map_or(0, |source| source.client_epoch),
             }
         }),
-        Arc::new(move || {
-            dispatch_stats
-                .drain_watermark
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }),
+        Arc::new(move || dispatch_stats.drain_watermark.load(Ordering::Relaxed)),
     ))))
+}
+
+#[derive(Clone)]
+struct LbReadiness {
+    lifecycle: control_plane::RuntimeHandle,
+    unhealthy: Arc<AtomicBool>,
+}
+
+struct HealthGates {
+    lb_readiness: LbReadiness,
+    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
+}
+
+impl LbReadiness {
+    fn new(lifecycle: control_plane::RuntimeHandle) -> Self {
+        Self {
+            lifecycle,
+            unhealthy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_unhealthy(&self) {
+        self.unhealthy.store(true, Ordering::SeqCst);
+    }
+
+    fn ready(&self) -> bool {
+        !self.unhealthy.load(Ordering::SeqCst)
+            && self.lifecycle.lifecycle().phase == LifecyclePhase::Ready
+    }
+
+    fn closing(&self) -> bool {
+        self.unhealthy.load(Ordering::SeqCst)
+            || !matches!(
+                self.lifecycle.lifecycle().phase,
+                LifecyclePhase::Starting | LifecyclePhase::Ready
+            )
+    }
 }
 
 /// ONE grace lineage: the CLI's validated drain grace IS the
@@ -1858,7 +1989,7 @@ struct AdminPlaneSeams {
 }
 
 fn admin_hooks(
-    in_process: &Arc<InProcessControlRuntime>,
+    lb_readiness: LbReadiness,
     config: &ConfigModuleHandle,
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
@@ -1870,7 +2001,6 @@ fn admin_hooks(
         backend_metrics,
         route_plane,
     } = seams;
-    let lifecycle = in_process.handle();
     let health_config = config.clone();
     let health_serving = serving.clone();
     let status_serving = serving.clone();
@@ -1882,10 +2012,7 @@ fn admin_hooks(
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {
             // Go `PreClose` sets closing when the drain begins.
-            closing: !matches!(
-                lifecycle.lifecycle().phase,
-                LifecyclePhase::Starting | LifecyclePhase::Ready
-            ),
+            closing: lb_readiness.closing(),
             namespaces_ready: health_config.is_ready(),
             applied_generation: health_serving.status().applied_generation,
             config_checksum: health_config.source().current().config_checksum(),
@@ -2194,6 +2321,58 @@ mod tests {
             ),
             Err("metering durable dispatch rejected snapshots: Persistence".to_owned())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lb_removal_wait_elapses_but_supervised_fault_preempts_it() {
+        let elapsed =
+            super::wait_for_lb_removal_or(Duration::from_secs(3), std::future::pending::<()>())
+                .await;
+        assert_eq!(elapsed, None);
+
+        let (fault_tx, fault_rx) = tokio::sync::oneshot::channel();
+        let wait = tokio::spawn(super::wait_for_lb_removal_or(
+            Duration::from_secs(30),
+            async {
+                fault_rx
+                    .await
+                    .unwrap_or_else(|error| unreachable!("fault sender: {error}"))
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(!wait.is_finished(), "the listener window is still active");
+        fault_tx
+            .send("module failed")
+            .unwrap_or_else(|_| unreachable!("waiter still exists"));
+        assert_eq!(
+            wait.await
+                .unwrap_or_else(|error| unreachable!("wait task: {error}")),
+            Some("module failed")
+        );
+
+        let huge = super::wait_for_lb_removal_or(Duration::MAX, async { "fault" }).await;
+        assert_eq!(huge, Some("fault"));
+    }
+
+    #[test]
+    fn lb_readiness_turns_off_while_route_admission_stays_ready() {
+        let owner = armed_owner();
+        let lb_readiness = super::LbReadiness::new(owner.handle());
+        assert!(!lb_readiness.ready());
+        owner
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        assert!(lb_readiness.ready());
+        lb_readiness.mark_unhealthy();
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Ready);
+        assert!(!lb_readiness.ready());
+        assert!(lb_readiness.closing());
+        owner
+            .begin_shutdown(control_plane::ShutdownReason::Signal)
+            .unwrap_or_else(|error| unreachable!("begin ordered shutdown: {error}"));
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Quiescing);
+        assert!(!lb_readiness.ready());
     }
 
     type TeardownLog = Arc<Mutex<Vec<&'static str>>>;

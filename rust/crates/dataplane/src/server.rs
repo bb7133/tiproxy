@@ -175,6 +175,20 @@ pub struct DataplaneHandle {
 }
 
 impl DataplaneHandle {
+    /// Returns the load-balancer removal window from the last applied serving
+    /// snapshot. A candidate that failed validation must not change shutdown.
+    #[must_use]
+    pub fn graceful_wait_before_shutdown(&self) -> Duration {
+        Duration::from_millis(
+            self.snapshot_tx
+                .borrow()
+                .raw()
+                .config
+                .as_ref()
+                .map_or(0, |config| config.graceful_wait_millis),
+        )
+    }
+
     /// Atomically publishes a complete validated generation for new
     /// admissions/sessions. Existing sessions retain their captured `Arc`,
     /// while their private watch receiver exposes the explicit live-topology
@@ -1053,6 +1067,43 @@ mod tests {
                 SnapshotLineage::for_tests("go-fixture"),
             )?
             .snapshot)
+    }
+
+    #[tokio::test]
+    async fn lb_wait_reads_last_applied_serving_generation() -> Result<(), Box<dyn Error>> {
+        let first = snapshot_with(1, one_listener(), |config| {
+            config.graceful_wait_millis = 250;
+            config.graceful_close_millis = 9_000;
+        })?;
+        let server = ephemeral_server(first, Arc::new(MutableMemory::new(1, 100))).await?;
+        let handle = server.handle();
+        assert_eq!(
+            handle.graceful_wait_before_shutdown(),
+            Duration::from_millis(250)
+        );
+
+        let second = snapshot_with(2, one_listener(), |config| {
+            config.graceful_wait_millis = 800;
+            config.graceful_close_millis = 1;
+        })?;
+        handle.update_snapshot(second)?;
+        assert_eq!(
+            handle.graceful_wait_before_shutdown(),
+            Duration::from_millis(800),
+            "LB wait is independent of the session drain grace"
+        );
+        let mut changed_listener = one_listener();
+        changed_listener[0].port += 1;
+        let rejected = snapshot_with(3, changed_listener, |config| {
+            config.graceful_wait_millis = 4_000;
+        })?;
+        assert!(handle.update_snapshot(rejected).is_err());
+        assert_eq!(
+            handle.graceful_wait_before_shutdown(),
+            Duration::from_millis(800),
+            "a rejected serving generation cannot extend shutdown"
+        );
+        Ok(())
     }
 
     fn one_listener() -> Vec<Listener> {
