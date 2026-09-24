@@ -36,11 +36,20 @@ Status values:
 | --- | --- |
 | `GO-VERIFIED / RUST-TODO` | Go source and a focused Go test exist; Rust parity is not yet demonstrated. |
 | `GO-IMPLEMENTED / RUST-TODO` | Go source exists but focused Go coverage is missing or indirect. The parity test must first freeze the observed behavior. |
+| `RUST-IMPLEMENTED` | The Rust implementation exists, but the row's evidence or behavior is not yet closed. An audited row must state the precise residual; a bare `RUST-IMPLEMENTED` with no note means nobody has enumerated what is missing. |
+| `RUST-VERIFIED` | Every clause of the requirement is carried by the Rust **production** path, the row says how, and it cites specific Rust tests or integration evidence that discriminate on the clause. Citing test names is not sufficient on its own: evidence that does not reach the production wiring, or that would pass with the behavior removed, does not qualify. Where the contract was deliberately narrowed, the row names the narrowing and what is no longer promised. |
 | `DECISION-REQUIRED` | Go behavior is ambiguous, accidental, or unsafe to copy. Resolve before implementing Rust. |
 | `PARITY-VERIFIED` | The referenced differential/integration test passes for Go and Rust at the recorded revisions. |
 | `RUST-PARTIAL` | Rust implements and verifies a bounded subset of the Go behavior; the row states the remaining gap. |
+| `RUST-DIVERGENT-BY-DESIGN` | Rust's behavior differs from Go's, the difference has been explicitly accepted, and the row records the difference, the reason it was accepted, and evidence of what Rust actually does. An ordinary implementation gap is not a divergence and must not be recorded as one. |
 | `EXCLUDED` | Deliberately outside the Rust dataplane contract. |
 | `RETIRED` | No longer required; the row must link to the approved removal. |
+
+The `GO-` and `RUST-` halves are independent: `GO-IMPLEMENTED` describes the
+strength of the Go-side evidence a row was frozen against, and constrains what
+the Rust side can claim to match, but it does not by itself cap the Rust
+status. `DECISION-REQUIRED`, `PARITY-VERIFIED`, `EXCLUDED` and `RETIRED` stand
+alone and take no `GO-`/`RUST-` pair.
 
 Severity is evaluated separately for canary and cutover:
 
