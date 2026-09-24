@@ -1162,7 +1162,7 @@ async fn run(options: Options) -> Result<(), String> {
                 &in_process,
                 &serving,
                 &lb_readiness,
-                lb_wait,
+                sleep_lb_window(lb_wait),
                 event,
                 &drain_tx,
                 &session_shutdown_tx,
@@ -1313,11 +1313,14 @@ enum OrderedWaitExit {
 /// Coordinates the two shutdown clocks on the actual signal path. Readiness
 /// closes first while lifecycle stays Ready, then the applied LB wait runs;
 /// only after that do Quiescing, listener stop, and session drain begin.
-async fn signal_stop_drain_and_join_sessions<F: Future<Output = OrderedWaitExit>>(
+async fn signal_stop_drain_and_join_sessions<
+    W: Future<Output = ()>,
+    F: Future<Output = OrderedWaitExit>,
+>(
     runtime: &InProcessControlRuntime,
     serving: &DataplaneServingHandle,
     lb_readiness: &LbReadiness,
-    lb_wait: Duration,
+    lb_wait: W,
     event: F,
     drain: &watch::Sender<Option<Duration>>,
     session_shutdown: &watch::Sender<bool>,
@@ -1341,9 +1344,12 @@ async fn signal_stop_drain_and_join_sessions<F: Future<Output = OrderedWaitExit>
 /// The orderly signal path keeps its SQL listener open until the LB removal
 /// deadline, unless a supervised owner exits. Dropping the timer on that exit
 /// lets the caller stop admission immediately.
-async fn wait_for_lb_removal_or<F: Future>(duration: Duration, event: F) -> Option<F::Output> {
+async fn wait_for_lb_removal_or<W: Future<Output = ()>, F: Future>(
+    wait: W,
+    event: F,
+) -> Option<F::Output> {
     tokio::select! {
-        () = sleep_lb_window(duration) => None,
+        () = wait => None,
         event = event => Some(event),
     }
 }
@@ -2348,14 +2354,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn lb_removal_wait_elapses_but_supervised_fault_preempts_it() {
-        let elapsed =
-            super::wait_for_lb_removal_or(Duration::from_secs(3), std::future::pending::<()>())
-                .await;
+        let elapsed = super::wait_for_lb_removal_or(
+            super::sleep_lb_window(Duration::from_secs(3)),
+            std::future::pending::<()>(),
+        )
+        .await;
         assert_eq!(elapsed, None);
 
         let (fault_tx, fault_rx) = tokio::sync::oneshot::channel();
         let wait = tokio::spawn(super::wait_for_lb_removal_or(
-            Duration::from_secs(30),
+            super::sleep_lb_window(Duration::from_secs(30)),
             async {
                 fault_rx
                     .await
@@ -2374,7 +2382,9 @@ mod tests {
             Some("module failed")
         );
 
-        let huge = super::wait_for_lb_removal_or(Duration::MAX, async { "fault" }).await;
+        let huge =
+            super::wait_for_lb_removal_or(super::sleep_lb_window(Duration::MAX), async { "fault" })
+                .await;
         assert_eq!(huge, Some("fault"));
     }
 
@@ -2469,7 +2479,7 @@ mod tests {
         (serving, port, seen_rx)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn signal_coordinator_keeps_lb_and_session_drain_clocks_separate() {
         let owner = armed_owner();
         owner
@@ -2479,10 +2489,15 @@ mod tests {
         let (serving, port, mut seen_rx) = bound_serving_with_lb_wait(2_000).await;
         assert!(serving.is_serving().await);
         assert!(readiness.ready());
-        let lb_wait = serving.graceful_wait_before_shutdown().await;
+        assert_eq!(
+            serving.graceful_wait_before_shutdown().await,
+            Duration::from_secs(2)
+        );
         let serving_probe = serving.clone();
-        let (drain_tx, drain_rx) = watch::channel(None);
+        let (drain_tx, mut drain_rx) = watch::channel(None);
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let (lb_done_tx, lb_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let coordinator = tokio::spawn({
             let owner = Arc::clone(&owner);
             let readiness = readiness.clone();
@@ -2491,15 +2506,26 @@ mod tests {
                     &owner,
                     &serving,
                     &readiness,
-                    lb_wait,
-                    std::future::pending::<super::OrderedWaitExit>(),
+                    async {
+                        lb_done_rx
+                            .await
+                            .unwrap_or_else(|error| unreachable!("LB window release: {error}"));
+                    },
+                    async {
+                        ready_tx
+                            .send(())
+                            .unwrap_or_else(|()| unreachable!("readiness handshake receiver"));
+                        std::future::pending::<super::OrderedWaitExit>().await
+                    },
                     &drain_tx,
                     &session_shutdown_tx,
                 )
                 .await
             }
         });
-        tokio::task::yield_now().await;
+        ready_rx
+            .await
+            .unwrap_or_else(|error| unreachable!("readiness handshake: {error}"));
         assert!(!readiness.ready());
         assert!(readiness.closing());
         assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Ready);
@@ -2509,18 +2535,29 @@ mod tests {
             .await
             .unwrap_or_else(|error| unreachable!("accept during LB wait: {error}"));
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
                 .await
                 .unwrap_or_else(|error| unreachable!("admission receipt: {error}")),
             Some(())
         );
         drop(connection);
 
-        // Socket polling can advance Tokio's paused clock while other tests
-        // run. Admission above proves the listener remained open; advancing
-        // a whole LB window from here reliably crosses its deadline.
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        // Keep real socket I/O on a real clock. The timer itself is tested
+        // separately; this production-coordinator test controls the boundary
+        // so scheduler load cannot close the listener before the admission.
+        lb_done_tx
+            .send(())
+            .unwrap_or_else(|()| unreachable!("coordinator still waits"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while drain_rx.borrow().is_none() {
+                drain_rx
+                    .changed()
+                    .await
+                    .unwrap_or_else(|error| unreachable!("drain signal: {error}"));
+            }
+        })
+        .await
+        .unwrap_or_else(|error| unreachable!("drain starts: {error}"));
         assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Draining);
         assert_eq!(*drain_rx.borrow(), Some(Duration::from_secs(30)));
         assert!(!*session_shutdown_rx.borrow());
@@ -2535,6 +2572,7 @@ mod tests {
         }
         assert!(refused, "SQL listener stops before the session drain grace");
 
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(!*session_shutdown_rx.borrow());
         tokio::time::advance(Duration::from_secs(30)).await;
@@ -2570,7 +2608,7 @@ mod tests {
                     &owner,
                     &serving,
                     &readiness,
-                    Duration::from_secs(60),
+                    super::sleep_lb_window(Duration::from_secs(60)),
                     async {
                         fault_rx
                             .await
