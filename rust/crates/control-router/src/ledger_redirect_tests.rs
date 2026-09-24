@@ -713,6 +713,60 @@ fn migration_state_survives_every_notification_being_dropped() {
     assert!(above > 0 && above < duration.buckets.len());
 }
 
+/// Prometheus histogram buckets are inclusive upper bounds (`le`), so a
+/// sample landing exactly on a bound belongs to that bucket. The 80ms sample
+/// in `migration_state_survives_every_notification_being_dropped` sits
+/// between two bounds, so it cannot tell `<=` from `<`: replacing one with
+/// the other leaves every test in the workspace passing. This drives a
+/// sample at exactly a bound and pins which side it falls on.
+#[test]
+fn a_duration_exactly_on_a_bucket_bound_belongs_to_that_bucket() {
+    const BOUND_INDEX: usize = 10;
+    let bound = crate::migration_history::MIGRATE_DURATION_BUCKETS[BOUND_INDEX];
+    let elapsed = Duration::from_secs_f64(bound);
+
+    let mut ledger = Ledger::new(8);
+    let history = Arc::clone(ledger.history());
+    let a = must(ledger.add_account());
+    let b = must(ledger.add_account());
+    let session = must(ledger.open());
+    let reservation = must(ledger.reserve(&session, &a, addressed("a", "10.0.0.1:4000")));
+    assert_eq!(ledger.finish(&reservation, true), Settlement::Applied);
+    let issued = Instant::now();
+    let op = must(ledger.prepare_redirect(
+        &session,
+        &b,
+        addressed("b", "10.0.0.2:4000"),
+        issued,
+        RedirectReason::Balance(Factor::Memory),
+    ));
+    ledger.admit_redirect(op.clone(), true, issued);
+    assert_eq!(
+        ledger.finish_redirect(&op, true, issued + elapsed),
+        Settlement::Applied
+    );
+
+    let snapshot = history.snapshot();
+    let duration = snapshot
+        .durations
+        .get(&DurationKey {
+            from: "10.0.0.1:4000".to_owned(),
+            to: "10.0.0.2:4000".to_owned(),
+            succeeded: true,
+        })
+        .unwrap_or_else(|| unreachable!("duration series recorded"));
+    assert_eq!(duration.count, 1);
+    assert_eq!(
+        duration.buckets[BOUND_INDEX], 1,
+        "a sample equal to the bound belongs to that `le` bucket"
+    );
+    assert_eq!(
+        duration.buckets[BOUND_INDEX - 1],
+        0,
+        "and not to the bucket below it"
+    );
+}
+
 /// Cumulative history must outlive the router that produced it: a counter
 /// that falls back to zero when an incarnation is destroyed is a false reset.
 #[test]
