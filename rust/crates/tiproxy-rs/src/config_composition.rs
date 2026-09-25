@@ -111,9 +111,6 @@ impl RustConfigComposer {
     /// `RUST_ROUTE_OWNER` static config and takes every other serving field
     /// from the local owned config and CP-TOPO source. This lets a standalone
     /// process bind SQL without a Go control peer.
-    // `dead_code` until the bridge-free startup path (task #135) calls this for
-    // `bootstrap_local`; the tests below already exercise it.
-    #[allow(dead_code)]
     #[must_use]
     pub fn local_source_snapshot(&self) -> StateSnapshot {
         StateSnapshot {
@@ -132,7 +129,6 @@ impl RustConfigComposer {
     /// `/status` version (the CP-TOPO health overlay carries it, as Go reads it
     /// from the default namespace's router), falling back to
     /// [`DEFAULT_SERVER_VERSION`] when no backend has reported one yet.
-    #[allow(dead_code)]
     fn local_server_version(&self) -> String {
         self.topology
             .as_ref()

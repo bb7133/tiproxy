@@ -215,13 +215,19 @@ async fn local_first_bind_and_reload_need_no_control_snapshot() -> Result<(), Bo
     assert_eq!(serving.status().applied_generation, 1);
     assert_eq!(*serving.applied_config_generation().borrow(), 3);
     let first = TcpStream::connect(("127.0.0.1", port)).await?;
-    assert_eq!(timeout(Duration::from_secs(2), seen_rx.recv()).await?, Some(3));
+    assert_eq!(
+        timeout(Duration::from_secs(2), seen_rx.recv()).await?,
+        Some(3)
+    );
 
     composer.set(8, 4, 6, None);
     assert!(serving.reload_composed(&store, now).await?);
     assert_eq!(*serving.applied_config_generation().borrow(), 4);
     let second = TcpStream::connect(("127.0.0.1", port)).await?;
-    assert_eq!(timeout(Duration::from_secs(2), seen_rx.recv()).await?, Some(4));
+    assert_eq!(
+        timeout(Duration::from_secs(2), seen_rx.recv()).await?,
+        Some(4)
+    );
     drop((first, second));
     serving.shutdown().await?;
     Ok(())

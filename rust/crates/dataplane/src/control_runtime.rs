@@ -459,7 +459,7 @@ pub fn spawn_local_control_runtime(
                     "local control dispatch panicked".to_owned(),
                 )),
             },
-            _ = async {
+            () = async {
                 loop {
                     let requested = *shutdown.borrow();
                     if requested || shutdown.changed().await.is_err() {
@@ -487,8 +487,8 @@ pub fn spawn_local_control_runtime(
 #[cfg(test)]
 mod local_runtime_tests {
     use super::*;
-    use control_proto::v1::{ConnectionIdentity, ErrorSource, Hello, Role};
     use crate::route_control::TrafficTotals;
+    use control_proto::v1::{ConnectionIdentity, ErrorSource, Hello, Role};
 
     #[tokio::test]
     async fn local_dispatch_registers_and_adopts_without_go_socket() {
@@ -501,12 +501,8 @@ mod local_runtime_tests {
             ..Hello::default()
         };
         let client = Arc::new(
-            ControlClient::new(ClientConfig::with_defaults(
-                "/dev/null".into(),
-                0,
-                hello,
-            ))
-            .unwrap_or_else(|error| unreachable!("local client metadata: {error}")),
+            ControlClient::new(ClientConfig::with_defaults("/dev/null".into(), 0, hello))
+                .unwrap_or_else(|error| unreachable!("local client metadata: {error}")),
         );
         let runtime = spawn_local_control_runtime(
             Arc::clone(&client),

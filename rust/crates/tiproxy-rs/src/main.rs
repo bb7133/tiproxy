@@ -128,7 +128,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-standalone,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -569,7 +569,7 @@ async fn run(options: Options) -> Result<(), String> {
     // be read; the Rust owner refuses to start the same way.
     dispatch_handler.local_drain_issuer_ready()?;
     let mut client =
-        ClientConfig::with_defaults(options.control_socket, options.control_uid, hello);
+        ClientConfig::with_defaults(options.control_socket.clone(), options.control_uid, hello);
     client.required_capabilities = capabilities;
     let store = config_owner.snapshots.clone();
 
@@ -973,17 +973,16 @@ async fn run(options: Options) -> Result<(), String> {
             return Err(guard.rollback(error).await);
         }
     };
-    if !options.standalone {
-        if let Err(error) = wait_module_ready(
+    if !options.standalone
+        && let Err(error) = wait_module_ready(
             "native meter peer",
             CONTROL_STARTUP_READY_TIMEOUT,
             native_meter::wait_peer(shared_client.subscribe_state()),
         )
         .await
-        {
-            meter_ready.send_replace(Some(false));
-            return Err(guard.rollback(error).await);
-        }
+    {
+        meter_ready.send_replace(Some(false));
+        return Err(guard.rollback(error).await);
     }
     // Bridge mode requires negotiated native ownership before opening either
     // consumer or outbox. Local mode itself is the native owner.
@@ -3399,6 +3398,7 @@ mod tests {
         let options = Options {
             routing_shadow_socket: None,
             config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
+            standalone: false,
             control_socket: PathBuf::from("/tmp/control.sock"),
             control_uid: 42,
             tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
