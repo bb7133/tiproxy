@@ -22,6 +22,7 @@ control-proto.workspace = true
 control-router.workspace = true
 control-topology.workspace = true
 dataplane.workspace = true
+session-core.workspace = true
 legacy-router-shadow.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
