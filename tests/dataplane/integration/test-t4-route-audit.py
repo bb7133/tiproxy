@@ -104,5 +104,47 @@ class CaptureAuditTest(unittest.TestCase):
             self.capture([self.pending, json.dumps(state).encode()])
 
 
+class NativeZeroBatchAuditTest(unittest.TestCase):
+    """Under native Rust metering (CP-ADMIN 5c/5d onward) the residual bridge
+    emits no metering batches, so the final audit carries only the
+    reconcile_request -> reconcile_snapshot pair. That pair must still be
+    complete and in order: a zero-batch audit is accepted, but an incomplete
+    reconcile (e.g. a missing snapshot) still fails closed."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name) / "native.json"
+
+    def _write(self, event_count):
+        state = copy.deepcopy(seed)
+        audit = state["route_audit"]
+        pair = audit["metering_events"][:2]
+        audit["metering_events"] = [
+            dict(pair[index], ordinal=index + 1) for index in range(event_count)
+        ]
+        audit["metering_batches"] = 0
+        audit["metering_acks"] = 0
+        state["armed"] = False
+        state["held"] = False
+        state["connect_count"] = max(state.get("connect_count", 0), 1)
+        state["forwarded"] = max(state.get("forwarded", 0), 1)
+        self.output.write_bytes(json.dumps(state).encode())
+
+    def test_complete_reconcile_pair_is_accepted(self):
+        self._write(2)
+        result = receipt.validate_route_audit(self.output)
+        self.assertEqual(result["metering_batches"], 0)
+        self.assertEqual(result["metering_acks"], 0)
+        self.assertEqual(result["max_metering_sequence"], 0)
+        self.assertIsNone(result["producer_fingerprint"])
+
+    def test_missing_reconcile_snapshot_is_rejected(self):
+        self._write(1)
+        with self.assertRaisesRegex(
+                ValueError, "reconcile_request->reconcile_snapshot"):
+            receipt.validate_route_audit(self.output)
+
+
 if __name__ == "__main__":
     unittest.main()
