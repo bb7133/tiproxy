@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config_composition::{
@@ -874,6 +875,9 @@ async fn run(options: Options) -> Result<(), String> {
     // recovers (it answers not-ready until the SQL gate opens).
     let meter_slot: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>> =
         Arc::new(std::sync::OnceLock::new());
+    // LB readiness must turn off before stop-accept without changing the
+    // process lifecycle: Quiescing also revokes route admission authority.
+    let lb_readiness = LbReadiness::new(in_process.handle());
     // Readiness probe for the integration topology: answers 503 until
     // the first applied generation, 200 after. Bound before serving so
     // a bad port fails fast; the task is owned and aborted at exit.
@@ -884,7 +888,10 @@ async fn run(options: Options) -> Result<(), String> {
         route_config_source,
         topology_handle,
         Arc::clone(&runtime_stats),
-        Arc::clone(&meter_slot),
+        HealthGates {
+            lb_readiness: lb_readiness.clone(),
+            meter: Arc::clone(&meter_slot),
+        },
     )
     .await
     {
@@ -930,7 +937,7 @@ async fn run(options: Options) -> Result<(), String> {
     let admin_app = match spawn_admin(
         admin_address,
         admin_hooks(
-            &in_process,
+            lb_readiness.clone(),
             &config_owner.handle,
             &serving,
             &metrics_registry,
@@ -1122,26 +1129,76 @@ async fn run(options: Options) -> Result<(), String> {
             (control, sampler, serving_result, Ok(()))
         }
         () = &mut termination => {
-            in_process
-                .begin_shutdown(ShutdownReason::Signal)
-                .map_err(|error| format!("begin signal shutdown: {error}"))?;
-            let serving_result = stop_drain_and_join_sessions(
+            // Close readiness as soon as SIGTERM wins the select, even if an
+            // in-flight config apply briefly delays the applied-snapshot read.
+            lb_readiness.mark_unhealthy();
+            let lb_wait = serving.graceful_wait_before_shutdown().await;
+            let event = async {
+                tokio::select! {
+                    control = &mut control_runtime => OrderedWaitExit::Control(match control {
+                        Ok(Ok(())) => Err("control runtime exited during load-balancer wait".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("control runtime supervisor panicked".to_owned()),
+                    }),
+                    sampler = &mut metering_sampler => OrderedWaitExit::Sampler(match sampler {
+                        Ok(Ok(())) => Err("metering sampler exited during load-balancer wait".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("metering sampler panicked".to_owned()),
+                    }),
+                    admin = &mut admin_exit => OrderedWaitExit::Admin(match admin {
+                        Ok(()) => "control admin server exited during load-balancer wait".to_owned(),
+                        Err(_) => "control admin server panicked".to_owned(),
+                    }),
+                    module = modules.join_next() => OrderedWaitExit::Module(match module {
+                        Some(exit) => match exit.result {
+                            Ok(()) => format!("control module {} exited during load-balancer wait", exit.module),
+                            Err(error) => format!("control module {} failed: {error}", exit.module),
+                        },
+                        None => "control module executor became empty during load-balancer wait".to_owned(),
+                    }),
+                }
+            };
+            let (serving_result, interruption) = signal_stop_drain_and_join_sessions(
                 &in_process,
                 &serving,
+                &lb_readiness,
+                sleep_lb_window(lb_wait),
+                event,
                 &drain_tx,
                 &session_shutdown_tx,
-            ).await;
+            ).await?;
+            let mut early_control = None;
+            let mut early_sampler = None;
+            let mut module_result = Ok(());
+            match interruption {
+                None => {}
+                Some(OrderedWaitExit::Control(control)) => {
+                    early_control = Some(control);
+                }
+                Some(OrderedWaitExit::Sampler(sampler)) => {
+                    early_sampler = Some(sampler);
+                }
+                Some(OrderedWaitExit::Admin(failure) | OrderedWaitExit::Module(failure)) => {
+                    module_result = Err(failure);
+                }
+            }
             metering_shutdown_tx.send_replace(true);
-            let sampler = match metering_sampler.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err("metering sampler panicked".to_owned()),
+            let sampler = match early_sampler {
+                Some(result) => result,
+                None => match metering_sampler.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("metering sampler panicked".to_owned()),
+                },
             };
             shared_client.shutdown();
-            let control = match control_runtime.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err("control runtime supervisor panicked".to_owned()),
+            let control = match early_control {
+                Some(result) => result,
+                None => match control_runtime.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("control runtime supervisor panicked".to_owned()),
+                },
             };
-            (control, sampler, serving_result, Ok(()))
+            (control, sampler, serving_result, module_result)
         }
         admin = &mut admin_exit => {
             let failure = match admin {
@@ -1246,6 +1303,67 @@ fn prefer_control_failure(
     sampler
 }
 
+enum OrderedWaitExit {
+    Control(Result<(), String>),
+    Sampler(Result<(), String>),
+    Admin(String),
+    Module(String),
+}
+
+/// Coordinates the two shutdown clocks on the actual signal path. Readiness
+/// closes first while lifecycle stays Ready, then the applied LB wait runs;
+/// only after that do Quiescing, listener stop, and session drain begin.
+async fn signal_stop_drain_and_join_sessions<
+    W: Future<Output = ()>,
+    F: Future<Output = OrderedWaitExit>,
+>(
+    runtime: &InProcessControlRuntime,
+    serving: &DataplaneServingHandle,
+    lb_readiness: &LbReadiness,
+    lb_wait: W,
+    event: F,
+    drain: &watch::Sender<Option<Duration>>,
+    session_shutdown: &watch::Sender<bool>,
+) -> Result<(Result<(), String>, Option<OrderedWaitExit>), String> {
+    lb_readiness.mark_unhealthy();
+    let interruption = wait_for_lb_removal_or(lb_wait, event).await;
+    match &interruption {
+        None => runtime
+            .begin_shutdown(ShutdownReason::Signal)
+            .map_err(|error| format!("begin signal shutdown: {error}"))?,
+        Some(OrderedWaitExit::Control(_)) => runtime.fail("legacy_bridge", "runtime_failure"),
+        Some(OrderedWaitExit::Sampler(_)) => runtime.fail("metering_sampler", "runtime_failure"),
+        Some(OrderedWaitExit::Admin(_)) => runtime.fail("control_admin", "runtime_failure"),
+        Some(OrderedWaitExit::Module(_)) => runtime.fail("control_module", "runtime_failure"),
+    }
+    let serving_result =
+        stop_drain_and_join_sessions(runtime, serving, drain, session_shutdown).await;
+    Ok((serving_result, interruption))
+}
+
+/// The orderly signal path keeps its SQL listener open until the LB removal
+/// deadline, unless a supervised owner exits. Dropping the timer on that exit
+/// lets the caller stop admission immediately.
+async fn wait_for_lb_removal_or<W: Future<Output = ()>, F: Future>(
+    wait: W,
+    event: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        () = wait => None,
+        event = event => Some(event),
+    }
+}
+
+async fn sleep_lb_window(mut remaining: Duration) {
+    // The wire field is u64 milliseconds. Split extreme, but valid, values
+    // so Tokio never adds an overflowing duration to its monotonic clock.
+    while !remaining.is_zero() {
+        let chunk = remaining.min(Duration::from_secs(24 * 60 * 60));
+        tokio::time::sleep(chunk).await;
+        remaining -= chunk;
+    }
+}
+
 async fn join_modules(modules: &mut ControlModuleSet) -> Result<(), String> {
     join_modules_with_timeout(modules, CONTROL_MODULE_SHUTDOWN_TIMEOUT).await
 }
@@ -1320,7 +1438,7 @@ async fn spawn_health(
     config: Arc<dyn ConfigNamespaceSource>,
     topology: TopologyModuleHandle,
     dispatch_stats: Arc<dataplane::control_dispatch::DispatchStats>,
-    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
+    gates: HealthGates,
 ) -> Result<Option<JoinHandle<()>>, String> {
     if port == 0 {
         return Ok(None);
@@ -1333,11 +1451,15 @@ async fn spawn_health(
     let ledger_routes = routes.clone();
     let topology_status = topology.status();
     let routing = topology.routing_handle();
+    let HealthGates {
+        lb_readiness,
+        meter,
+    } = gates;
     Ok(Some(tokio::spawn(health::serve(
         listener,
         serving,
         // Before the native meter opens the SQL gate is closed anyway.
-        Arc::new(move || meter.get().is_none_or(|meter| meter.healthy())),
+        Arc::new(move || lb_readiness.ready() && meter.get().is_none_or(|meter| meter.healthy())),
         Arc::new(move || routes.route_input_evidence()),
         Arc::new(move || ledger_routes.route_ledger_evidence()),
         Arc::new(move || {
@@ -1355,12 +1477,45 @@ async fn spawn_health(
                 routing_client_epoch: routing.as_ref().map_or(0, |source| source.client_epoch),
             }
         }),
-        Arc::new(move || {
-            dispatch_stats
-                .drain_watermark
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }),
+        Arc::new(move || dispatch_stats.drain_watermark.load(Ordering::Relaxed)),
     ))))
+}
+
+#[derive(Clone)]
+struct LbReadiness {
+    lifecycle: control_plane::RuntimeHandle,
+    unhealthy: Arc<AtomicBool>,
+}
+
+struct HealthGates {
+    lb_readiness: LbReadiness,
+    meter: Arc<std::sync::OnceLock<Arc<control_meter::service::Service>>>,
+}
+
+impl LbReadiness {
+    fn new(lifecycle: control_plane::RuntimeHandle) -> Self {
+        Self {
+            lifecycle,
+            unhealthy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_unhealthy(&self) {
+        self.unhealthy.store(true, Ordering::SeqCst);
+    }
+
+    fn ready(&self) -> bool {
+        !self.unhealthy.load(Ordering::SeqCst)
+            && self.lifecycle.lifecycle().phase == LifecyclePhase::Ready
+    }
+
+    fn closing(&self) -> bool {
+        self.unhealthy.load(Ordering::SeqCst)
+            || !matches!(
+                self.lifecycle.lifecycle().phase,
+                LifecyclePhase::Starting | LifecyclePhase::Ready
+            )
+    }
 }
 
 /// ONE grace lineage: the CLI's validated drain grace IS the
@@ -1858,7 +2013,7 @@ struct AdminPlaneSeams {
 }
 
 fn admin_hooks(
-    in_process: &Arc<InProcessControlRuntime>,
+    lb_readiness: LbReadiness,
     config: &ConfigModuleHandle,
     serving: &DataplaneServingHandle,
     registry: &Arc<MetricsRegistry>,
@@ -1870,7 +2025,6 @@ fn admin_hooks(
         backend_metrics,
         route_plane,
     } = seams;
-    let lifecycle = in_process.handle();
     let health_config = config.clone();
     let health_serving = serving.clone();
     let status_serving = serving.clone();
@@ -1882,10 +2036,7 @@ fn admin_hooks(
     control_admin::AdminHooks {
         health_inputs: Arc::new(move || control_admin::HealthInputs {
             // Go `PreClose` sets closing when the drain begins.
-            closing: !matches!(
-                lifecycle.lifecycle().phase,
-                LifecyclePhase::Starting | LifecyclePhase::Ready
-            ),
+            closing: lb_readiness.closing(),
             namespaces_ready: health_config.is_ready(),
             applied_generation: health_serving.status().applied_generation,
             config_checksum: health_config.source().current().config_checksum(),
@@ -2144,10 +2295,15 @@ mod tests {
     };
     use crate::config_composition::control_config;
     use crate::startup::{Teardown, TeardownFuture};
-    use dataplane::{MetricsRegistry, spawn_system_time_monitor_with_clock};
+    use dataplane::control_runtime::SnapshotConsumer;
+    use dataplane::{
+        DataplaneSnapshotConsumer, MetricsRegistry, SystemMemoryProbe,
+        spawn_system_time_monitor_with_clock,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use tokio::net::TcpStream;
 
     use super::{MeteringSampler, RunningProcess, StopJoin};
     use control_plane::{
@@ -2194,6 +2350,293 @@ mod tests {
             ),
             Err("metering durable dispatch rejected snapshots: Persistence".to_owned())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lb_removal_wait_elapses_but_supervised_fault_preempts_it() {
+        let elapsed = super::wait_for_lb_removal_or(
+            super::sleep_lb_window(Duration::from_secs(3)),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_eq!(elapsed, None);
+
+        let (fault_tx, fault_rx) = tokio::sync::oneshot::channel();
+        let wait = tokio::spawn(super::wait_for_lb_removal_or(
+            super::sleep_lb_window(Duration::from_secs(30)),
+            async {
+                fault_rx
+                    .await
+                    .unwrap_or_else(|error| unreachable!("fault sender: {error}"))
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(!wait.is_finished(), "the listener window is still active");
+        fault_tx
+            .send("module failed")
+            .unwrap_or_else(|_| unreachable!("waiter still exists"));
+        assert_eq!(
+            wait.await
+                .unwrap_or_else(|error| unreachable!("wait task: {error}")),
+            Some("module failed")
+        );
+
+        let huge =
+            super::wait_for_lb_removal_or(super::sleep_lb_window(Duration::MAX), async { "fault" })
+                .await;
+        assert_eq!(huge, Some("fault"));
+    }
+
+    #[test]
+    fn lb_readiness_turns_off_while_route_admission_stays_ready() {
+        let owner = armed_owner();
+        let lb_readiness = super::LbReadiness::new(owner.handle());
+        assert!(!lb_readiness.ready());
+        owner
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        assert!(lb_readiness.ready());
+        lb_readiness.mark_unhealthy();
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Ready);
+        assert!(!lb_readiness.ready());
+        assert!(lb_readiness.closing());
+        owner
+            .begin_shutdown(control_plane::ShutdownReason::Signal)
+            .unwrap_or_else(|error| unreachable!("begin ordered shutdown: {error}"));
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Quiescing);
+        assert!(!lb_readiness.ready());
+    }
+
+    async fn bound_serving_with_lb_wait(
+        wait_millis: u64,
+    ) -> (
+        dataplane::DataplaneServingHandle,
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        use control_proto::snapshot::{SnapshotLineage, SnapshotStore, UnixTime};
+        use control_proto::v1::{
+            ConfigSnapshot, KeepalivePolicy, Listener, ProxyProtocolMode, StateSnapshot, TlsPolicy,
+        };
+
+        let port_socket = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap_or_else(|error| unreachable!("ephemeral port: {error}"));
+        let port = port_socket
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("local address: {error}"))
+            .port();
+        drop(port_socket);
+        let keepalive = KeepalivePolicy {
+            enabled: true,
+            ..KeepalivePolicy::default()
+        };
+        let raw = StateSnapshot {
+            config: Some(ConfigSnapshot {
+                max_connections: 10,
+                connection_buffer_bytes: 4096,
+                frontend_keepalive: Some(keepalive),
+                healthy_backend_keepalive: Some(keepalive),
+                unhealthy_backend_keepalive: Some(keepalive),
+                proxy_protocol: ProxyProtocolMode::Disabled as i32,
+                listeners: vec![Listener {
+                    address: "127.0.0.1".to_owned(),
+                    port: u32::from(port),
+                    name: "sql-0".to_owned(),
+                }],
+                server_version: "TiProxy-test".to_owned(),
+                frontend_tls: Some(TlsPolicy::default()),
+                backend_tls: Some(TlsPolicy::default()),
+                graceful_wait_millis: wait_millis,
+                ..ConfigSnapshot::default()
+            }),
+            ..StateSnapshot::default()
+        };
+        let store =
+            SnapshotStore::new([]).unwrap_or_else(|error| unreachable!("snapshot store: {error}"));
+        let snapshot = store
+            .apply(
+                1,
+                raw,
+                UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
+                SnapshotLineage::for_tests("life001"),
+            )
+            .unwrap_or_else(|error| unreachable!("validated snapshot: {error}"))
+            .snapshot;
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = Arc::new(move |_: dataplane::AcceptedConnection| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                let _ = seen_tx.send(());
+            }
+        });
+        let (mut consumer, serving) =
+            DataplaneSnapshotConsumer::new(Arc::new(SystemMemoryProbe::new()), handler);
+        consumer
+            .apply(&snapshot, &|| true)
+            .await
+            .unwrap_or_else(|error| unreachable!("bind serving: {error}"));
+        (serving, port, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn signal_coordinator_keeps_lb_and_session_drain_clocks_separate() {
+        let owner = armed_owner();
+        owner
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        let readiness = super::LbReadiness::new(owner.handle());
+        let (serving, port, mut seen_rx) = bound_serving_with_lb_wait(2_000).await;
+        assert!(serving.is_serving().await);
+        assert!(readiness.ready());
+        assert_eq!(
+            serving.graceful_wait_before_shutdown().await,
+            Duration::from_secs(2)
+        );
+        let serving_probe = serving.clone();
+        let (drain_tx, mut drain_rx) = watch::channel(None);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let (lb_done_tx, lb_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let coordinator = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            let readiness = readiness.clone();
+            async move {
+                super::signal_stop_drain_and_join_sessions(
+                    &owner,
+                    &serving,
+                    &readiness,
+                    async {
+                        lb_done_rx
+                            .await
+                            .unwrap_or_else(|error| unreachable!("LB window release: {error}"));
+                    },
+                    async {
+                        ready_tx
+                            .send(())
+                            .unwrap_or_else(|()| unreachable!("readiness handshake receiver"));
+                        std::future::pending::<super::OrderedWaitExit>().await
+                    },
+                    &drain_tx,
+                    &session_shutdown_tx,
+                )
+                .await
+            }
+        });
+        ready_rx
+            .await
+            .unwrap_or_else(|error| unreachable!("readiness handshake: {error}"));
+        assert!(!readiness.ready());
+        assert!(readiness.closing());
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Ready);
+        assert_eq!(*drain_rx.borrow(), None);
+        assert!(!*session_shutdown_rx.borrow());
+        let connection = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap_or_else(|error| unreachable!("accept during LB wait: {error}"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+                .await
+                .unwrap_or_else(|error| unreachable!("admission receipt: {error}")),
+            Some(())
+        );
+        drop(connection);
+
+        // Keep real socket I/O on a real clock. The timer itself is tested
+        // separately; this production-coordinator test controls the boundary
+        // so scheduler load cannot close the listener before the admission.
+        lb_done_tx
+            .send(())
+            .unwrap_or_else(|()| unreachable!("coordinator still waits"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while drain_rx.borrow().is_none() {
+                drain_rx
+                    .changed()
+                    .await
+                    .unwrap_or_else(|error| unreachable!("drain signal: {error}"));
+            }
+        })
+        .await
+        .unwrap_or_else(|error| unreachable!("drain starts: {error}"));
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Draining);
+        assert_eq!(*drain_rx.borrow(), Some(Duration::from_secs(30)));
+        assert!(!*session_shutdown_rx.borrow());
+        assert!(!serving_probe.is_serving().await);
+        let mut refused = false;
+        for _ in 0..10 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(refused, "SQL listener stops before the session drain grace");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(!*session_shutdown_rx.borrow());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let result = coordinator
+            .await
+            .unwrap_or_else(|error| unreachable!("coordinator task: {error}"))
+            .unwrap_or_else(|error| unreachable!("coordinator: {error}"));
+        assert!(result.0.is_ok());
+        assert!(result.1.is_none());
+        assert!(*session_shutdown_rx.borrow());
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Stopping);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_coordinator_fault_preempts_the_lb_window() {
+        let owner = armed_owner();
+        owner
+            .mark_ready()
+            .unwrap_or_else(|error| unreachable!("mark ready: {error}"));
+        let readiness = super::LbReadiness::new(owner.handle());
+        let (_consumer, serving) = DataplaneSnapshotConsumer::new(
+            Arc::new(SystemMemoryProbe::new()),
+            Arc::new(|_: dataplane::AcceptedConnection| async {}),
+        );
+        let (drain_tx, drain_rx) = watch::channel(None);
+        let (session_shutdown_tx, _session_shutdown_rx) = watch::channel(false);
+        let (fault_tx, fault_rx) = tokio::sync::oneshot::channel();
+        let coordinator = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            let readiness = readiness.clone();
+            async move {
+                super::signal_stop_drain_and_join_sessions(
+                    &owner,
+                    &serving,
+                    &readiness,
+                    super::sleep_lb_window(Duration::from_secs(60)),
+                    async {
+                        fault_rx
+                            .await
+                            .unwrap_or_else(|error| unreachable!("fault sender: {error}"))
+                    },
+                    &drain_tx,
+                    &session_shutdown_tx,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Ready);
+        assert_eq!(*drain_rx.borrow(), None);
+        fault_tx
+            .send(super::OrderedWaitExit::Module("module failed".to_owned()))
+            .unwrap_or_else(|_| unreachable!("waiter still exists"));
+        tokio::task::yield_now().await;
+        assert_eq!(owner.handle().lifecycle().phase, LifecyclePhase::Draining);
+        assert_eq!(*drain_rx.borrow(), Some(Duration::from_secs(30)));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let result = coordinator
+            .await
+            .unwrap_or_else(|error| unreachable!("coordinator task: {error}"))
+            .unwrap_or_else(|error| unreachable!("coordinator: {error}"));
+        assert!(result.0.is_ok());
+        assert!(matches!(result.1, Some(super::OrderedWaitExit::Module(_))));
     }
 
     type TeardownLog = Arc<Mutex<Vec<&'static str>>>;
