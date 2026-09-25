@@ -109,6 +109,21 @@ And then start TiProxy:
 bin/tiproxy --config=conf/proxy.toml
 ```
 
+To try the standalone Rust process instead, build it with `make rust-build`
+and start it with the same proxy configuration:
+
+```shell
+rust/target/debug/tiproxy-rs --standalone --config conf/proxy.toml --health-port 8080
+```
+
+Set `proxy.pd-addrs` in `conf/proxy.toml` to the running PD endpoints before
+starting it. The Rust process opens the configured SQL and API addresses and
+reads configuration and backend topology directly from PD. It does not need a
+Go TiProxy process or a control socket. Use `--tls-root <absolute-directory>`
+when the configuration refers to TLS files in an allowed root. This standalone
+path is under validation; the existing TiUP and Operator deployment paths above
+still use their documented binaries.
+
 4. Connect to TiProxy with your client. The default port is 6000:
 
 ```shell
