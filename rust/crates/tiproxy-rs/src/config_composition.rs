@@ -36,9 +36,17 @@ use control_proto::v1::{
 use control_topology::{TopologyModuleHandle, TopologyUpdateObserver};
 use dataplane::ServingSnapshotComposer;
 use dataplane::control_runtime::SnapshotComposition;
+use session_core::handshake::SUPPORTED_SERVER_CAPABILITIES;
 
 /// Rust-owned config/namespace projection retaining only Go-owned topology and
 /// protocol/static handshake facts from the legacy bridge.
+/// Fallback server version advertised before any backend reports its own,
+/// mirroring Go `parser/mysql.ServerVersion` (`mysqlCompatibilityVersion` +
+/// `VersionSeparator` + the default `TiDBReleaseVersion` placeholder), which Go
+/// serves through `pnet.ServerVersion`. A live backend's observed version
+/// overrides it, exactly as in Go.
+const DEFAULT_SERVER_VERSION: &str = "8.0.11-TiDB-v8.4.0-this-is-a-placeholder";
+
 pub struct RustConfigComposer {
     source: ConfigNamespaceStore,
     topology: Option<TopologyModuleHandle>,
@@ -94,6 +102,50 @@ impl RustConfigComposer {
             composition_generation,
             self.drain_grace_override,
         )
+    }
+
+    /// Bridge-free static source snapshot for the first serving bind and
+    /// later reloads. It carries only the two values the Go bridge used to
+    /// supply -- the advertised capability mask and the server version --
+    /// with empty backend/namespace state, so `compose` treats it as the
+    /// `RUST_ROUTE_OWNER` static config and takes every other serving field
+    /// from the local owned config and CP-TOPO source. This lets a standalone
+    /// process bind SQL without a Go control peer.
+    // `dead_code` until the bridge-free startup path (task #135) calls this for
+    // `bootstrap_local`; the tests below already exercise it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn local_source_snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            config: Some(ConfigSnapshot {
+                advertised_capability: SUPPORTED_SERVER_CAPABILITIES.bits(),
+                server_version: self.local_server_version(),
+                ..ConfigSnapshot::default()
+            }),
+            backends: Vec::new(),
+            namespaces: Vec::new(),
+        }
+    }
+
+    /// The greeting server version. Mirrors Go
+    /// `DefaultHandshakeHandler.GetServerVersion`: prefer a backend's observed
+    /// `/status` version (the CP-TOPO health overlay carries it, as Go reads it
+    /// from the default namespace's router), falling back to
+    /// [`DEFAULT_SERVER_VERSION`] when no backend has reported one yet.
+    #[allow(dead_code)]
+    fn local_server_version(&self) -> String {
+        self.topology
+            .as_ref()
+            .and_then(|topology| {
+                let routing = topology.routing_handle().current()?;
+                let health = topology.health_overlay_handle().current_for(&routing)?;
+                routing.backends.backends.iter().find_map(|merged| {
+                    let version = health.get(merged.backend_id.as_ref()).server_version?;
+                    let trimmed = version.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                })
+            })
+            .unwrap_or_else(|| DEFAULT_SERVER_VERSION.to_owned())
     }
 }
 
@@ -600,6 +652,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn local_source_snapshot_feeds_compose_without_a_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owned = ConfigNamespaceStore::from_toml(
+            b"enable-traffic-replay = false\n[proxy]\naddr = '127.0.0.1:7001'\nmax-connections = 41\n",
+            None,
+            Path::new("/tmp"),
+        )?;
+        let composer = RustConfigComposer::new(owned, None);
+        let source = composer.local_source_snapshot();
+        // The two former-bridge fields come from local sources, and no
+        // backend/namespace state is invented; with no CP-TOPO backend yet the
+        // server version is the Go-parity fallback.
+        let source_config = source.config.clone().unwrap_or_default();
+        assert_eq!(
+            source_config.advertised_capability,
+            SUPPORTED_SERVER_CAPABILITIES.bits()
+        );
+        assert_eq!(source_config.server_version, DEFAULT_SERVER_VERSION);
+        assert!(source.backends.is_empty() && source.namespaces.is_empty());
+        // compose accepts the local source with no bridge peer and keeps every
+        // other serving field from the local owned config.
+        let composition = composer.compose_current(&source)?;
+        let config = composition.snapshot.config.unwrap_or_default();
+        assert_eq!(config.max_connections, 41);
+        assert_eq!(config.listeners[0].port, 7001);
+        assert_eq!(
+            config.advertised_capability,
+            SUPPORTED_SERVER_CAPABILITIES.bits()
+        );
+        assert_eq!(config.server_version, DEFAULT_SERVER_VERSION);
+        Ok(())
     }
 
     #[test]
