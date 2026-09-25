@@ -126,6 +126,7 @@ func TestRustDataplaneConfigGateAndClone(t *testing.T) {
 	require.Equal(t, []string{"/tls-a"}, cfg.RustDataplane.TLSAllowedRoots)
 
 	cfg.RustDataplane.Enabled = true
+	cfg.EnableTrafficReplay = true
 	require.ErrorContains(t, cfg.Check(), "enable-traffic-replay must be false")
 	cfg.EnableTrafficReplay = false
 	cfg.RustDataplane.ControlSocket = "relative.sock"
@@ -142,6 +143,7 @@ func TestRustDataplaneConfigGateAndClone(t *testing.T) {
 func TestRoutingObservationConfigIsExplicitAndRestartPinned(t *testing.T) {
 	cfg := NewConfig()
 	require.Empty(t, cfg.RustDataplane.RoutingShadowSocket)
+	cfg.RustDataplane.Enabled = false
 	cfg.RustDataplane.RoutingShadowSocket = "/tmp/routing-shadow/observer.sock"
 	require.ErrorContains(t, cfg.Check(), "routing-shadow-socket")
 	cfg.RustDataplane.Enabled = true

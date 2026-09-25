@@ -193,7 +193,11 @@ func NewConfig() *Config {
 	cfg.HA.GARPBurstCount = 5
 	cfg.HA.GARPRefreshCount = 30
 
-	cfg.EnableTrafficReplay = true
+	// Rust dataplane is the default route owner (CP-ROUTE #223 cutover).
+	// Traffic replay is a Go-dataplane feature and is mutually exclusive
+	// with the Rust dataplane, so it defaults off here.
+	cfg.RustDataplane.Enabled = true
+	cfg.EnableTrafficReplay = false
 	cfg.RustDataplane.AllowedUID = -1
 
 	return &cfg

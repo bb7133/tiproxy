@@ -20,6 +20,7 @@ import (
 
 func TestTraffic(t *testing.T) {
 	server, doHTTP := createServer(t)
+	server.mgr.CfgMgr.GetConfig().EnableTrafficReplay = true
 	mgr := server.mgr.ReplayJobMgr.(*mockReplayJobManager)
 
 	// parse duration error

@@ -34,6 +34,8 @@ func TestServer(t *testing.T) {
 	cfg := etcd.ConfigForEtcdTest(endpoint)
 	b, err := toml.Marshal(cfg)
 	require.NoError(t, err)
+	// Rust dataplane now defaults on; this test exercises the Go server path.
+	b = append(b, []byte("\n[rust-dataplane]\nenabled = false\n")...)
 	require.NoError(t, os.WriteFile(configFile, b, 0o644))
 
 	server, err := NewServer(context.Background(), &sctx.Context{
@@ -50,7 +52,7 @@ func TestServerWithoutBackendCluster(t *testing.T) {
 
 	dir := t.TempDir()
 	configFile := dir + "/config.toml"
-	require.NoError(t, os.WriteFile(configFile, []byte("[proxy]\npd-addrs = \"\"\n"), 0o644))
+	require.NoError(t, os.WriteFile(configFile, []byte("[proxy]\npd-addrs = \"\"\n[rust-dataplane]\nenabled = false\n"), 0o644))
 
 	server, err := NewServer(context.Background(), &sctx.Context{
 		ConfigFile: configFile,
