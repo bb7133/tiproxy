@@ -140,21 +140,35 @@ def validate_route_audit(path: Path) -> dict[str, Any]:
     acknowledgements = [event for event in events if event.get("kind") == "ack"]
     batch_sequences = [event.get("sequence") for event in batches]
     acknowledgement_sequences = [event.get("sequence") for event in acknowledgements]
-    if not batch_sequences or batch_sequences != list(range(1, len(batch_sequences) + 1)):
+    # With native Rust metering (CP-ADMIN 5c/5d onward) the residual bridge
+    # emits no metering batches, so an empty batch/ack sequence is legal. Only
+    # verify batch contiguity and the producer fingerprint when the residual
+    # bridge actually produced metering events.
+    if batch_sequences != list(range(1, len(batch_sequences) + 1)):
         raise ValueError(f"{path.name} metering batch sequence is not contiguous")
     if (
         audit.get("metering_batches") != len(batches)
         or audit.get("metering_acks") != len(acknowledgements)
     ):
         raise ValueError(f"{path.name} metering counters disagree with ordered events")
-    fingerprints = {
-        event.get("producer_fingerprint") for event in batches + acknowledgements
-    }
-    if len(fingerprints) != 1:
-        raise ValueError(f"{path.name} producer fingerprint changed: {fingerprints}")
-    fingerprint = next(iter(fingerprints))
-    if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
-        raise ValueError(f"{path.name} producer fingerprint is not SHA-256 hex")
+    metered = batches + acknowledgements
+    fingerprint = None
+    if metered:
+        fingerprints = {event.get("producer_fingerprint") for event in metered}
+        if len(fingerprints) != 1:
+            raise ValueError(f"{path.name} producer fingerprint changed: {fingerprints}")
+        fingerprint = next(iter(fingerprints))
+        if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            raise ValueError(f"{path.name} producer fingerprint is not SHA-256 hex")
+    elif [event.get("kind") for event in events] != ["reconcile_request", "reconcile_snapshot"]:
+        # Native metering emits no batches/acks, but the final audit must still
+        # carry the complete reconcile_request -> reconcile_snapshot pair. An
+        # incomplete reconcile (e.g. a missing snapshot) still fails closed.
+        raise ValueError(
+            f"{path.name} native-metering audit is not a complete "
+            "reconcile_request->reconcile_snapshot pair: "
+            f"{[event.get('kind') for event in events]}"
+        )
     if state.get("connect_count", 0) < 1 or state.get("forwarded", 0) < 1:
         raise ValueError(f"{path.name} was not on the live control path")
     if state.get("armed") is not False or state.get("held") is not False:
@@ -172,7 +186,7 @@ def validate_route_audit(path: Path) -> dict[str, Any]:
         "fatal_protocol_errors": 0,
         "metering_batches": len(batches),
         "metering_acks": len(acknowledgements),
-        "max_metering_sequence": batch_sequences[-1],
+        "max_metering_sequence": batch_sequences[-1] if batch_sequences else 0,
         "producer_fingerprint": fingerprint,
         "connect_count": state["connect_count"],
         "forwarded": state["forwarded"],
