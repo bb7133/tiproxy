@@ -25,6 +25,9 @@ resolve_etcdctl() {
 
 mode=rust
 variant=plain
+# Single-process acceptance (task #140): tiup starts no Go tiproxy and the
+# standalone Rust binary owns the SQL listeners with no Go control peer.
+standalone=${DATAPLANE_STANDALONE:-0}
 artifact_root=${DATAPLANE_ARTIFACT_ROOT:-$script_dir/artifacts}
 port_offset=${DATAPLANE_PORT_OFFSET:-$((10000 + ($$ % 20) * 100))}
 
@@ -372,11 +375,14 @@ for port in $PORTS; do
 	fi
 done
 
+tiup_tiproxy_args=(--tiproxy 1 --tiproxy.binpath "$repo_root/bin/tiproxy" --tiproxy.config "$run_dir/tiproxy.toml")
+if [[ $standalone == 1 ]]; then
+	tiup_tiproxy_args=(--tiproxy 0)
+fi
 tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION" --tag "$tag" --without-monitor \
 	--host 127.0.0.1 --port-offset "$port_offset" \
 	--pd 1 --kv 1 --db 2 --tiflash 0 --db.config "$run_dir/tidb.toml" \
-	--tiproxy 1 --tiproxy.binpath "$repo_root/bin/tiproxy" \
-	--tiproxy.config "$run_dir/tiproxy.toml" \
+	"${tiup_tiproxy_args[@]}" \
 	>"$run_dir/tiup-playground.log" 2>&1 &
 TIUP_PID=$!
 record_t4_process tiup-main start "$TIUP_PID" 0
@@ -474,8 +480,13 @@ if [[ $mode == rust ]]; then
 		# its own allowlist of roots, mirroring the control plane's check.
 		rust_tls_args=(--tls-root "$run_dir/certs")
 	fi
+	rust_owner_args=(--control-socket "$control_socket" --control-uid "$(id -u)")
+	if [[ $standalone == 1 ]]; then
+		# Bridge-free single process: no Go control peer, so no control socket.
+		rust_owner_args=(--standalone)
+	fi
 	"$rust_binary" --config "$run_dir/tiproxy.toml" \
-		--control-socket "$control_socket" --control-uid "$(id -u)" \
+		"${rust_owner_args[@]}" \
 		--health-port "$RUST_HEALTH_PORT" \
 		${rust_tls_args[@]+"${rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs.log" 2>&1 &
