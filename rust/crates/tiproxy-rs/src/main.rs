@@ -59,7 +59,9 @@ use control_topology::{
     TopologyModuleHandle,
 };
 use dataplane::GenerationStatusSnapshot;
-use dataplane::control_runtime::{ControlRuntime, spawn_control_runtime_with_client_and_handler};
+use dataplane::control_runtime::{
+    ControlRuntime, spawn_control_runtime_with_client_and_handler, spawn_local_control_runtime,
+};
 use dataplane::metering::{MeteringSamplerError, MeteringSourceRegistry};
 use dataplane::session::SessionLoopConfig;
 use dataplane::session_engine::EngineSessionOwner;
@@ -100,6 +102,7 @@ const MAX_DRAIN_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     config_file: PathBuf,
+    standalone: bool,
     control_socket: PathBuf,
     routing_shadow_socket: Option<PathBuf>,
     control_uid: u32,
@@ -125,7 +128,7 @@ enum Command {
 /// C) are all wired, so `tls`, `proxy-v2`, `zlib`, and `zstd` are advertised
 /// and the topology preflight admits plain, tls, proxy, and compressed
 /// variants.
-const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
+const INTEGRATION_CAPABILITIES: &str = "in-process-control-runtime,control-bridge-v1,rust-standalone,rust-route-owner,rust-meter-owner,rust-api-owner,mysql-listener,health-endpoint,graceful-shutdown,tls,proxy-v2,zlib,zstd";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -561,9 +564,6 @@ async fn run(options: Options) -> Result<(), String> {
         build_version: VERSION.to_owned(),
         build_commit: COMMIT.to_owned(),
     };
-    let mut wal_name = options.control_socket.as_os_str().to_os_string();
-    wal_name.push(".metering.wal");
-    let wal_path = PathBuf::from(wal_name);
     let dispatch_handler = ControlCommandHandler::native_meter_owner();
     // Go `NewDrainIssuer` fails the bridge when the incarnation nonce cannot
     // be read; the Rust owner refuses to start the same way.
@@ -630,6 +630,13 @@ async fn run(options: Options) -> Result<(), String> {
     }
     let meter_config = config_owner.handle.source().current();
     let meter_paths = Path::new(meter_config.effective().workdir()).join("run");
+    let wal_path = if options.standalone {
+        meter_paths.join("rust-metering.wal")
+    } else {
+        let mut wal_name = options.control_socket.as_os_str().to_os_string();
+        wal_name.push(".metering.wal");
+        PathBuf::from(wal_name)
+    };
     let _meter_lock = match native_meter::lock_state(&meter_paths) {
         Ok(lock) => lock,
         Err(error) => return Err(guard.rollback(error).await),
@@ -834,28 +841,32 @@ async fn run(options: Options) -> Result<(), String> {
     // before the abort backstop fires.
     let consumer =
         consumer.with_force_join_grace(loop_config.cleanup_deadline + Duration::from_secs(1));
-    if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
-        serving.clone(),
-        store.clone(),
-        Arc::clone(&in_process),
-        options.health_port,
-        config_owner.tls_roots,
-        options.drain_grace,
-        composer,
-    )) {
-        return Err(guard
-            .rollback(format!("start config serving adapter: {error}"))
-            .await);
-    }
-    let (consumer, meter_ready) = native_meter::ReadyConsumer::new(consumer);
-    let runtime = spawn_control_runtime_with_client_and_handler(
-        Arc::clone(&shared_client),
-        Duration::from_millis(100),
-        8,
-        store.clone(),
-        consumer,
-        dispatch_handler,
-    );
+    let (runtime, meter_ready, mut local_consumer) = if options.standalone {
+        let (ready, _) = watch::channel(None);
+        (
+            spawn_local_control_runtime(
+                Arc::clone(&shared_client),
+                Duration::from_millis(100),
+                dispatch_handler,
+            ),
+            ready,
+            Some(consumer),
+        )
+    } else {
+        let (consumer, ready) = native_meter::ReadyConsumer::new(consumer);
+        (
+            spawn_control_runtime_with_client_and_handler(
+                Arc::clone(&shared_client),
+                Duration::from_millis(100),
+                8,
+                store.clone(),
+                consumer,
+                dispatch_handler,
+            ),
+            ready,
+            None,
+        )
+    };
     // Take the dispatch handles and stats before the runtime moves into the
     // guard; from then on the guard owns it (and tears it down on any later
     // failure).
@@ -962,18 +973,20 @@ async fn run(options: Options) -> Result<(), String> {
             return Err(guard.rollback(error).await);
         }
     };
-    if let Err(error) = wait_module_ready(
-        "native meter peer",
-        CONTROL_STARTUP_READY_TIMEOUT,
-        native_meter::wait_peer(shared_client.subscribe_state()),
-    )
-    .await
-    {
-        meter_ready.send_replace(Some(false));
-        return Err(guard.rollback(error).await);
+    if !options.standalone {
+        if let Err(error) = wait_module_ready(
+            "native meter peer",
+            CONTROL_STARTUP_READY_TIMEOUT,
+            native_meter::wait_peer(shared_client.subscribe_state()),
+        )
+        .await
+        {
+            meter_ready.send_replace(Some(false));
+            return Err(guard.rollback(error).await);
+        }
     }
-    // A legacy Go peer cannot reach this point: negotiation requires native
-    // ownership before either consumer or outbox is opened. SQL stays gated.
+    // Bridge mode requires negotiated native ownership before opening either
+    // consumer or outbox. Local mode itself is the native owner.
     let native_meter = match control_meter::service::Service::open(
         meter_config.effective().metering(),
         meter_paths.join("rust-metering-consumer.json"),
@@ -1020,6 +1033,38 @@ async fn run(options: Options) -> Result<(), String> {
         )),
         shutdown: metering_shutdown_tx.clone(),
     });
+
+    // Local mode opens SQL only after native metering has recovered and its
+    // sampler is supervised. The first serving generation is composed from the
+    // Rust config/topology source; no Go snapshot or socket is involved.
+    if let Some(mut consumer) = local_consumer.take() {
+        let local_source = composer.local_source_snapshot();
+        let now = control_proto::snapshot::UnixTime::since_unix_epoch(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
+        if let Err(error) = consumer.bootstrap_local(&store, &local_source, now).await {
+            meter_ready.send_replace(Some(false));
+            return Err(guard
+                .rollback(format!("bind local SQL serving generation: {error}"))
+                .await);
+        }
+    }
+    if let Err(error) = guard.spawn_module(ConfigServingAdapter::new(
+        serving.clone(),
+        store.clone(),
+        Arc::clone(&in_process),
+        options.health_port,
+        config_owner.tls_roots,
+        options.drain_grace,
+        Arc::clone(&composer),
+    )) {
+        meter_ready.send_replace(Some(false));
+        return Err(guard
+            .rollback(format!("start config serving adapter: {error}"))
+            .await);
+    }
 
     if let Err(error) = in_process.mark_ready() {
         meter_ready.send_replace(Some(false));
@@ -2135,11 +2180,14 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let mut admin_addr: Option<SocketAddr> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut routing_shadow_socket = None;
+    let mut standalone = false;
+    let mut socket_argument = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--version" | "-V" => return Ok(Command::Version),
             "--help" | "-h" => return Ok(Command::Help),
             "--integration-capabilities" => return Ok(Command::IntegrationCapabilities),
+            "--standalone" => standalone = true,
             "--config" => {
                 config_file = Some(PathBuf::from(
                     arguments
@@ -2148,6 +2196,7 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
                 ));
             }
             "--control-socket" => {
+                socket_argument = true;
                 socket =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
                         "--control-socket requires a path".to_owned()
@@ -2223,8 +2272,16 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
             _ => return Err(format!("unknown argument {argument:?}")),
         }
     }
-    let control_socket =
-        socket.ok_or_else(|| format!("--control-socket or {CONTROL_SOCKET_ENV} is required"))?;
+    if standalone && socket_argument {
+        return Err("--standalone must not set a Go control socket".to_owned());
+    }
+    // A local-mode client object remains for the compatibility-only session
+    // adapter. No transport task is started and this path is never opened.
+    let control_socket = if standalone {
+        PathBuf::from("/dev/null")
+    } else {
+        socket.ok_or_else(|| format!("--control-socket or {CONTROL_SOCKET_ENV} is required"))?
+    };
     if !control_socket.is_absolute() {
         return Err("control socket path must be absolute".to_owned());
     }
@@ -2243,10 +2300,14 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     Ok(Command::Run(Box::new(Options {
         config_file: config_file
             .ok_or_else(|| format!("--config or {CONFIG_FILE_ENV} is required"))?,
+        standalone,
         control_socket,
         routing_shadow_socket,
-        control_uid: uid
-            .ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?,
+        control_uid: if standalone {
+            0
+        } else {
+            uid.ok_or_else(|| format!("--control-uid or {CONTROL_UID_ENV} is required"))?
+        },
         tls_roots,
         drain_grace,
         health_port,
@@ -2271,7 +2332,7 @@ impl startup::Teardown for legacy_router_shadow::consumer::Task {
 }
 
 fn usage() -> &'static str {
-    "Usage: tiproxy-rs --config <path> --control-socket <absolute-path> --control-uid <uid> \
+    "Usage: tiproxy-rs --config <path> (--standalone | --control-socket <absolute-path> --control-uid <uid>) \
      [--tls-root <absolute-path>]... [--drain-grace-seconds <n>] [--health-port <n>] [--metrics-addr <host:port>] [--admin-addr <host:port>] [--log-file <absolute-path>] [--routing-shadow-socket <absolute-path>]\n\
      Environment: TIPROXY_CONFIG, TIPROXY_CONTROL_SOCKET, TIPROXY_CONTROL_UID, TIPROXY_TLS_ROOTS"
 }
@@ -3254,6 +3315,7 @@ mod tests {
             Options {
                 routing_shadow_socket: None,
                 config_file: PathBuf::from("/etc/tiproxy/tiproxy.toml"),
+                standalone: false,
                 control_socket: PathBuf::from("/tmp/control.sock"),
                 control_uid: 42,
                 tls_roots: vec![PathBuf::from("/etc/tiproxy/tls")],
@@ -3264,6 +3326,21 @@ mod tests {
                 log_file: None,
             }
         );
+    }
+
+    #[test]
+    fn standalone_cli_needs_no_go_socket_or_uid() {
+        let command = parse_options([
+            "--standalone".to_owned(),
+            "--config".to_owned(),
+            "/etc/tiproxy/tiproxy.toml".to_owned(),
+        ]);
+        let Ok(Command::Run(options)) = command else {
+            unreachable!("standalone process only needs its own config file")
+        };
+        assert!(options.standalone);
+        assert_eq!(options.control_socket, PathBuf::from("/dev/null"));
+        assert_eq!(options.control_uid, 0);
     }
 
     #[test]

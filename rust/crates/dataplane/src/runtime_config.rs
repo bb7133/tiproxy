@@ -270,6 +270,40 @@ impl DataplaneSnapshotConsumer {
         self.force_join_grace = grace;
         self
     }
+
+    /// Validates and binds the first SQL generation from an in-process source.
+    /// The same consumer apply path owns listener lifetime and generation
+    /// status as the bridge path; later local config/topology changes use the
+    /// serving handle's `reload_composed` path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a snapshot or listener preflight failure without publishing a
+    /// partial serving generation.
+    pub async fn bootstrap_local(
+        &mut self,
+        validator: &SnapshotStore,
+        source: &StateSnapshot,
+        now: UnixTime,
+    ) -> Result<(), SnapshotError> {
+        let composition = self.compose(source)?;
+        let snapshot = validator.validate_composed(
+            1,
+            CompositionGenerations {
+                composition: composition.generation,
+                config: composition.config_generation,
+            },
+            composition.snapshot,
+            now,
+        )?;
+        self.apply(&snapshot, &|| true).await?;
+        // Detached validation uses the composed view as `source_raw`; keep
+        // the actual local protocol seed for later recompositions. It has no
+        // backend/namespace fields, which the composer correctly rejects if
+        // presented as a legacy bridge payload.
+        self.state.lock().await.last_bridge_source = Some(source.clone());
+        Ok(())
+    }
 }
 
 impl SnapshotConsumer for DataplaneSnapshotConsumer {

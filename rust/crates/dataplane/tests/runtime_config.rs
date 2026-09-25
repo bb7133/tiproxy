@@ -192,6 +192,42 @@ impl ServingSnapshotComposer for MutableComposer {
 }
 
 #[tokio::test]
+async fn local_first_bind_and_reload_need_no_control_snapshot() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let source = raw_snapshot(port);
+    let store = SnapshotStore::new([])?;
+    let composer = Arc::new(MutableComposer::with(7, 3, 5));
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let handler: Arc<dyn ConnectionHandler> = Arc::new(move |connection: AcceptedConnection| {
+        let seen_tx = seen_tx.clone();
+        async move {
+            let _ = seen_tx.send(connection.snapshot().config_generation());
+        }
+    });
+    let (mut consumer, serving) = DataplaneSnapshotConsumer::new_with_composer(
+        Arc::new(FixedMemory),
+        handler,
+        composer.clone(),
+    );
+    let now = UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000));
+    consumer.bootstrap_local(&store, &source, now).await?;
+    assert!(serving.is_serving().await);
+    assert_eq!(serving.status().applied_generation, 1);
+    assert_eq!(*serving.applied_config_generation().borrow(), 3);
+    let first = TcpStream::connect(("127.0.0.1", port)).await?;
+    assert_eq!(timeout(Duration::from_secs(2), seen_rx.recv()).await?, Some(3));
+
+    composer.set(8, 4, 6, None);
+    assert!(serving.reload_composed(&store, now).await?);
+    assert_eq!(*serving.applied_config_generation().borrow(), 4);
+    let second = TcpStream::connect(("127.0.0.1", port)).await?;
+    assert_eq!(timeout(Duration::from_secs(2), seen_rx.recv()).await?, Some(4));
+    drop((first, second));
+    serving.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn first_bind_reload_reject_and_shutdown_keep_one_last_good_generation()
 -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
