@@ -185,6 +185,20 @@ finalize() {
 	local audit_output
 	trap - EXIT
 	set +e
+	# A KA live-socket probe may temporarily stop a run-owned TiDB process.
+	# Resume it before diagnostics and TiUP cleanup, even after an assertion
+	# fails. Its independent watchdog also resumes it if this shell is killed.
+	if [[ -n ${KA_STOPPED_TIDB_PID:-} ]]; then
+		if [[ $(ps -p "$KA_STOPPED_TIDB_PID" -o command= 2>/dev/null || true) == *"/$tag/"* ]]; then
+			kill -CONT "$KA_STOPPED_TIDB_PID" 2>/dev/null || true
+		fi
+		KA_STOPPED_TIDB_PID=
+	fi
+	if [[ -n ${KA_RESUME_WATCHDOG_PID:-} ]]; then
+		kill "$KA_RESUME_WATCHDOG_PID" 2>/dev/null || true
+		wait "$KA_RESUME_WATCHDOG_PID" 2>/dev/null || true
+		KA_RESUME_WATCHDOG_PID=
+	fi
 	record_t4_process harness finalizer 0 0
 	close_t4_process_lineage
 	if [[ $mode == rust && ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && -n ${T3_DROP_PID:-} ]]; then

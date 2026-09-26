@@ -120,6 +120,26 @@ PYKA
 		echo "standalone MatchAll session did not answer $marker" >&2
 		return 1
 	}
+	sa_ka_metric_count() {
+		local phase=$1 health=$2 result=$3 path="$run_dir/standalone-ka-metrics-$1.txt"
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_api_port/metrics" -o "$path" || return 1
+		python3 - "$path" "127.0.0.1:$TIDB_PORT_0" "$health" "$result" <<'PYMETRIC'
+import re
+import sys
+
+path, backend, health, result = sys.argv[1:]
+total = 0
+for line in open(path):
+    if not line.startswith('tiproxy_backend_keepalive_update_total{'):
+        continue
+    labels, value = line.split('}', 1)
+    found = dict(re.findall(r'([a-z_]+)="([^"]*)"', labels))
+    if (found.get('backend'), found.get('health'), found.get('result')) == (backend, health, result):
+        total += int(float(value.strip()))
+print(total)
+PYMETRIC
+	}
 	local baseline
 	baseline=$(sa_ka_query SABASE "USE sa_cross; SET @sa_cross='alive'; SELECT CONCAT('SABASE|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(),'NULL'), '|', COALESCE(@sa_cross,'NULL'));") || exit 1
 	[[ $(cut -d'|' -f3 <<<"$baseline") == "$TIDB_PORT_0" &&
@@ -217,11 +237,89 @@ PYKA
 		exit 1
 	}
 	sa_set_route_policy "[\"127.0.0.1:$TIDB_PORT_1\",\"127.0.0.1:$TIDB_PORT_B\"]" 300 cross-restore
+	# KA-002 in the same 0-Go process: a stopped TiDB still holds the
+	# established SQL socket but makes /status fail. Require the Rust owner
+	# to apply the unhealthy policy to that exact backend. The route owner
+	# may then migrate the client to healthy A1; that is a valid result, so
+	# this row checks frontend-session continuity after A0 resumes rather
+	# than inventing a same-backend healthy recovery. The existing Linux
+	# socket-policy test reads back the exact TCP options.
+	local ka_tidb_pid ka_tidb_cmd before_unhealthy now_unhealthy ka_row ka_result ka_recovered
+	# The Go policy's TCP_USER_TIMEOUT option is Linux-only. On macOS the
+	# engine still observes each live health transition, but reports a
+	# failed setsockopt instead of silently claiming the policy was applied.
+	ka_result=succeed
+	[[ $(uname -s) == Linux ]] || ka_result=fail
+	ka_tidb_pid=$(lsof -ti "tcp:$TIDB_PORT_0" -sTCP:LISTEN 2>/dev/null || true)
+	[[ $ka_tidb_pid =~ ^[0-9]+$ ]] || {
+		echo "standalone KA requires one A0 LISTEN owner, got '$ka_tidb_pid'" >&2
+		exit 1
+	}
+	ka_tidb_cmd=$(ps -p "$ka_tidb_pid" -o command= 2>/dev/null || true)
+	[[ $ka_tidb_cmd == *"/$tag/"* ]] || {
+		echo "refusing KA SIGSTOP for non-run PID $ka_tidb_pid: $ka_tidb_cmd" >&2
+		exit 1
+	}
+	before_unhealthy=$(sa_ka_metric_count before-stop unhealthy "$ka_result") || exit 1
+	(
+		sleep 90
+		[[ $(ps -p "$ka_tidb_pid" -o command= 2>/dev/null || true) == *"/$tag/"* ]] &&
+			kill -CONT "$ka_tidb_pid" 2>/dev/null || true
+	) &
+	KA_RESUME_WATCHDOG_PID=$!
+	kill -STOP "$ka_tidb_pid" || exit 1
+	KA_STOPPED_TIDB_PID=$ka_tidb_pid
+	local ka_unhealthy_seen=false
+	for _ in {1..60}; do
+		now_unhealthy=$(sa_ka_metric_count stopped unhealthy "$ka_result") || exit 1
+		if ((now_unhealthy > before_unhealthy)); then
+			ka_unhealthy_seen=true
+			break
+		fi
+		sleep 0.5
+	done
+	[[ $ka_unhealthy_seen == true ]] || {
+		echo "standalone KA did not report unhealthy backend result=$ka_result while A0 was stopped" >&2
+		exit 1
+	}
+	kill -CONT "$ka_tidb_pid" || exit 1
+	KA_STOPPED_TIDB_PID=
+	kill "$KA_RESUME_WATCHDOG_PID" 2>/dev/null || true
+	wait "$KA_RESUME_WATCHDOG_PID" 2>/dev/null || true
+	KA_RESUME_WATCHDOG_PID=
+	ka_recovered=false
+	for _ in {1..60}; do
+		if curl --noproxy '*' --fail --silent --max-time 2 \
+			"http://127.0.0.1:$((10080 + port_offset))/status" -o /dev/null; then
+			ka_recovered=true
+			break
+		fi
+		sleep 0.5
+	done
+	[[ $ka_recovered == true ]] || {
+		echo "standalone KA A0 status did not recover after SIGCONT" >&2
+		exit 1
+	}
+	ka_row=$(sa_ka_query SAKA "SELECT CONCAT('SAKA|', CONNECTION_ID(), '|', @@port, '|', COALESCE(DATABASE(),'NULL'), '|', COALESCE(@sa_cross,'NULL'));") || exit 1
+	[[ ($(cut -d'|' -f3 <<<"$ka_row") == "$TIDB_PORT_0" ||
+		$(cut -d'|' -f3 <<<"$ka_row") == "$TIDB_PORT_1") &&
+		$(cut -d'|' -f4 <<<"$ka_row") == sa_cross &&
+		$(cut -d'|' -f5 <<<"$ka_row") == alive ]] || {
+		echo "standalone KA health flip lost same-client SQL state: $check -> $ka_row" >&2
+		exit 1
+	}
+	kill -0 "$KA_SESSION_PID" 2>/dev/null || {
+		echo "standalone KA client exited after health flip" >&2
+		exit 1
+	}
 	exec 9>&-
 	wait "$KA_SESSION_PID" 2>/dev/null || true
 	KA_SESSION_PID=
 	rm -f "$KA_FIFO"
 	KA_FIFO=
 	write_state
-	echo "PASS: standalone Rust CP-ADMIN self-migration ($baseline -> $admin_row); MatchAll cross-keyspace refusal (old=$check, new ks-new port=$p), route ledger settled, no Go tiproxy"
+	echo "PASS: standalone Rust CP-ADMIN self-migration ($baseline -> $admin_row); MatchAll cross-keyspace refusal (old=$check, new ks-new port=$p), route ledger settled; KA-002 A0 unhealthy policy result=$ka_result count $before_unhealthy->$now_unhealthy with same frontend session state $ka_row after recovery; no Go tiproxy"
+	if [[ $ka_result == fail ]]; then
+		echo "NOTE: non-Linux KA-002 proves health delivery only; TCP_USER_TIMEOUT policy application requires the Linux result=succeed run"
+	fi
 }
