@@ -25,8 +25,8 @@ resolve_etcdctl() {
 
 mode=rust
 variant=plain
-# Single-process acceptance (task #140): tiup starts no Go tiproxy and the
-# standalone Rust binary owns the SQL listeners with no Go control peer.
+# Bridge-free acceptance (tasks #140/#141): tiup starts no Go tiproxy and
+# Rust owns the SQL listeners with no Go control peer.
 standalone=${DATAPLANE_STANDALONE:-0}
 artifact_root=${DATAPLANE_ARTIFACT_ROOT:-$script_dir/artifacts}
 port_offset=${DATAPLANE_PORT_OFFSET:-$((10000 + ($$ % 20) * 100))}
@@ -64,8 +64,8 @@ case "$mode" in
 		;;
 esac
 
-# DATAPLANE_STANDALONE is a single-process acceptance mode: it runs the
-# main --standalone MIG-01 and exits before the Go-coupled sub-phases.
+# DATAPLANE_STANDALONE runs the main --standalone MIG-01 and, for plain,
+# an isolated Rust MatchAll phase. It exits before the Go-coupled sub-phases.
 # Reject combinations it cannot honestly execute, before the variant=all
 # recursion, so an early exit can never mark un-run phases as passed.
 if [[ $standalone == 1 ]]; then
@@ -75,7 +75,7 @@ if [[ $standalone == 1 ]]; then
 	fi
 	for _sa_flag in DATAPLANE_T3_FOCUSED DATAPLANE_T4_FOCUSED DATAPLANE_T4_QUALIFICATION DATAPLANE_NATIVE_METER; do
 		if [[ ${!_sa_flag:-0} == 1 ]]; then
-			echo "DATAPLANE_STANDALONE=1 is incompatible with $_sa_flag=1: the standalone path exits after the main-entry MIG-01 and would not run the focused/qualification phases" >&2
+			echo "DATAPLANE_STANDALONE=1 is incompatible with $_sa_flag=1: the standalone path exits before the focused/qualification phases" >&2
 			exit 2
 		fi
 	done
@@ -334,6 +334,11 @@ T4_REJECT_PID=
 T4_REJECT_STATE="$run_dir/t4-control-rejection.json"
 MIG_SESSION_PID=
 MIG_FIFO=
+KA_PID=
+KA_FAULT_PID=
+KA_FAULT_PORT=
+KA_SESSION_PID=
+KA_FIFO=
 if [[ $mode == rust ]]; then
 	# The Go process cedes the SQL listeners entirely: with the gate
 	# enabled it serves only the control plane and API, and the Rust
@@ -366,6 +371,11 @@ write_state() {
 		printf 'TAG_B=%q\n' "$tag_b"
 		printf 'FAULT_PID=%q\n' "$FAULT_PID"
 		printf 'RUST_PID=%q\n' "$RUST_PID"
+		printf 'KA_PID=%q\n' "$KA_PID"
+		printf 'KA_FAULT_PID=%q\n' "$KA_FAULT_PID"
+		printf 'KA_FAULT_PORT=%q\n' "$KA_FAULT_PORT"
+		printf 'KA_SESSION_PID=%q\n' "$KA_SESSION_PID"
+		printf 'KA_FIFO=%q\n' "$KA_FIFO"
 		printf 'RUST_SOCKET=%q\n' "$RUST_SOCKET"
 		printf 'RUST_CONTROL_SOCKET=%q\n' "$RUST_CONTROL_SOCKET"
 		printf 'T3_DROP_PID=%q\n' "$T3_DROP_PID"
@@ -1840,13 +1850,17 @@ cluster_row "$TIPROXY_PORT" cluster-a "$TIDB_PORT_0 $TIDB_PORT_1" "$TIDB_PORT_B"
 cluster_row "$TIPROXY_PORT_B" cluster-b "$TIDB_PORT_B" "$TIDB_PORT_0 $TIDB_PORT_1" || exit 1
 echo "cluster matrix: listener $TIPROXY_PORT->cluster-a listener $TIPROXY_PORT_B->cluster-b (deterministic port routing)"
 
-# Single-process acceptance: prove the pure-Rust A0->A1 connection migration
-# on the main --standalone entry, then stop before the Go-coupled
-# keyspace-guard sub-phase (which still reads Go control-plane logs).
+# Bridge-free acceptance: prove A0->A1 migration on the main Rust process.
+# Plain also starts an isolated Rust MatchAll process for native CP-ADMIN and
+# cross-keyspace checks. Both stop before the Go-coupled legacy sub-phase.
 if [[ $standalone == 1 ]]; then
 	source "$script_dir/standalone-mig01.sh"
 	run_standalone_mig01
 	echo "PASS: standalone single-process executed SELECT 1, namespace matrix, and MIG-01 live migration (A0->A1, database+user-variable restored) with no Go tiproxy"
+	if [[ $variant == plain ]]; then
+		source "$script_dir/standalone-cross-keyspace.sh"
+		run_standalone_cross_keyspace
+	fi
 	exit 0
 fi
 

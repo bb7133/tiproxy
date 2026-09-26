@@ -102,7 +102,7 @@ fn render(
         (503, "Service Unavailable", "NOT_READY")
     };
     let body = format!(
-        "{{\"status\":\"{state}\",\"applied_generation\":{},\"drain_watermark\":{drain_watermark},\"source_generations\":{{\"config_generation\":{},\"config_file_revision\":{},\"config_etcd_revision\":{},\"topology_observed_generation\":{},\"topology_applied_generation\":{},\"routing_generation\":{},\"routing_client_epoch\":{}}},\"route_inputs\":{{\"observations\":{},\"health_input_backends\":{},\"healthy_backends\":{},\"cpu_series\":{},\"memory_series\":{}}},\"route_ledger\":{{\"router_incarnations\":{},\"sessions\":{},\"reserved\":{},\"active\":{},\"incoming\":{},\"outgoing\":{},\"unsettled_redirects\":{},\"unsettled_closes\":{}}}}}",
+        "{{\"status\":\"{state}\",\"applied_generation\":{},\"drain_watermark\":{drain_watermark},\"source_generations\":{{\"config_generation\":{},\"config_file_revision\":{},\"config_etcd_revision\":{},\"topology_observed_generation\":{},\"topology_applied_generation\":{},\"routing_generation\":{},\"routing_client_epoch\":{}}},\"route_inputs\":{{\"observations\":{},\"health_input_backends\":{},\"healthy_backends\":{},\"cpu_series\":{},\"memory_series\":{}}},\"route_ledger\":{{\"router_incarnations\":{},\"sessions\":{},\"reserved\":{},\"active\":{},\"incoming\":{},\"outgoing\":{},\"unsettled_redirects\":{},\"unsettled_closes\":{},\"keyspace_refusals\":{}}}}}",
         status.applied_generation,
         sources.config_generation,
         sources.config_file_revision,
@@ -124,6 +124,7 @@ fn render(
         ledger.outgoing,
         ledger.unsettled_redirects,
         ledger.unsettled_closes,
+        ledger.keyspace_refusals,
     );
     format!(
         "HTTP/1.0 {code} {reason}\r\nContent-Type: application/json\r\n\
@@ -275,6 +276,7 @@ mod tests {
             router_incarnations: 2,
             sessions: 1,
             active: 1,
+            keyspace_refusals: 3,
             ..RouteLedgerEvidence::default()
         };
         let sources = SourceGenerationEvidence {
@@ -300,6 +302,7 @@ mod tests {
         assert!(response.contains("\"memory_series\":3"));
         assert!(response.contains("\"router_incarnations\":2"));
         assert!(response.contains("\"sessions\":1"));
+        assert!(response.contains("\"keyspace_refusals\":3"));
         assert!(response.contains("\"active\":1"));
     }
 }
