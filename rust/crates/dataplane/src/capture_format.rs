@@ -101,6 +101,17 @@ fn valid_go_literal(value: &str) -> bool {
                     if !digits.iter().all(u8::is_ascii_hexdigit) {
                         return false;
                     }
+                    if matches!(escaped, b'u' | b'U') {
+                        let Ok(hex) = std::str::from_utf8(digits) else {
+                            return false;
+                        };
+                        let Ok(codepoint) = u32::from_str_radix(hex, 16) else {
+                            return false;
+                        };
+                        if char::from_u32(codepoint).is_none() {
+                            return false;
+                        }
+                    }
                     index += hex_len;
                 }
             }
@@ -348,7 +359,13 @@ mod tests {
     fn rejects_header_injection_and_malformed_go_literals() -> Result<(), NativeFormatError> {
         let fixture = include_bytes!("../../../../tests/dataplane/capture-format/native-v1.log");
         let (mut record, _) = decode_one(fixture)?;
-        for literal in ["\"bad\nheader\"", "\"bad\\q\"", "\"bad\"quote\""] {
+        for literal in [
+            "\"bad\nheader\"",
+            "\"bad\\q\"",
+            "\"bad\"quote\"",
+            "\"bad\\ud800\"",
+            "\"bad\\U00110000\"",
+        ] {
             record.prepared_stmt_go_literal = Some(literal.to_owned());
             assert_eq!(
                 encode(&record),
