@@ -214,10 +214,12 @@ stop_owned_process "${CONFLICT_PID:-}" "$run_dir/tiproxy-conflict.toml" || clean
 stop_owned_process "${RUST_CONFLICT_PID:-}" "$run_dir/absent.sock" || cleanup_status=1
 stop_owned_process "${FAULT_PID:-}" "$run_dir/faultproxy" || cleanup_status=1
 # SIGINT drives tiproxy-rs's coordinated shutdown (stop-accept ->
-# graceful drain -> force -> join); its command line carries this run's
-# unique control-socket path, satisfying the ownership check.
+# graceful drain -> force -> join). The ownership marker is this run's
+# unique --config path, which the command carries in BOTH the two-process
+# (--control-socket) and the single-process (--standalone) launches; the
+# control socket is absent under --standalone and cannot be the marker.
 if [[ -n ${RUST_SOCKET:-} ]]; then
-	stop_owned_process "${RUST_PID:-}" "${RUST_CONTROL_SOCKET:-$RUST_SOCKET}" || cleanup_status=1
+	stop_owned_process "${RUST_PID:-}" "$run_dir/tiproxy.toml" || cleanup_status=1
 	if [[ -n ${T3_DROP_SOCKET:-} ]]; then
 		stop_owned_process "${T4_REJECT_PID:-}" "$run_dir/controlrejector" || cleanup_status=1
 		t3_drop_stopped=0
