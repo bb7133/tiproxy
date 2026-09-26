@@ -165,6 +165,7 @@ if [[ -n ${KA_DROP_SOCKET:-} ]]; then
 		fi
 	fi
 fi
+stop_owned_process "${KA_FAULT_PID:-}" "127.0.0.1:${KA_FAULT_PORT:-unused-standalone-faultproxy}" || cleanup_status=1
 stop_owned_process "${KA_PID:-}" "$run_dir/tiproxy-ka.toml" || cleanup_status=1
 # MIG-01 live migration session (Rust plain/TLS only). The exact PID and
 # FIFO are persisted before the dynamic fail-list swap so a mid-phase failure

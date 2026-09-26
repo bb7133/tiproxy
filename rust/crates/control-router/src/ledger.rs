@@ -60,6 +60,8 @@ pub struct RouteLedgerEvidence {
     pub unsettled_redirects: u64,
     /// Exact force-close terminals that remain unsettled.
     pub unsettled_closes: u64,
+    /// Cross-keyspace migration offers rejected across retained routers.
+    pub keyspace_refusals: u64,
 }
 
 impl RouteLedgerEvidence {
@@ -76,6 +78,9 @@ impl RouteLedgerEvidence {
             .unsettled_redirects
             .saturating_add(other.unsettled_redirects);
         self.unsettled_closes = self.unsettled_closes.saturating_add(other.unsettled_closes);
+        self.keyspace_refusals = self
+            .keyspace_refusals
+            .saturating_add(other.keyspace_refusals);
     }
 }
 

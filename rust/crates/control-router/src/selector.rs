@@ -1092,7 +1092,12 @@ impl Router {
     }
 
     pub(crate) fn ledger_evidence(&self) -> crate::RouteLedgerEvidence {
-        self.lock().ledger.evidence()
+        let state = self.lock();
+        let mut evidence = state.ledger.evidence();
+        evidence.keyspace_refusals = state.schedules.values().fold(0_u64, |total, schedule| {
+            total.saturating_add(schedule.progress.keyspace_refusals)
+        });
+        evidence
     }
 }
 

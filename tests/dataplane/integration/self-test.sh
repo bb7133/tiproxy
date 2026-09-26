@@ -22,8 +22,40 @@ sha256_file() {
 	fi
 }
 
-bash -n "$script_dir/run.sh" "$script_dir/qualify-route-owner.sh" \
+bash -n "$script_dir/run.sh" "$script_dir/standalone-no-go.sh" "$script_dir/qualify-route-owner.sh" \
 	"$script_dir/warm-tiup-components.sh"
+
+# The standalone receipt must pass without a Go component and fail if a
+# tagged TiUP Go component log appears, including one from a short-lived
+# process that no longer appears in ps.
+source "$script_dir/standalone-no-go.sh"
+run_dir="$temp_dir/standalone-no-go"
+tiup_data="$temp_dir/tiup-main"
+tiup_data_b="$temp_dir/tiup-secondary"
+mkdir -p "$run_dir" "$tiup_data" "$tiup_data_b"
+assert_standalone_no_go clean
+grep -q '^phase=clean go_proxy_processes=0 go_component_logs=0 main_nsmgr_lines=0$' \
+	"$run_dir/standalone-no-go.txt" || {
+	echo "standalone 0-Go clean receipt missing" >&2
+	exit 1
+}
+mkdir -p "$tiup_data/0/log"
+: >"$tiup_data/0/log/tiproxy.log"
+if (assert_standalone_no_go empty-go-log) >/dev/null 2>&1; then
+	echo "standalone 0-Go gate accepted an empty Go component log" >&2
+	exit 1
+fi
+printf '{"logger":"main.nsmgr.router.policy"}\n' >"$tiup_data/0/log/tiproxy.log"
+if (assert_standalone_no_go nsmgr) >/dev/null 2>&1; then
+	echo "standalone 0-Go gate accepted a Go nsmgr log" >&2
+	exit 1
+fi
+grep -q '^phase=nsmgr go_proxy_processes=0 go_component_logs=1 main_nsmgr_lines=1$' \
+	"$run_dir/standalone-no-go.txt" || {
+	echo "standalone 0-Go refusal receipt missing real log count" >&2
+	exit 1
+}
+
 PYTHONPYCACHEPREFIX="$temp_dir/pycache" python3 -m py_compile \
 	"$script_dir/write-t4-row-receipt.py" \
 	"$script_dir/dedup-evidence-binaries.py"
