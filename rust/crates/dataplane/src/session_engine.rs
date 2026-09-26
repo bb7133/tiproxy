@@ -345,6 +345,11 @@ const STREAMED_COMMAND_CAPTURE: usize = 1024;
 const RESPONSE_CAPTURE: usize = 23;
 /// Engine effect-command queue depth (FSM effects per event are few).
 const ENGINE_CMD_CAPACITY: usize = 16;
+/// opt#5: yield to the scheduler once per this many consecutively bypassed
+/// response packets, so the FSM/SessionLoop producer task (the sender into
+/// `cmds`), not this Engine consumer task, gets a scheduling opportunity to
+/// enqueue a pending close/redirect on a continuously readable response.
+const BYPASS_YIELD_INTERVAL: u32 = 64;
 /// Engine → owner report queue depth.
 const ENGINE_REPORT_CAPACITY: usize = 8;
 const BACKEND_HEALTH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -3268,6 +3273,7 @@ impl Engine {
     }
 
     /// Streams one command's backend response(s) to the client.
+    #[allow(clippy::too_many_lines)] // hot response loop; opt#5 bypass adds a branch
     async fn response_rounds(&mut self, pending: &PendingCommand) -> Option<WireErrorSource> {
         let Ok(mut observer) = ResponseObserver::new(
             pending.expected,
@@ -3277,6 +3283,22 @@ impl Engine {
         ) else {
             return Some(WireErrorSource::Proxy);
         };
+        // opt#5: the first packet of a response carries the Command->Response
+        // transition and always drives the FSM; only *subsequent* ordinary
+        // `Continue` packets (result-set column defs / rows, ~2/3 of tpcc
+        // response packets) can bypass the per-packet FSM round-trip.
+        let mut first_packet = true;
+        // Consecutive bypassed packets since the last scheduling point. A busy
+        // backend can keep the read side continuously ready, so `try_recv` alone
+        // never lets the FSM/SessionLoop producer task run to *enqueue* a
+        // pending close/redirect (starvation risk on a single-threaded runtime).
+        // Every this many bypasses we `yield_now`, giving that producer a
+        // scheduling *opportunity*
+        // (Tokio does not guarantee a specific producer runs next, so this is not
+        // a hard packet bound — the hard forced-close bound remains the owner's
+        // force-drain deadline; this only keeps that deadline from being starved
+        // indefinitely on a continuously readable response).
+        let mut bypass_since_yield: u32 = 0;
         loop {
             let forwarded = {
                 let Some(backend) = self.backend.as_mut() else {
@@ -3335,6 +3357,33 @@ impl Engine {
             if completes && let Some(source) = self.observe_prepared_cursor(pending, effect).await {
                 return Some(source);
             }
+            // opt#5: a non-first ordinary `Continue` packet applies no FSM state
+            // change (the FSM would only echo `ForwardResponseToClient`). Skip
+            // the per-packet `events.send` + `await_effect` cross-task round-trip
+            // and instead drain any pending control non-blocking, so a forced
+            // close / redirect is not starved by a long response and the bounded
+            // `cmds` channel is drained at this boundary (it can still transiently
+            // fill during a single packet's transfer). All other dispositions (first packet,
+            // MoreResults, LOCAL INFILE, terminal) keep the full FSM round-trip.
+            let bypass_fsm =
+                !first_packet && matches!(effect.disposition, ResponseDisposition::Continue);
+            first_packet = false;
+            if bypass_fsm {
+                bypass_since_yield += 1;
+                if bypass_since_yield >= BYPASS_YIELD_INTERVAL {
+                    bypass_since_yield = 0;
+                    // Scheduling opportunity for the FSM/SessionLoop producer
+                    // task so a pending close/redirect can be enqueued under a
+                    // continuously readable response (Tokio does not guarantee it
+                    // runs before the next forward); the next drain observes it.
+                    tokio::task::yield_now().await;
+                }
+                if matches!(self.drain_control_pending().await, Awaited::Closing) {
+                    return None;
+                }
+                continue;
+            }
+            bypass_since_yield = 0;
             let event = effect.session_event();
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
@@ -3601,6 +3650,34 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// opt#5: non-blocking, bounded drain of pending engine control commands at
+    /// a bypassed-`Continue`-packet boundary. Handles `Probe` / `PrepareRedirect` /
+    /// control effects (redirect, `ReleaseBackend`, close) inline so a long
+    /// response cannot starve a forced close or redirect, and drains queued
+    /// control so a full `cmds` channel does not block the producer's sends (the
+    /// channel can still transiently fill during a single packet's transfer).
+    /// Bounded by the channel capacity so it always terminates, even under a continuous control
+    /// stream (any excess is handled at the next packet boundary). Returns
+    /// `Closing` on a teardown effect or a disconnected engine.
+    ///
+    /// This does NOT provide real-time close mid-packet: a backend stalled part
+    /// way through a physical packet is still bounded only by the owner's
+    /// existing force-drain deadline, exactly as before opt#5.
+    async fn drain_control_pending(&mut self) -> Awaited {
+        for _ in 0..ENGINE_CMD_CAPACITY {
+            match self.cmds.try_recv() {
+                Ok(cmd) => {
+                    if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
+                        return Awaited::Closing;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return Awaited::Closing,
+            }
+        }
+        Awaited::Got
     }
 
     /// Executes one out-of-band command (control effects, probes).
