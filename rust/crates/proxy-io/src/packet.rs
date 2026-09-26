@@ -306,9 +306,12 @@ pub struct LogicalPacket {
 async fn drain_or_read(
     raw_prefix: &mut Vec<u8>,
     raw_prefix_start: &mut usize,
+    over_read: &mut OverReadBuffer,
     inner: &mut (impl AsyncRead + Unpin),
     buf: &mut [u8],
 ) -> io::Result<usize> {
+    // Earliest bytes: the staged raw prefix (below MySQL framing) always drains
+    // before any transport or over-read bytes.
     if *raw_prefix_start < raw_prefix.len() {
         let available = raw_prefix.len() - *raw_prefix_start;
         let count = available.min(buf.len());
@@ -320,7 +323,41 @@ async fn drain_or_read(
         }
         return Ok(count);
     }
+    if over_read.enabled {
+        // Serve any already-buffered over-read bytes first.
+        if over_read.has_pending() {
+            return Ok(serve_over_read(over_read, buf));
+        }
+        // Buffer empty: refill with a single bounded transport read, then serve
+        // this request from it. The raw prefix is drained above, so bytes read
+        // here are strictly later in the stream than the prefetch window and
+        // raw prefix — matching the replay order on upgrade.
+        if over_read.buf.len() != over_read.capacity {
+            over_read.buf = vec![0_u8; over_read.capacity];
+        }
+        let filled = inner.read(&mut over_read.buf[..over_read.capacity]).await?;
+        if filled == 0 {
+            return Ok(0);
+        }
+        over_read.start = 0;
+        over_read.end = filled;
+        return Ok(serve_over_read(over_read, buf));
+    }
     inner.read(buf).await
+}
+
+/// Copy up to `buf.len()` staged over-read bytes into `buf`, advancing the
+/// window and resetting it once drained. Returns the byte count served.
+fn serve_over_read(over_read: &mut OverReadBuffer, buf: &mut [u8]) -> usize {
+    let available = over_read.end - over_read.start;
+    let count = available.min(buf.len());
+    buf[..count].copy_from_slice(&over_read.buf[over_read.start..over_read.start + count]);
+    over_read.start += count;
+    if over_read.start >= over_read.end {
+        over_read.start = 0;
+        over_read.end = 0;
+    }
+    count
 }
 
 /// Inner-independent read state: sequence tracking, prefetch buffer, accounting.
@@ -346,8 +383,61 @@ struct ReaderState {
     raw_prefix_start: usize,
     stream_buffer_size: NonZeroUsize,
     forward_scratch: Vec<u8>,
+    /// Optional read-side over-read window. When enabled (backend readers only),
+    /// a transport read fills this bounded buffer in one syscall and later
+    /// physical-packet reads are served from it, so a multi-packet response
+    /// costs one `recvfrom` per buffer-fill instead of one per header/payload.
+    /// Disabled readers never touch it, preserving exact per-read behaviour.
+    over_read: OverReadBuffer,
     in_bytes: u64,
     in_packets: u64,
+}
+
+/// Bounded read-side over-read buffer, mirroring Go's `bufio.Reader` on the
+/// backend connection. Bytes staged here are *later* in the stream than the
+/// prefetch window and raw prefix, and are counted into `in_bytes` only when a
+/// reader actually consumes them (exactly once), never at fill time.
+#[derive(Debug)]
+struct OverReadBuffer {
+    /// Only backend readers enable buffering; a disabled buffer stays empty and
+    /// every read falls through to an exact transport read.
+    enabled: bool,
+    /// Fill capacity; the backing `Vec` is allocated lazily on first fill.
+    capacity: usize,
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl OverReadBuffer {
+    const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            capacity: 0,
+            buf: Vec::new(),
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Unconsumed staged bytes, in stream order.
+    fn pending(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    const fn has_pending(&self) -> bool {
+        self.end > self.start
+    }
+
+    /// Physically zero and reset the window (used on upgrade handoff, after the
+    /// bytes have been moved into the replay prefix). Preserves the enabled flag
+    /// and capacity so a reused read state keeps buffering after the upgrade.
+    fn clear_zero(&mut self) {
+        self.buf.fill(0);
+        self.buf = Vec::new();
+        self.start = 0;
+        self.end = 0;
+    }
 }
 
 impl ReaderState {
@@ -362,6 +452,7 @@ impl ReaderState {
             stream_buffer_size: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_SIZE)
                 .unwrap_or(NonZeroUsize::MIN),
             forward_scratch: Vec::new(),
+            over_read: OverReadBuffer::disabled(),
             in_bytes: 0,
             in_packets: 0,
         }
@@ -374,6 +465,14 @@ impl ReaderState {
         }
     }
 
+    /// Enable read-side over-read buffering for this reader (backend only). The
+    /// fill capacity matches the stream buffer size, so one transport read can
+    /// hold a full window of response packets.
+    fn enable_over_read(&mut self) {
+        self.over_read.enabled = true;
+        self.over_read.capacity = self.stream_buffer_size.get();
+    }
+
     /// Unconsumed staged raw-prefix bytes, in order.
     fn raw_prefix_slice(&self) -> &[u8] {
         &self.raw_prefix[self.raw_prefix_start..]
@@ -384,7 +483,9 @@ impl ReaderState {
     /// `peek_packet` decoded can sit entirely here while the compression layer's
     /// own read buffer looks empty, so a layered-sequence reset must see it.
     const fn has_buffered_read(&self) -> bool {
-        self.prefetch_end > self.prefetch_start || self.raw_prefix_start < self.raw_prefix.len()
+        self.prefetch_end > self.prefetch_start
+            || self.raw_prefix_start < self.raw_prefix.len()
+            || self.over_read.has_pending()
     }
 
     async fn peek_packet(
@@ -496,6 +597,7 @@ impl ReaderState {
             let read = drain_or_read(
                 &mut self.raw_prefix,
                 &mut self.raw_prefix_start,
+                &mut self.over_read,
                 inner,
                 &mut self.prefetched[self.prefetch_end..],
             )
@@ -534,6 +636,7 @@ impl ReaderState {
             let read = drain_or_read(
                 &mut self.raw_prefix,
                 &mut self.raw_prefix_start,
+                &mut self.over_read,
                 inner,
                 &mut output[position..],
             )
@@ -1406,6 +1509,22 @@ impl<T> PacketIo<T> {
         }
     }
 
+    /// Enables read-side over-read buffering on this endpoint (backend readers
+    /// only). One transport read then fills a bounded window and later physical
+    /// packets are served from it, cutting `recvfrom` on multi-packet responses.
+    pub fn enable_read_buffering(&mut self) {
+        self.read.enable_over_read();
+    }
+
+    /// Whether any peeked-but-unconsumed bytes remain above the transport (read
+    /// prefetch, raw prefix, or over-read window). At a command boundary this is
+    /// false; a `true` at an idle liveness probe means the peer sent data
+    /// outside a command (protocol desync), i.e. not idle-healthy.
+    #[must_use]
+    pub const fn has_buffered_read(&self) -> bool {
+        self.read.has_buffered_read()
+    }
+
     /// Returns a shared reference to the underlying transport.
     #[must_use]
     pub const fn get_ref(&self) -> &T {
@@ -1505,16 +1624,21 @@ impl<T> PacketIo<T> {
         // raw-prefix remainder is later in the stream and comes after.
         let mut unread_prefix = read.prefetched_slice().to_vec();
         unread_prefix.extend_from_slice(read.raw_prefix_slice());
+        // Over-read bytes are strictly later in the stream than the prefetch
+        // window and raw-prefix remainder (they were read from the transport
+        // only after both drained), so they replay last.
+        unread_prefix.extend_from_slice(read.over_read.pending());
         // Exactly-once: the prefix now lives solely in `unread_prefix`. Physically
-        // zero both the prefetch backing array and the whole raw-prefix buffer
-        // (including its already-drained region) before releasing it, so the
-        // token — and the freed allocation — retain no second copy of any byte.
+        // zero the prefetch backing array, the whole raw-prefix buffer (including
+        // its already-drained region), and the over-read window before releasing
+        // them, so the token — and the freed allocations — retain no second copy.
         read.prefetched.fill(0);
         read.prefetch_start = 0;
         read.prefetch_end = 0;
         read.raw_prefix.fill(0);
         read.raw_prefix = Vec::new();
         read.raw_prefix_start = 0;
+        read.over_read.clear_zero();
         (inner, PacketIoUpgradeState { read, write }, unread_prefix)
     }
 
@@ -2829,6 +2953,198 @@ mod tests {
         assert_eq!(resumed.payload, b"resumed-next");
         // Sequence continued from 2 to 3 (not reset); no duplicated prefix bytes.
         assert_eq!(upgraded.expected_read_sequence(), 3);
+        Ok(())
+    }
+
+    /// Counts `poll_read` invocations (one per transport `recvfrom`) over a
+    /// `Cursor`, so a test can prove over-read buffering coalesces reads.
+    #[derive(Debug)]
+    struct CountingReader {
+        data: Cursor<Vec<u8>>,
+        reads: usize,
+    }
+
+    impl CountingReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: Cursor::new(data),
+                reads: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.reads += 1;
+            Pin::new(&mut this.data).poll_read(context, output)
+        }
+    }
+
+    #[tokio::test]
+    async fn over_read_serves_multiple_packets_in_one_transport_read() -> Result<(), Box<dyn Error>>
+    {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encoded_physical_packet(b"aa", 0)?);
+        wire.extend_from_slice(&encoded_physical_packet(b"bbbb", 1)?);
+        wire.extend_from_slice(&encoded_physical_packet(b"cc", 2)?);
+
+        // Enabled reader: one bounded fill covers all three packets; every
+        // header/payload read after that is served from the window.
+        let mut reader = CountingReader::new(wire.clone());
+        let mut state = ReaderState::new();
+        state.enable_over_read();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..3 {
+            let (header, _sequence) = state.read_header(&mut reader).await?;
+            let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+            state
+                .read_exact(&mut reader, &mut payload, "test payload")
+                .await?;
+            payloads.push(payload);
+        }
+        assert_eq!(
+            payloads,
+            vec![b"aa".to_vec(), b"bbbb".to_vec(), b"cc".to_vec()],
+            "bytes and packet order preserved across the buffered window"
+        );
+        assert_eq!(
+            reader.reads, 1,
+            "over-read coalesces all packets into a single transport read"
+        );
+
+        // Disabled reader (default): header and payload each cost a read.
+        let mut plain_reader = CountingReader::new(wire);
+        let mut plain_state = ReaderState::new();
+        for _ in 0..3 {
+            let (header, _sequence) = plain_state.read_header(&mut plain_reader).await?;
+            let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+            plain_state
+                .read_exact(&mut plain_reader, &mut payload, "test payload")
+                .await?;
+        }
+        assert_eq!(
+            plain_reader.reads, 6,
+            "unbuffered path reads header and payload separately (2 per packet)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn has_buffered_read_true_while_over_read_window_holds_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encoded_physical_packet(b"aa", 0)?);
+        wire.extend_from_slice(&encoded_physical_packet(b"bb", 1)?);
+        let mut reader = CountingReader::new(wire);
+        let mut state = ReaderState::new();
+        state.enable_over_read();
+
+        // Consume only the first packet; the second sits in the over-read
+        // window, so an idle-liveness check must see data outstanding.
+        let (header, _sequence) = state.read_header(&mut reader).await?;
+        let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+        state.read_exact(&mut reader, &mut payload, "p").await?;
+        assert!(
+            state.has_buffered_read(),
+            "a buffered second packet is data outside a command => not idle-healthy"
+        );
+
+        // Draining the second packet empties the window.
+        let (header, _sequence) = state.read_header(&mut reader).await?;
+        let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+        state.read_exact(&mut reader, &mut payload, "p").await?;
+        assert!(
+            !state.has_buffered_read(),
+            "fully drained window => idle-healthy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_prefix_replays_over_read_bytes_last() -> Result<(), Box<dyn Error>> {
+        let first = encoded_physical_packet(b"aa", 0)?;
+        let mut wire = first.clone();
+        wire.extend_from_slice(&encoded_physical_packet(b"bb", 1)?);
+
+        let mut io = PacketIo::new(Cursor::new(wire.clone()));
+        io.enable_read_buffering();
+        // Reading the first logical packet over-reads the second into the
+        // window; the upgrade prefix must carry those bytes for replay.
+        let logical = io.read_logical(16).await?;
+        assert_eq!(logical.payload, b"aa");
+        // Only the consumed first packet is counted; the over-read second packet
+        // sits in the window uncounted until consumed.
+        assert_eq!(
+            io.in_bytes(),
+            first.len() as u64,
+            "over-read bytes are not counted at fill time"
+        );
+
+        let (_inner, state, unread_prefix) = io.into_upgrade_parts();
+        assert_eq!(
+            unread_prefix.as_slice(),
+            &wire[first.len()..],
+            "over-read bytes replay as the (only) unread prefix, in stream order"
+        );
+
+        // Replaying the prefix reconstructs the second packet exactly once, with
+        // the sequence continued (not reset).
+        let mut reattached = PacketIo::from_upgrade_parts(Cursor::new(unread_prefix), state);
+        let second = reattached.read_logical(16).await?;
+        assert_eq!(second.payload, b"bb");
+        // Counters carry across the upgrade: one packet before, one after, and
+        // neither the replayed prefix bytes nor the packet count are doubled —
+        // every wire byte is counted exactly once end to end.
+        assert_eq!(reattached.in_packets(), 2);
+        assert_eq!(
+            reattached.in_bytes(),
+            wire.len() as u64,
+            "each wire byte counted exactly once across the upgrade replay"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn over_read_extra_bytes_in_same_read_keep_reader_not_idle_healthy()
+    -> Result<(), Box<dyn Error>> {
+        // A single transport read delivers a complete response packet plus a
+        // trailing stray byte (the "final OK + extra byte in the same write"
+        // desync case). The stray must land in the over-read window and keep
+        // `has_buffered_read()` true, so a session's `backend_alive()` reports
+        // not-idle-healthy — the same verdict the raw-socket probe gives for a
+        // stray byte still on the socket (`Ok(_) => false`).
+        let mut wire = encoded_physical_packet(b"aa", 0)?;
+        wire.push(0x99);
+        let mut reader = CountingReader::new(wire);
+        let mut state = ReaderState::new();
+        state.enable_over_read();
+
+        let (header, _sequence) = state.read_header(&mut reader).await?;
+        let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+        state.read_exact(&mut reader, &mut payload, "p").await?;
+        assert_eq!(payload, b"aa");
+        assert_eq!(
+            reader.reads, 1,
+            "the packet and the stray byte arrived in one transport read"
+        );
+        assert!(
+            state.has_buffered_read(),
+            "stray byte outside a packet stays buffered => not idle-healthy"
+        );
+
+        // Draining the stray byte empties the window (idle-healthy again).
+        let mut stray = [0_u8; 1];
+        state.read_exact(&mut reader, &mut stray, "stray").await?;
+        assert_eq!(stray[0], 0x99);
+        assert!(
+            !state.has_buffered_read(),
+            "fully drained window => idle-healthy"
+        );
         Ok(())
     }
 }

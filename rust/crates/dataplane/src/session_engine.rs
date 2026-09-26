@@ -2147,6 +2147,11 @@ impl Engine {
             healthy: backend_healthy,
             keepalive_applied,
         };
+        // Backend responses are multi-packet result sets; over-read buffering
+        // serves their physical packets from one transport read. The backend
+        // only sends solicited bytes, so the window is empty at every command
+        // boundary (keeping `reset_layer_sequence`/idle-liveness clean).
+        backend.backend_io.enable_read_buffering();
         let greeting_read = backend
             .backend_io
             .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
@@ -3961,6 +3966,8 @@ impl Engine {
             healthy: target.backend_healthy,
             keepalive_applied: false,
         };
+        // Same read-side over-read buffering as the primary connect path.
+        candidate.backend_io.enable_read_buffering();
         let greeting = candidate
             .backend_io
             .read_logical(HANDSHAKE_PAYLOAD_LIMIT)
@@ -4737,6 +4744,13 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return false;
         };
+        // Over-read/prefetch bytes staged above the transport mean the backend
+        // sent data outside a command (or a full response was not drained) —
+        // the same "data while idle" condition the raw-socket probe treats as
+        // not idle-healthy, so report it before probing the socket.
+        if backend.backend_io.has_buffered_read() {
+            return false;
+        }
         let Some(counted) = backend.backend_io.get_ref().as_counted_stream() else {
             // Detached only during an in-progress TLS upgrade, before the
             // backend is exposed to probes; treat as alive rather than dead.
