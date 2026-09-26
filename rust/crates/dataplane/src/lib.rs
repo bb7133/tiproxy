@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod capture_format;
 pub mod control_commands;
 pub mod control_dispatch;
 pub mod control_runtime;

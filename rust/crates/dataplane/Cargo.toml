@@ -11,6 +11,7 @@ repository.workspace = true
 default = []
 
 [dependencies]
+chrono.workspace = true
 control-meter.workspace = true
 control-proto.workspace = true
 control-router.workspace = true
