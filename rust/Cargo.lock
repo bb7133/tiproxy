@@ -2936,6 +2936,7 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
+ "session-core",
  "tokio",
  "tokio-rustls",
  "tonic",

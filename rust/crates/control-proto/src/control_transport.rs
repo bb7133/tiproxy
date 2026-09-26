@@ -648,6 +648,12 @@ impl ControlClient {
         *self.shutdown_tx.borrow()
     }
 
+    /// Observes process shutdown without starting the legacy socket owner.
+    #[must_use]
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
     /// Requests cancellation of connect, queue, I/O, heartbeat, and backoff waits.
     pub fn shutdown(&self) {
         self.shutdown_tx.send_replace(true);

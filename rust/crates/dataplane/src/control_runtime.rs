@@ -67,9 +67,33 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::control_dispatch::{
-    ControlCommandHandler, ControlDispatchHandle, DispatchFatal, DispatchStats, TaggedEnvelope,
-    spawn_control_dispatch_with_handler, system_unix_millis,
+    ControlCommandHandler, ControlDispatchHandle, DispatchFatal, DispatchSender, DispatchStats,
+    TaggedEnvelope, spawn_control_dispatch_parts, spawn_control_dispatch_with_handler,
+    system_unix_millis,
 };
+
+/// The local owner never sends control envelopes to a Go process. Session and
+/// metering notices still pass through the same in-process dispatch gate, while
+/// the route plane owns all backend decisions and migration commands.
+struct LocalDispatchSender;
+
+impl DispatchSender for LocalDispatchSender {
+    fn allocate_request_id(&self) -> Option<u64> {
+        None
+    }
+
+    async fn send_envelope(&self, _envelope: ControlEnvelope) -> Result<(), TransportError> {
+        Err(TransportError::Closed)
+    }
+
+    async fn send_session_scoped(
+        &self,
+        _envelope: ControlEnvelope,
+        _epoch: u64,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::StaleSessionEpoch)
+    }
+}
 
 /// One effective serving payload plus the independent Rust-owned source
 /// generation used to compose it.
@@ -396,6 +420,129 @@ pub fn spawn_control_runtime_with_client_and_handler<C: SnapshotConsumer>(
         snapshot_rx,
     ));
     ControlRuntime::supervise(client, handle, transport, dispatch, snapshots)
+}
+
+/// Runs the session/command gate without opening a control socket or starting
+/// a transport owner. The client is retained only for the legacy-only session
+/// adapter and process shutdown until those compatibility seams are removed.
+/// Its transport is never run; local routing never sends through it.
+#[must_use]
+pub fn spawn_local_control_runtime(
+    client: Arc<ControlClient>,
+    tick_interval: Duration,
+    handler: ControlCommandHandler,
+) -> ControlRuntime {
+    let (snapshot_tx, snapshot_rx) = mpsc::channel(1);
+    let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+    let (handle, forwarder, mut dispatch) = spawn_control_dispatch_parts(
+        handler,
+        Arc::new(LocalDispatchSender),
+        state_rx,
+        snapshot_tx,
+        tick_interval,
+    );
+    let supervisor_client = Arc::clone(&client);
+    let supervisor = tokio::spawn(async move {
+        // Keep the channel owners alive while local sessions are served. The
+        // dispatch must not interpret their absence as an unexpected exit.
+        let _owners = (state_tx, forwarder, snapshot_rx);
+        let mut shutdown = supervisor_client.subscribe_shutdown();
+        tokio::select! {
+            result = &mut dispatch => match result {
+                Ok(Ok(())) => Err(TransportError::Configuration(
+                    "local control dispatch exited without shutdown".to_owned(),
+                )),
+                Ok(Err(error)) => Err(TransportError::Configuration(
+                    format!("local control dispatch failed: {error}"),
+                )),
+                Err(_) => Err(TransportError::Configuration(
+                    "local control dispatch panicked".to_owned(),
+                )),
+            },
+            () = async {
+                loop {
+                    let requested = *shutdown.borrow();
+                    if requested || shutdown.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {
+                dispatch.abort();
+                match dispatch.await {
+                    Ok(Err(error)) => Err(TransportError::Configuration(
+                        format!("local control dispatch failed: {error}"),
+                    )),
+                    _ => Ok(()),
+                }
+            }
+        }
+    });
+    ControlRuntime {
+        client,
+        handle,
+        supervisor,
+    }
+}
+
+#[cfg(test)]
+mod local_runtime_tests {
+    use super::*;
+    use crate::route_control::TrafficTotals;
+    use control_proto::v1::{ConnectionIdentity, ErrorSource, Hello, Role};
+
+    #[tokio::test]
+    async fn local_dispatch_registers_and_adopts_without_go_socket() {
+        let hello = Hello {
+            role: Role::RustDataplane as i32,
+            process_id: "local-runtime-test".to_owned(),
+            process_started_unix_millis: 1,
+            supported_versions: vec![1],
+            max_frame_bytes: control_proto::DEFAULT_MAX_FRAME_BYTES,
+            ..Hello::default()
+        };
+        let client = Arc::new(
+            ControlClient::new(ClientConfig::with_defaults("/dev/null".into(), 0, hello))
+                .unwrap_or_else(|error| unreachable!("local client metadata: {error}")),
+        );
+        let runtime = spawn_local_control_runtime(
+            Arc::clone(&client),
+            Duration::from_millis(10),
+            ControlCommandHandler::native_meter_owner(),
+        );
+        let handle = runtime.handle();
+        let (directives, _receiver) = mpsc::channel(1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                handle.register_session(
+                    ConnectionIdentity {
+                        connection_id: 7,
+                        ..ConnectionIdentity::default()
+                    },
+                    "default".to_owned(),
+                    1,
+                    "sql".to_owned(),
+                    directives,
+                    None,
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| unreachable!("local register timed out: {error}"))
+        );
+        assert!(handle.set_local_namespace(7, "default".to_owned()).await);
+        assert!(handle.set_backend(7, "backend-1".to_owned()).await);
+        assert!(
+            handle
+                .session_closed(7, false, ErrorSource::Proxy, TrafficTotals::default())
+                .await
+        );
+        assert!(!client.is_shutdown());
+        runtime.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .unwrap_or_else(|error| unreachable!("local shutdown timed out: {error}"))
+            .unwrap_or_else(|error| unreachable!("local shutdown failed: {error}"));
+    }
 }
 
 /// Applies one `StateSnapshot` envelope through the two-phase
