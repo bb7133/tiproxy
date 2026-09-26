@@ -708,10 +708,17 @@ impl WriterState {
         inner: &mut (impl AsyncWrite + Unpin),
         payload_length: u32,
     ) -> Result<(), PacketIoError> {
-        let sequence = self.sequence.take_next();
-        let header = PacketHeader::new(payload_length, sequence)?.encode();
+        let header = self.next_physical_header(payload_length)?;
         self.write_all(inner, &header, "writing physical packet header")
             .await
+    }
+
+    fn next_physical_header(
+        &mut self,
+        payload_length: u32,
+    ) -> Result<[u8; PHYSICAL_PACKET_HEADER_LEN], PacketIoError> {
+        let sequence = self.sequence.take_next();
+        Ok(PacketHeader::new(payload_length, sequence)?.encode())
     }
 
     async fn write_payload(
@@ -836,29 +843,51 @@ async fn forward_inner_with_scratch(
         }
         let (header, sequence) = src_state.read_header(src_inner).await?;
         progress.observe_header(header, sequence)?;
-        dst_state
-            .start_physical_packet(dst_inner, header.payload_length())
-            .await?;
-
-        let mut remaining = usize::try_from(header.payload_length()).map_err(|_| {
+        let payload_length = usize::try_from(header.payload_length()).map_err(|_| {
             PacketIoError::CounterOverflow {
                 field: "physical payload length",
             }
         })?;
-        while remaining > 0 {
-            let chunk_length = remaining.min(scratch.len());
+        if payload_length > 0
+            && payload_length <= scratch.len().saturating_sub(PHYSICAL_PACKET_HEADER_LEN)
+        {
+            // A small physical packet fits in one bounded write. Reading the
+            // complete payload before emission avoids a separate socket write
+            // for its regenerated header, while keeping the stream buffer cap.
+            let outbound_header = dst_state.next_physical_header(header.payload_length())?;
+            let end = PHYSICAL_PACKET_HEADER_LEN + payload_length;
             src_state
                 .read_exact(
                     src_inner,
-                    &mut scratch[..chunk_length],
+                    &mut scratch[PHYSICAL_PACKET_HEADER_LEN..end],
                     "physical packet payload",
                 )
                 .await?;
-            progress.observe_payload(&scratch[..chunk_length])?;
+            progress.observe_payload(&scratch[PHYSICAL_PACKET_HEADER_LEN..end])?;
+            scratch[..PHYSICAL_PACKET_HEADER_LEN].copy_from_slice(&outbound_header);
             dst_state
-                .write_payload(dst_inner, &scratch[..chunk_length])
+                .write_all(dst_inner, &scratch[..end], "writing physical packet")
                 .await?;
-            remaining -= chunk_length;
+        } else {
+            dst_state
+                .start_physical_packet(dst_inner, header.payload_length())
+                .await?;
+            let mut remaining = payload_length;
+            while remaining > 0 {
+                let chunk_length = remaining.min(scratch.len());
+                src_state
+                    .read_exact(
+                        src_inner,
+                        &mut scratch[..chunk_length],
+                        "physical packet payload",
+                    )
+                    .await?;
+                progress.observe_payload(&scratch[..chunk_length])?;
+                dst_state
+                    .write_payload(dst_inner, &scratch[..chunk_length])
+                    .await?;
+                remaining -= chunk_length;
+            }
         }
         src_state.finish_physical_packet()?;
         dst_state.finish_physical_packet()?;
@@ -2450,6 +2479,25 @@ mod tests {
         let mut reader = PacketReader::new(output.as_slice());
         assert_eq!(reader.read_logical(16).await?.payload, b"secret payload");
         assert_eq!(reader.read_logical(16).await?.payload, b"x");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn short_forward_coalesces_header_and_payload_but_large_forward_stays_bounded()
+    -> Result<(), Box<dyn Error>> {
+        let mut wire = encoded_physical_packet(b"hello", 0)?;
+        encode_physical_packet(&[7; 40], 1, &mut wire)?;
+        let buffer_size = NonZeroUsize::new(32).ok_or(io::Error::other("nonzero buffer size"))?;
+        let mut reader = PacketReader::with_stream_buffer_size(wire.as_slice(), buffer_size);
+        let mut writer = PacketWriter::new(CountingWriter::default());
+
+        reader.forward_packet_to(&mut writer, 0).await?;
+        assert_eq!(writer.get_ref().writes, 1);
+        reader.forward_packet_to(&mut writer, 0).await?;
+        assert_eq!(writer.get_ref().writes, 4);
+        assert_eq!(writer.get_ref().maximum_write, 32);
+        assert_eq!(writer.out_packets(), 2);
+        assert_eq!(writer.out_bytes(), 53);
         Ok(())
     }
 
