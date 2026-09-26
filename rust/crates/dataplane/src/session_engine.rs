@@ -343,6 +343,23 @@ const COMMAND_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 const STREAMED_COMMAND_CAPTURE: usize = 1024;
 /// Streaming prefix capture for response classification.
 const RESPONSE_CAPTURE: usize = 23;
+
+async fn forward_response_packet<S, D>(
+    source: &mut PacketIo<S>,
+    destination: &mut PacketIo<D>,
+    first: bool,
+) -> Result<proxy_io::ForwardProgress, PacketIoError>
+where
+    S: tokio::io::AsyncRead + Unpin + DirectionSync,
+    D: tokio::io::AsyncWrite + Unpin + DirectionSync,
+{
+    if first {
+        PacketIo::forward_packet_to(source, destination, RESPONSE_CAPTURE).await
+    } else {
+        PacketIo::forward_response_packet_buffered(source, destination, RESPONSE_CAPTURE).await
+    }
+}
+
 /// Engine effect-command queue depth (FSM effects per event are few).
 const ENGINE_CMD_CAPACITY: usize = 16;
 /// Engine → owner report queue depth.
@@ -3277,15 +3294,20 @@ impl Engine {
         ) else {
             return Some(WireErrorSource::Proxy);
         };
+        // A one-packet OK/ERR response is already one write after packet
+        // coalescing. Forward its first packet directly so batching does not
+        // add an allocation and copy to the common OLTP case. Later packets
+        // may be held until the observer's existing flush boundary.
+        let mut first_response_packet = true;
         loop {
             let forwarded = {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                PacketIo::forward_response_packet_buffered(
+                forward_response_packet(
                     &mut backend.backend_io,
                     &mut self.client_io,
-                    RESPONSE_CAPTURE,
+                    first_response_packet,
                 )
                 .await
             };
@@ -3301,6 +3323,7 @@ impl Engine {
                     return Some(self.end_source(source));
                 }
             };
+            first_response_packet = false;
             let first_physical = progress.first_packet_length().unwrap_or(0);
             let Ok(packet) = ResponsePacket::from_forwarded(
                 progress.captured_prefix(),
@@ -3426,15 +3449,16 @@ impl Engine {
         _pending: &PendingCommand,
     ) -> Option<WireErrorSource> {
         let mut observer = PrepareObserver::new(self.negotiated);
+        let mut first_response_packet = true;
         loop {
             let forwarded = {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                PacketIo::forward_response_packet_buffered(
+                forward_response_packet(
                     &mut backend.backend_io,
                     &mut self.client_io,
-                    RESPONSE_CAPTURE,
+                    first_response_packet,
                 )
                 .await
             };
@@ -3450,6 +3474,7 @@ impl Engine {
                     return Some(self.end_source(source));
                 }
             };
+            first_response_packet = false;
             let first_physical = progress.first_packet_length().unwrap_or(0);
             let Ok(packet) = ResponsePacket::from_forwarded(
                 progress.captured_prefix(),
