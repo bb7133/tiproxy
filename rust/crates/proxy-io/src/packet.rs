@@ -93,6 +93,51 @@ pub struct PacketPreview {
     pub sequence_id: u8,
 }
 
+/// Most response classifiers retain at most 23 bytes. Keep that prefix on the
+/// stack; command captures with a larger limit spill to a `Vec` only when the
+/// inline space fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CaptureBuffer {
+    Inline { bytes: [u8; 32], len: usize },
+    Heap(Vec<u8>),
+}
+
+impl CaptureBuffer {
+    const fn new() -> Self {
+        Self::Inline {
+            bytes: [0; 32],
+            len: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn extend_from_slice(&mut self, input: &[u8]) {
+        match self {
+            Self::Inline { bytes, len } if input.len() <= bytes.len() - *len => {
+                bytes[*len..*len + input.len()].copy_from_slice(input);
+                *len += input.len();
+            }
+            Self::Inline { bytes, len } => {
+                let mut heap = Vec::with_capacity(*len + input.len());
+                heap.extend_from_slice(&bytes[..*len]);
+                heap.extend_from_slice(input);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(bytes) => bytes.extend_from_slice(input),
+        }
+    }
+}
+
 /// Bounded capture and accounting state for one logical packet forward.
 ///
 /// A cancellable forward may return at a physical-packet boundary with this
@@ -101,7 +146,7 @@ pub struct PacketPreview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardProgress {
     capture_limit: usize,
-    captured_prefix: Vec<u8>,
+    captured_prefix: CaptureBuffer,
     logical_payload_bytes: u64,
     physical_packets: u64,
     first_packet_length: Option<u32>,
@@ -117,7 +162,7 @@ impl ForwardProgress {
     pub const fn new(capture_limit: usize) -> Self {
         Self {
             capture_limit,
-            captured_prefix: Vec::new(),
+            captured_prefix: CaptureBuffer::new(),
             logical_payload_bytes: 0,
             physical_packets: 0,
             first_packet_length: None,
@@ -137,7 +182,7 @@ impl ForwardProgress {
     /// Returns the retained logical-payload prefix.
     #[must_use]
     pub fn captured_prefix(&self) -> &[u8] {
-        &self.captured_prefix
+        self.captured_prefix.as_slice()
     }
 
     /// Returns whether payload bytes beyond a nonzero capture limit were omitted.
@@ -439,7 +484,7 @@ impl ReaderState {
             });
         }
         Ok(LogicalPacket {
-            payload: progress.captured_prefix.clone(),
+            payload: progress.captured_prefix.as_slice().to_vec(),
             progress,
         })
     }
@@ -1931,6 +1976,31 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     use super::*;
+
+    #[test]
+    fn short_forward_capture_stays_inline_and_larger_command_capture_spills()
+    -> Result<(), PacketIoError> {
+        let mut response = ForwardProgress::new(23);
+        response.observe_payload(&[7; 12])?;
+        response.observe_payload(&[8; 11])?;
+        response.observe_payload(&[9; 5])?;
+        assert!(matches!(
+            response.captured_prefix,
+            CaptureBuffer::Inline { .. }
+        ));
+        assert_eq!(response.captured_prefix().len(), 23);
+        assert_eq!(&response.captured_prefix()[..12], &[7; 12]);
+        assert_eq!(&response.captured_prefix()[12..], &[8; 11]);
+        assert!(response.capture_truncated());
+
+        let mut command = ForwardProgress::new(64);
+        command.observe_payload(&[1; 32])?;
+        command.observe_payload(&[2; 1])?;
+        assert!(matches!(command.captured_prefix, CaptureBuffer::Heap(_)));
+        assert_eq!(&command.captured_prefix()[..32], &[1; 32]);
+        assert_eq!(command.captured_prefix()[32], 2);
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct SyntheticPayload {
