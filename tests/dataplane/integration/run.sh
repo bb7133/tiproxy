@@ -25,6 +25,9 @@ resolve_etcdctl() {
 
 mode=rust
 variant=plain
+# Single-process acceptance (task #140): tiup starts no Go tiproxy and the
+# standalone Rust binary owns the SQL listeners with no Go control peer.
+standalone=${DATAPLANE_STANDALONE:-0}
 artifact_root=${DATAPLANE_ARTIFACT_ROOT:-$script_dir/artifacts}
 port_offset=${DATAPLANE_PORT_OFFSET:-$((10000 + ($$ % 20) * 100))}
 
@@ -61,6 +64,22 @@ case "$mode" in
 		;;
 esac
 
+# DATAPLANE_STANDALONE is a single-process acceptance mode: it runs the
+# main --standalone MIG-01 and exits before the Go-coupled sub-phases.
+# Reject combinations it cannot honestly execute, before the variant=all
+# recursion, so an early exit can never mark un-run phases as passed.
+if [[ $standalone == 1 ]]; then
+	if [[ $mode != rust ]]; then
+		echo "DATAPLANE_STANDALONE=1 requires --mode rust (a single Rust process; tiup starts no Go tiproxy); got --mode '$mode'" >&2
+		exit 2
+	fi
+	for _sa_flag in DATAPLANE_T3_FOCUSED DATAPLANE_T4_FOCUSED DATAPLANE_T4_QUALIFICATION DATAPLANE_NATIVE_METER; do
+		if [[ ${!_sa_flag:-0} == 1 ]]; then
+			echo "DATAPLANE_STANDALONE=1 is incompatible with $_sa_flag=1: the standalone path exits after the main-entry MIG-01 and would not run the focused/qualification phases" >&2
+			exit 2
+		fi
+	done
+fi
 if [[ $variant == all ]]; then
 	# The FULL range is validated up front: six variants at stride 200
 	# (each run consumes two 100-port windows), so the base must leave
@@ -372,11 +391,14 @@ for port in $PORTS; do
 	fi
 done
 
+tiup_tiproxy_args=(--tiproxy 1 --tiproxy.binpath "$repo_root/bin/tiproxy" --tiproxy.config "$run_dir/tiproxy.toml")
+if [[ $standalone == 1 ]]; then
+	tiup_tiproxy_args=(--tiproxy 0)
+fi
 tiup "playground:v${TIUP_VERSION}" "$TIDB_VERSION" --tag "$tag" --without-monitor \
 	--host 127.0.0.1 --port-offset "$port_offset" \
 	--pd 1 --kv 1 --db 2 --tiflash 0 --db.config "$run_dir/tidb.toml" \
-	--tiproxy 1 --tiproxy.binpath "$repo_root/bin/tiproxy" \
-	--tiproxy.config "$run_dir/tiproxy.toml" \
+	"${tiup_tiproxy_args[@]}" \
 	>"$run_dir/tiup-playground.log" 2>&1 &
 TIUP_PID=$!
 record_t4_process tiup-main start "$TIUP_PID" 0
@@ -419,6 +441,9 @@ if [[ -d $tiup_data_b ]]; then
 fi
 
 if [[ $mode == rust ]]; then
+	# The Go bridge socket only exists in the two-process path; skip the
+	# socket wait and control-tap entirely for the single-process run.
+	if [[ $standalone != 1 ]]; then
 	control_socket="$RUST_SOCKET"
 	# The Go control plane creates the socket when it starts; waiting
 	# here keeps the launch independent of client reconnect timing.
@@ -468,14 +493,21 @@ if [[ $mode == rust ]]; then
 		fi
 		control_socket=$RUST_CONTROL_SOCKET
 	fi
+	fi
 	rust_tls_args=()
 	if [[ $TLS_ENABLED == true ]]; then
 		# The Rust dataplane validates the snapshot's TLS cert paths against
 		# its own allowlist of roots, mirroring the control plane's check.
 		rust_tls_args=(--tls-root "$run_dir/certs")
 	fi
+	if [[ $standalone == 1 ]]; then
+		# Bridge-free single process: no Go control peer, so no control socket.
+		rust_owner_args=(--standalone)
+	else
+		rust_owner_args=(--control-socket "$control_socket" --control-uid "$(id -u)")
+	fi
 	"$rust_binary" --config "$run_dir/tiproxy.toml" \
-		--control-socket "$control_socket" --control-uid "$(id -u)" \
+		"${rust_owner_args[@]}" \
 		--health-port "$RUST_HEALTH_PORT" \
 		${rust_tls_args[@]+"${rust_tls_args[@]}"} \
 		>"$run_dir/tiproxy-rs.log" 2>&1 &
@@ -1807,6 +1839,16 @@ cluster_row() {
 cluster_row "$TIPROXY_PORT" cluster-a "$TIDB_PORT_0 $TIDB_PORT_1" "$TIDB_PORT_B" || exit 1
 cluster_row "$TIPROXY_PORT_B" cluster-b "$TIDB_PORT_B" "$TIDB_PORT_0 $TIDB_PORT_1" || exit 1
 echo "cluster matrix: listener $TIPROXY_PORT->cluster-a listener $TIPROXY_PORT_B->cluster-b (deterministic port routing)"
+
+# Single-process acceptance: prove the pure-Rust A0->A1 connection migration
+# on the main --standalone entry, then stop before the Go-coupled
+# keyspace-guard sub-phase (which still reads Go control-plane logs).
+if [[ $standalone == 1 ]]; then
+	source "$script_dir/standalone-mig01.sh"
+	run_standalone_mig01
+	echo "PASS: standalone single-process executed SELECT 1, namespace matrix, and MIG-01 live migration (A0->A1, database+user-variable restored) with no Go tiproxy"
+	exit 0
+fi
 
 # ---- No-keyspace-migration (DPL-07 #41 acceptance) ----
 # An isolated MatchAll proxy instance puts cluster-a (ks-old) and
