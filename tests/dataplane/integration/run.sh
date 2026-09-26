@@ -1854,36 +1854,7 @@ echo "cluster matrix: listener $TIPROXY_PORT->cluster-a listener $TIPROXY_PORT_B
 # Plain also starts an isolated Rust MatchAll process for native CP-ADMIN and
 # cross-keyspace checks. Both stop before the Go-coupled legacy sub-phase.
 if [[ $standalone == 1 ]]; then
-	# A reviewable runtime receipt complements TiUP's --tiproxy 0 and both
-	# Rust --standalone launches. The old Go proxy would use this run's
-	# config path and emit main.nsmgr logs; either observation fails closed.
-	assert_standalone_no_go() {
-		local phase=$1 process_lines command pid go_proxy_count=0 nsmgr_count=0 log
-		process_lines=$(ps -Ao pid=,command=) || {
-			echo "cannot inspect standalone process table" >&2
-			exit 1
-		}
-		while read -r pid command; do
-			if [[ $command == *"$repo_root/bin/tiproxy"* &&
-				$command == *"$run_dir/tiproxy.toml"* ]]; then
-				((go_proxy_count += 1))
-			fi
-		done <<<"$process_lines"
-		for log in "$run_dir/tiproxy.log" "$run_dir/tiup-playground.log"; do
-			if [[ -f $log ]]; then
-				local found
-				found=$(grep -c 'main\.nsmgr' "$log" || true)
-				((nsmgr_count += found))
-			fi
-		done
-		printf 'phase=%s go_proxy_processes=%s main_nsmgr_lines=%s\n' \
-			"$phase" "$go_proxy_count" "$nsmgr_count" \
-			>>"$run_dir/standalone-no-go.txt"
-		if ((go_proxy_count != 0 || nsmgr_count != 0)); then
-			echo "standalone $phase launched Go tiproxy: processes=$go_proxy_count nsmgr_lines=$nsmgr_count" >&2
-			exit 1
-		fi
-	}
+	source "$script_dir/standalone-no-go.sh"
 	assert_standalone_no_go before-mig
 	source "$script_dir/standalone-mig01.sh"
 	run_standalone_mig01
