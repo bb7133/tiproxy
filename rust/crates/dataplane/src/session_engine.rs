@@ -3287,7 +3287,7 @@ impl Engine {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                PacketIo::forward_packet_to(
+                PacketIo::forward_response_packet_buffered(
                     &mut backend.backend_io,
                     &mut self.client_io,
                     RESPONSE_CAPTURE,
@@ -3436,7 +3436,7 @@ impl Engine {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                PacketIo::forward_packet_to(
+                PacketIo::forward_response_packet_buffered(
                     &mut backend.backend_io,
                     &mut self.client_io,
                     RESPONSE_CAPTURE,

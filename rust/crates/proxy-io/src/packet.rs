@@ -697,6 +697,7 @@ impl ReaderState {
 struct WriterState {
     sequence: SequenceTracker,
     stream_buffer_size: NonZeroUsize,
+    forward_pending: Vec<u8>,
     out_bytes: u64,
     out_packets: u64,
 }
@@ -707,6 +708,7 @@ impl WriterState {
             sequence: SequenceTracker::default(),
             stream_buffer_size: NonZeroUsize::new(DEFAULT_STREAM_BUFFER_SIZE)
                 .unwrap_or(NonZeroUsize::MIN),
+            forward_pending: Vec::new(),
             out_bytes: 0,
             out_packets: 0,
         }
@@ -800,6 +802,7 @@ impl WriterState {
     }
 
     async fn flush(&mut self, inner: &mut (impl AsyncWrite + Unpin)) -> Result<(), PacketIoError> {
+        self.drain_forward_pending(inner).await?;
         inner
             .flush()
             .await
@@ -834,6 +837,61 @@ impl WriterState {
     }
 
     async fn write_all(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        input: &[u8],
+        operation: &'static str,
+    ) -> Result<(), PacketIoError> {
+        self.drain_forward_pending(inner).await?;
+        self.write_all_direct(inner, input, operation).await
+    }
+
+    async fn write_forward(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        input: &[u8],
+        operation: &'static str,
+        buffered: bool,
+    ) -> Result<(), PacketIoError> {
+        if !buffered {
+            return self.write_all(inner, input, operation).await;
+        }
+        // A full-size chunk can go straight to the transport. Drain older
+        // complete packets first, so wire ordering never changes.
+        if input.len() >= self.stream_buffer_size.get() {
+            self.drain_forward_pending(inner).await?;
+            return self.write_all_direct(inner, input, operation).await;
+        }
+        if input.len() > self.stream_buffer_size.get() - self.forward_pending.len() {
+            self.drain_forward_pending(inner).await?;
+        }
+        if self.forward_pending.capacity() == 0 {
+            // Reserve the configured cap once. Repeated incremental growth
+            // would otherwise give this per-connection queue excess capacity.
+            self.forward_pending
+                .reserve_exact(self.stream_buffer_size.get());
+        }
+        self.forward_pending.extend_from_slice(input);
+        Ok(())
+    }
+
+    async fn drain_forward_pending(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<(), PacketIoError> {
+        if self.forward_pending.is_empty() {
+            return Ok(());
+        }
+        let mut pending = std::mem::take(&mut self.forward_pending);
+        let result = self
+            .write_all_direct(inner, &pending, "writing buffered response packets")
+            .await;
+        pending.clear();
+        self.forward_pending = pending;
+        result
+    }
+
+    async fn write_all_direct(
         &mut self,
         inner: &mut (impl AsyncWrite + Unpin),
         input: &[u8],
@@ -901,6 +959,7 @@ async fn forward_inner(
     allow_cancel: bool,
     is_cancelled: &mut impl FnMut() -> bool,
     flush_on_complete: bool,
+    buffer_forward: bool,
 ) -> Result<ForwardStatus, PacketIoError> {
     if progress.is_complete() {
         return Err(PacketIoError::ForwardAlreadyComplete);
@@ -921,6 +980,7 @@ async fn forward_inner(
         allow_cancel,
         is_cancelled,
         flush_on_complete,
+        buffer_forward,
         &mut scratch,
     )
     .await;
@@ -938,6 +998,7 @@ async fn forward_inner_with_scratch(
     allow_cancel: bool,
     is_cancelled: &mut impl FnMut() -> bool,
     flush_on_complete: bool,
+    buffer_forward: bool,
     scratch: &mut [u8],
 ) -> Result<ForwardStatus, PacketIoError> {
     loop {
@@ -969,11 +1030,22 @@ async fn forward_inner_with_scratch(
             progress.observe_payload(&scratch[PHYSICAL_PACKET_HEADER_LEN..end])?;
             scratch[..PHYSICAL_PACKET_HEADER_LEN].copy_from_slice(&outbound_header);
             dst_state
-                .write_all(dst_inner, &scratch[..end], "writing physical packet")
+                .write_forward(
+                    dst_inner,
+                    &scratch[..end],
+                    "writing physical packet",
+                    buffer_forward,
+                )
                 .await?;
         } else {
+            let outbound_header = dst_state.next_physical_header(header.payload_length())?;
             dst_state
-                .start_physical_packet(dst_inner, header.payload_length())
+                .write_forward(
+                    dst_inner,
+                    &outbound_header,
+                    "writing physical packet header",
+                    buffer_forward,
+                )
                 .await?;
             let mut remaining = payload_length;
             while remaining > 0 {
@@ -987,7 +1059,12 @@ async fn forward_inner_with_scratch(
                     .await?;
                 progress.observe_payload(&scratch[..chunk_length])?;
                 dst_state
-                    .write_payload(dst_inner, &scratch[..chunk_length])
+                    .write_forward(
+                        dst_inner,
+                        &scratch[..chunk_length],
+                        "writing physical packet payload",
+                        buffer_forward,
+                    )
                     .await?;
                 remaining -= chunk_length;
             }
@@ -1165,6 +1242,7 @@ where
             false,
             &mut || false,
             true,
+            false,
         )
         .await?;
         Ok(progress)
@@ -1200,6 +1278,7 @@ where
             true,
             &mut is_cancelled,
             true,
+            false,
         )
         .await
     }
@@ -1239,6 +1318,7 @@ where
                 &mut progress,
                 false,
                 &mut || false,
+                false,
                 false,
             )
             .await?;
@@ -1298,6 +1378,7 @@ where
                 &mut progress,
                 false,
                 &mut || false,
+                false,
                 false,
             )
             .await?;
@@ -1671,9 +1752,10 @@ where
     /// the once-per-command reset the session owner calls.
     ///
     /// Fails closed if a command is still staged ABOVE the transport — in the
-    /// read prefetch or raw-prefix window — or buffered INSIDE the transport
-    /// layer. A small command a `peek_packet` decoded can sit entirely in the
-    /// packet prefetch while the compression layer's own read buffer is empty,
+    /// read prefetch or raw-prefix window, in pending response output, or
+    /// buffered INSIDE the transport layer. A small command a `peek_packet`
+    /// decoded can sit entirely in the packet prefetch while the compression
+    /// layer's own read buffer is empty,
     /// so both must be clean before the shared sequence is reset; otherwise the
     /// reset would silently rewind the sequence over live command bytes.
     ///
@@ -1682,10 +1764,10 @@ where
     /// Returns a framing error when unread prefetch/raw-prefix bytes remain, or
     /// propagates the transport layer's in-flight rejection.
     pub fn reset_layer_sequence(&mut self) -> io::Result<()> {
-        if self.read.has_buffered_read() {
+        if self.read.has_buffered_read() || !self.write.forward_pending.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "cannot reset the layered sequence with a staged command in the read prefetch",
+                "cannot reset the layered sequence with staged read or response bytes",
             ));
         }
         self.inner.reset_layer_sequence()
@@ -1702,6 +1784,16 @@ where
     /// TLS transport is a no-op. Repeated reads in the same direction return
     /// `None`, so a `peek` followed by a `read` never shifts the sequence twice.
     fn begin_read_direction(&mut self) -> Result<(), PacketIoError> {
+        if !self.write.forward_pending.is_empty() {
+            return Err(PacketIoError::io(
+                IoSide::Source,
+                "beginning a read direction",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot read the next command with buffered response bytes",
+                ),
+            ));
+        }
         if let Some(sequence) = self.inner.begin_read().map_err(|error| {
             PacketIoError::io(IoSide::Source, "beginning a read direction", error)
         })? {
@@ -1870,8 +1962,52 @@ where
             false,
             &mut || false,
             true,
+            false,
         )
         .await?;
+        Ok(progress)
+    }
+
+    /// Streams one logical response packet into a bounded destination buffer.
+    ///
+    /// The caller must flush the destination at the response's protocol or
+    /// configured threshold boundary, before reading the next client command.
+    /// A full buffer drains early. Other packet writes drain any pending
+    /// response bytes first, preserving the order of bytes on the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed source/destination I/O, framing, or accounting error.
+    pub async fn forward_response_packet_buffered<B>(
+        src: &mut Self,
+        dst: &mut PacketIo<B>,
+        capture_limit: usize,
+    ) -> Result<ForwardProgress, PacketIoError>
+    where
+        B: AsyncWrite + Unpin + DirectionSync,
+    {
+        src.begin_read_direction()?;
+        dst.begin_write_direction()?;
+        let mut progress = ForwardProgress::new(capture_limit);
+        let forwarded = forward_inner(
+            &mut src.read,
+            &mut src.inner,
+            &mut dst.write,
+            &mut dst.inner,
+            &mut progress,
+            false,
+            &mut || false,
+            false,
+            true,
+        )
+        .await;
+        if forwarded.is_err() {
+            // Preserve delivery of preceding complete packets on a later
+            // source-read error. The session will close on this error, so do
+            // not replace the original cause if this best-effort flush fails.
+            let _ = dst.write.flush(&mut dst.inner).await;
+        }
+        forwarded?;
         Ok(progress)
     }
 
@@ -1905,6 +2041,7 @@ where
             true,
             &mut is_cancelled,
             true,
+            false,
         )
         .await
     }
@@ -1948,6 +2085,7 @@ where
                 &mut progress,
                 false,
                 &mut || false,
+                false,
                 false,
             )
             .await?;
@@ -2202,6 +2340,18 @@ mod tests {
             Poll::Ready(Ok(()))
         }
     }
+
+    impl AsyncRead for CountingWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl DirectionSync for CountingWriter {}
 
     #[derive(Debug)]
     struct FailingReader;
@@ -2622,6 +2772,80 @@ mod tests {
         assert_eq!(writer.get_ref().maximum_write, 32);
         assert_eq!(writer.out_packets(), 2);
         assert_eq!(writer.out_bytes(), 53);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_response_forwards_two_packets_in_one_write_at_explicit_flush()
+    -> Result<(), Box<dyn Error>> {
+        let mut wire = encoded_physical_packet(b"one", 0)?;
+        encode_physical_packet(b"two", 1, &mut wire)?;
+        let mut src = PacketIo::new(Cursor::new(wire));
+        let mut dst = PacketIo::new(CountingWriter::default());
+
+        PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await?;
+        PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await?;
+        assert_eq!(dst.get_ref().writes, 0);
+        assert_eq!(dst.out_bytes(), 0);
+        assert_eq!(dst.out_packets(), 2);
+
+        // A response must never remain staged when the next client command is
+        // read. The explicit protocol-boundary flush makes the transition safe.
+        assert!(matches!(
+            dst.peek_packet().await,
+            Err(PacketIoError::Io { .. })
+        ));
+        dst.flush().await?;
+        assert_eq!(dst.get_ref().writes, 1);
+        assert_eq!(dst.get_ref().bytes, 14);
+        assert_eq!(dst.out_bytes(), 14);
+        assert_eq!(dst.get_ref().flushes, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_response_drains_prior_complete_packet_on_source_error()
+    -> Result<(), Box<dyn Error>> {
+        let mut wire = encoded_physical_packet(b"one", 0)?;
+        // A complete second header followed by an incomplete payload.
+        wire.extend_from_slice(&[5, 0, 0, 1]);
+        let mut src = PacketIo::new(Cursor::new(wire));
+        let mut dst = PacketIo::new(CountingWriter::default());
+
+        PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await?;
+        assert!(matches!(
+            PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await,
+            Err(PacketIoError::Io {
+                side: IoSide::Source,
+                ..
+            })
+        ));
+        assert_eq!(dst.get_ref().writes, 1);
+        assert_eq!(dst.get_ref().bytes, 7);
+        assert_eq!(dst.out_bytes(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_response_drains_at_capacity_without_waiting_for_terminal()
+    -> Result<(), Box<dyn Error>> {
+        let mut wire = encoded_physical_packet(b"one", 0)?;
+        encode_physical_packet(b"two", 1, &mut wire)?;
+        encode_physical_packet(b"tri", 2, &mut wire)?;
+        let mut src = PacketIo::new(Cursor::new(wire));
+        let size = NonZeroUsize::new(16).ok_or(io::Error::other("nonzero buffer size"))?;
+        let mut dst = PacketIo::with_stream_buffer_size(CountingWriter::default(), size);
+
+        for _ in 0..3 {
+            PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await?;
+        }
+        assert_eq!(dst.get_ref().writes, 1);
+        assert_eq!(dst.get_ref().bytes, 14);
+        assert_eq!(dst.out_bytes(), 14);
+        dst.flush().await?;
+        assert_eq!(dst.get_ref().writes, 2);
+        assert_eq!(dst.get_ref().bytes, 21);
+        assert!(dst.get_ref().maximum_write <= 16);
         Ok(())
     }
 
