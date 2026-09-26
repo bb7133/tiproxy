@@ -28,6 +28,7 @@ variant=plain
 # Bridge-free acceptance (tasks #140/#141): tiup starts no Go tiproxy and
 # Rust owns the SQL listeners with no Go control peer.
 standalone=${DATAPLANE_STANDALONE:-0}
+standalone_restart=${DATAPLANE_STANDALONE_RESTART:-0}
 artifact_root=${DATAPLANE_ARTIFACT_ROOT:-$script_dir/artifacts}
 port_offset=${DATAPLANE_PORT_OFFSET:-$((10000 + ($$ % 20) * 100))}
 
@@ -79,6 +80,14 @@ if [[ $standalone == 1 ]]; then
 			exit 2
 		fi
 	done
+fi
+if [[ $standalone_restart != 0 && $standalone_restart != 1 ]]; then
+	echo "DATAPLANE_STANDALONE_RESTART must be 0 or 1" >&2
+	exit 2
+fi
+if [[ $standalone_restart == 1 && ($standalone != 1 || $mode != rust || $variant != plain) ]]; then
+	echo "DATAPLANE_STANDALONE_RESTART=1 requires standalone Rust plain" >&2
+	exit 2
 fi
 if [[ $variant == all ]]; then
 	# The FULL range is validated up front: six variants at stride 200
