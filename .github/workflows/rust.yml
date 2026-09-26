@@ -20,6 +20,8 @@ on:
       - "go.mod"
       - "pkg/controlbridge/**"
       - "pkg/balance/**"
+      - "pkg/proxy/net/command.go"
+      - "pkg/sqlreplay/cmd/**"
       - "lib/config/**"
       - "lib/go.mod"
       - "lib/go.sum"
@@ -29,6 +31,7 @@ on:
       - "rust/**"
       - "scripts/generate-control-proto.sh"
       - "tests/controlplane/**"
+      - "tests/dataplane/capture-format/**"
   push:
     branches:
       - main
@@ -41,6 +44,8 @@ on:
       - "go.mod"
       - "pkg/controlbridge/**"
       - "pkg/balance/**"
+      - "pkg/proxy/net/command.go"
+      - "pkg/sqlreplay/cmd/**"
       - "lib/config/**"
       - "lib/go.mod"
       - "lib/go.sum"
@@ -50,6 +55,7 @@ on:
       - "rust/**"
       - "scripts/generate-control-proto.sh"
       - "tests/controlplane/**"
+      - "tests/dataplane/capture-format/**"
   # The control-plane evidence jobs below do not run on pull requests. They
   # re-prove live etcd / Go-oracle behaviour that a pull request rarely
   # changes, and re-running them on every push to a branch was the bulk of
@@ -119,6 +125,8 @@ jobs:
         run: make control-proto-generate-check
       - name: Run Go control bridge tests
         run: go test -race ./pkg/controlbridge/...
+      - name: Verify Go native capture format golden
+        run: go run ./tests/dataplane/capture-format | cmp - tests/dataplane/capture-format/native-v1.log
       - name: Check formatting and Clippy
         run: make rust-lint
       - name: Run unit tests
