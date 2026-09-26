@@ -243,6 +243,11 @@ const WIRE03_EXACT_MULTIPLE_QUERY: &[u8] = b"\x03SELECT wire03_exact_multiple_re
 const WIRE03_LOCAL_INFILE_QUERY: &[u8] = b"\x03LOAD DATA LOCAL INFILE 'wire03.csv'";
 /// RSP-004: one command, two result sets (see `respond_to_multi_result`).
 const MULTI_RESULT_QUERY: &[u8] = b"\x03SELECT 0; SELECT 1";
+/// opt#5: a result set whose rows stream continuously with NO terminator, until
+/// the client disconnects. Exercises the continuation-packet FSM bypass under a
+/// genuinely continuous response so a mid-stream forced close can be verified
+/// to still take effect (see `respond_to_stream_rows`).
+const STREAM_ROWS_QUERY: &[u8] = b"\x03SELECT stream_rows_until_close";
 const WIRE03_LARGE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize + 257;
 const WIRE03_EXACT_MULTIPLE_RESPONSE_LEN: usize = MAX_PAYLOAD_LEN as usize;
 
@@ -579,6 +584,41 @@ where
         }
     }
     true
+}
+
+/// opt#5: streams a single result set's rows forever with NO terminator, until
+/// the client (through the proxy) disconnects and the write fails. This is a
+/// continuous, unterminated `Continue`-packet response: the column-count and
+/// column-definition open the set, then row packets stream until close drives
+/// the end (bounded memory — one small packet at a time). Yields periodically
+/// so, on a single-threaded runtime shared with the proxy tasks, the forwarding
+/// and control tasks still get scheduled. Never writes a result-set terminator,
+/// so any clean completion the client observes would be a bug.
+async fn respond_to_stream_rows<R, W>(
+    reader: &PacketReader<R>,
+    writer: &mut PacketWriter<W>,
+    capabilities: CapabilityFlags,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let _ = capabilities;
+    writer.reset_sequence(reader.expected_sequence());
+    for opener in [vec![0x01], result_column(b"c")] {
+        if writer.write_logical(&opener, true).await.is_err() {
+            return;
+        }
+    }
+    let mut written: u64 = 0;
+    loop {
+        // One-byte length-encoded text row, same shape as respond_to_multi_result.
+        if writer.write_logical(&[0x01, b'r'], true).await.is_err() {
+            return;
+        }
+        written += 1;
+        if written % 32 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 /// Emits a `COM_STMT_EXECUTE` response. The execute flags byte (payload[5])
@@ -1072,6 +1112,12 @@ where
                 break;
             }
             continue;
+        }
+        if packet.payload == STREAM_ROWS_QUERY {
+            // Streams until the proxy tears the backend down (write fails); the
+            // connection is finished once it returns.
+            respond_to_stream_rows(&reader, &mut writer, broad).await;
+            break;
         }
         if packet.payload == b"\x03SHOW SESSION_STATES" {
             if !respond_to_snapshot_query(&reader, &mut writer, snapshot_reply, broad).await {
@@ -5305,6 +5351,109 @@ async fn drain_waits_for_open_transaction_commit() {
     )
     .await;
     assert!(closed.is_some(), "the drain closes at the COMMIT boundary");
+    stack.dispatch_task.abort();
+}
+
+/// opt#5: a forced close during a continuous, unterminated `Continue`-packet
+/// response (forwarded via the FSM-bypass path) still takes effect within the
+/// force-drain deadline, and the session cleans up — on a SINGLE-THREADED
+/// runtime, where the bypass loop, the FSM/SessionLoop control producer, and
+/// the drain timer all share one thread. The client reads on a separate OS
+/// thread so it never stops draining the proxy (no downstream backpressure),
+/// and triggers the drain only after it has observed a batch of streamed rows
+/// (a deterministic "bypass path is active" barrier — no sleep guessing). The
+/// assertion is bounded-close within the deadline plus a generous cleanup
+/// budget, not a sub-millisecond or "earlier than N rows" threshold; removing
+/// the periodic yield is only a local diagnostic (Tokio's own cooperative
+/// yielding can also break the tight loop), so it is not asserted here.
+#[tokio::test(flavor = "current_thread")]
+async fn continue_bypass_forced_close_bounded_on_continuous_stream() {
+    let stack = spawn_stack().await;
+    // Provide the routing answer so the proxy can attach the fake backend
+    // (connection_id 1, request_id 2), matching the other connection tests.
+    spawn_route_answer(&stack, 1, 2);
+    let port = stack.sql_port;
+
+    // Unbounded so the client's sync `send` never blocks its runtime thread
+    // (which would stop it reading and create the backpressure we must avoid).
+    let (barrier_tx, mut barrier_rx) = mpsc::unbounded_channel::<()>();
+    let client = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return 0_u64;
+        };
+        rt.block_on(async move {
+            let Some(mut client) = MysqlClient::connect(port).await else {
+                return 0_u64;
+            };
+            client.writer.reset_sequence(0);
+            if client
+                .writer
+                .write_logical(STREAM_ROWS_QUERY, true)
+                .await
+                .is_err()
+            {
+                return 0;
+            }
+            client.reader.reset_sequence(1);
+            let mut rows: u64 = 0;
+            let mut signaled = false;
+            let mut saw_terminator = false;
+            while let Ok(packet) = client.reader.read_logical(64 * 1024).await {
+                if packet.payload == [0x01, b'r'] {
+                    rows += 1;
+                } else if matches!(packet.payload.first(), Some(&(0x00 | 0xfe))) {
+                    // OK/EOF terminator — the streaming backend must never emit one.
+                    saw_terminator = true;
+                }
+                if rows >= 128 && !signaled {
+                    signaled = true;
+                    let _ = barrier_tx.send(());
+                }
+            }
+            assert!(
+                !saw_terminator,
+                "the continuous response must never complete cleanly"
+            );
+            rows
+        })
+    });
+
+    // Cooperatively wait (letting the proxy runtime forward rows) until the
+    // client has streamed enough rows to prove the bypass path is active.
+    let Some(()) = barrier_rx.recv().await else {
+        unreachable!("client streamed rows before signalling");
+    };
+
+    // Force a drain while the bypassed stream is in flight.
+    stack.drain_tx.send_replace(Some(stack.drain_deadline));
+
+    // The forced close must land within the force deadline plus a generous
+    // cleanup budget.
+    let closed = timeout(
+        stack.drain_deadline + Duration::from_secs(10),
+        wait_sent(
+            &stack.sender,
+            |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Some(_))),
+        "forced close did not complete within the deadline + cleanup budget"
+    );
+
+    // The client thread exits once the proxy closes the connection (its read
+    // fails); joining proves cleanup with no leak and that it saw no terminator.
+    let Ok(rows) = client.join() else {
+        unreachable!("client thread joined");
+    };
+    assert!(
+        rows >= 128,
+        "client should have streamed rows before the close"
+    );
     stack.dispatch_task.abort();
 }
 
