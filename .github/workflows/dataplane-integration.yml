@@ -43,6 +43,11 @@ on:
         required: true
         default: false
         type: boolean
+      standalone_restart:
+        description: Also prove 0-Go Rust SIGKILL recovery and new-client migration (standalone Rust plain only)
+        required: true
+        default: false
+        type: boolean
       t4_qualification:
         description: Record the immutable 48-cell T4 route-owner matrix
         required: true
@@ -68,11 +73,11 @@ concurrency:
 jobs:
   reject-invalid-standalone:
     name: Reject incompatible standalone dispatch
-    if: inputs.standalone && (inputs.mode != 'rust' || inputs.t4_qualification)
+    if: (inputs.standalone && (inputs.mode != 'rust' || inputs.t4_qualification)) || (inputs.standalone_restart && (!inputs.standalone || inputs.mode != 'rust' || inputs.variant != 'plain' || inputs.t4_qualification))
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo 'standalone requires mode=rust and t4_qualification=false' >&2
+          echo 'standalone requires mode=rust and t4_qualification=false; standalone_restart additionally requires standalone Rust plain' >&2
           exit 2
 
   framework:
@@ -94,12 +99,13 @@ jobs:
 
   topology:
     name: Run ${{ inputs.mode }} / ${{ inputs.variant }} topology
-    if: github.event_name == 'workflow_dispatch' && !inputs.t4_qualification && (!inputs.standalone || inputs.mode == 'rust')
+    if: github.event_name == 'workflow_dispatch' && !inputs.t4_qualification && (!inputs.standalone || inputs.mode == 'rust') && (!inputs.standalone_restart || (inputs.standalone && inputs.mode == 'rust' && inputs.variant == 'plain'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       DATAPLANE_ARTIFACT_ROOT: ${{ github.workspace }}/tests/dataplane/integration/artifacts
       DATAPLANE_STANDALONE: ${{ inputs.standalone && '1' || '0' }}
+      DATAPLANE_STANDALONE_RESTART: ${{ inputs.standalone_restart && '1' || '0' }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
