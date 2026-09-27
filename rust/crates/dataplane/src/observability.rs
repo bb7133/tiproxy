@@ -33,7 +33,7 @@
 //! and bounded here and again in the Go consumer. No SQL, password, token, or
 //! authentication payload can enter an observation or a log field.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1484,9 +1484,81 @@ enum PendingMetric {
 struct Aggregator {
     pending: BTreeMap<MetricKey, PendingMetric>,
     overflow_dropped: u64,
+    /// opt#7: per-(backend, command) pre-built metric keys. The per-command
+    /// path used to allocate ~12 label/key values per observation; the keys
+    /// are content-identical, so build each set once and update by reference.
+    command_keys: HashMap<(String, &'static str), Arc<CommandKeys>>,
     /// Cumulative twin of `pending`: every accepted delta is also folded into
     /// the process-local registry that backs the native `/metrics` exposition.
     registry: Arc<MetricsRegistry>,
+}
+
+/// Pre-built keys for one (backend, command) pair. Same names/labels the
+/// per-observation path built inline, so exposition is unchanged.
+#[derive(Debug)]
+struct CommandKeys {
+    query_total: MetricKey,
+    query_duration: MetricKey,
+    since_connection: MetricKey,
+    traffic: [(MetricKey, TrafficField); 4],
+    cross_location_bytes: MetricKey,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrafficField {
+    InboundBytes,
+    InboundPackets,
+    OutboundBytes,
+    OutboundPackets,
+}
+
+impl TrafficField {
+    const fn pick(self, traffic: BackendTraffic) -> u64 {
+        match self {
+            Self::InboundBytes => traffic.inbound_bytes,
+            Self::InboundPackets => traffic.inbound_packets,
+            Self::OutboundBytes => traffic.outbound_bytes,
+            Self::OutboundPackets => traffic.outbound_packets,
+        }
+    }
+}
+
+impl CommandKeys {
+    fn new(backend: &str, cmd_type: &'static str) -> Self {
+        let labels = vec![
+            ("backend", backend.to_owned()),
+            ("cmd_type", cmd_type.to_owned()),
+        ];
+        let traffic_key =
+            |name: &'static str| MetricKey::new(name, vec![("backend", backend.to_owned())]);
+        Self {
+            query_total: MetricKey::new("tiproxy_session_query_total", labels.clone()),
+            query_duration: MetricKey::new("tiproxy_session_query_duration_seconds", labels),
+            since_connection: MetricKey::new(
+                "tiproxy_session_query_time_since_conn_creation_seconds",
+                vec![],
+            ),
+            traffic: [
+                (
+                    traffic_key("tiproxy_traffic_inbound_bytes"),
+                    TrafficField::InboundBytes,
+                ),
+                (
+                    traffic_key("tiproxy_traffic_inbound_packets"),
+                    TrafficField::InboundPackets,
+                ),
+                (
+                    traffic_key("tiproxy_traffic_outbound_bytes"),
+                    TrafficField::OutboundBytes,
+                ),
+                (
+                    traffic_key("tiproxy_traffic_outbound_packets"),
+                    TrafficField::OutboundPackets,
+                ),
+            ],
+            cross_location_bytes: MetricKey::new("tiproxy_traffic_cross_location_bytes", vec![]),
+        }
+    }
 }
 
 impl Default for Aggregator {
@@ -1500,18 +1572,19 @@ impl Aggregator {
         Self {
             pending: BTreeMap::new(),
             overflow_dropped: 0,
+            command_keys: HashMap::new(),
             registry,
         }
     }
 
     fn get_backend(&mut self, duration: Duration, succeeded: bool) {
         self.histogram(
-            MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
+            &MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
             duration.as_secs_f64(),
             &GET_BACKEND_BUCKETS,
         );
         self.counter(
-            MetricKey::new(
+            &MetricKey::new(
                 "tiproxy_backend_get_backend",
                 vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
             ),
@@ -1519,15 +1592,24 @@ impl Aggregator {
         );
     }
 
-    fn counter(&mut self, key: MetricKey, delta: u64) {
+    /// The key is cloned only when the series is first inserted into
+    /// `pending` (i.e. once per export batch), never per observation.
+    fn counter(&mut self, key: &MetricKey, delta: u64) {
         if delta == 0 {
             return;
         }
-        if !self.ensure_series(&key) {
+        if !self.ensure_series(key) {
             return;
         }
-        self.registry.add_counter(&key, delta);
-        match self.pending.entry(key).or_insert(PendingMetric::Counter(0)) {
+        self.registry.add_counter(key, delta);
+        let entry = if let Some(entry) = self.pending.get_mut(key) {
+            entry
+        } else {
+            self.pending
+                .entry(key.clone())
+                .or_insert(PendingMetric::Counter(0))
+        };
+        match entry {
             PendingMetric::Counter(value) => *value = value.saturating_add(delta),
             PendingMetric::Histogram { .. } => {
                 self.overflow_dropped = self.overflow_dropped.saturating_add(1);
@@ -1535,20 +1617,24 @@ impl Aggregator {
         }
     }
 
-    fn histogram(&mut self, key: MetricKey, seconds: f64, buckets: &[f64]) {
-        if !seconds.is_finite() || seconds < 0.0 || !self.ensure_series(&key) {
+    /// Clones the key only on first insert into `pending`.
+    fn histogram(&mut self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
+        if !seconds.is_finite() || seconds < 0.0 || !self.ensure_series(key) {
             self.overflow_dropped = self.overflow_dropped.saturating_add(1);
             return;
         }
-        self.registry.observe_histogram(&key, seconds, buckets);
-        let entry = self
-            .pending
-            .entry(key)
-            .or_insert_with(|| PendingMetric::Histogram {
-                count: 0,
-                sum: 0.0,
-                cumulative_buckets: vec![0; buckets.len()],
-            });
+        self.registry.observe_histogram(key, seconds, buckets);
+        let entry = if let Some(entry) = self.pending.get_mut(key) {
+            entry
+        } else {
+            self.pending
+                .entry(key.clone())
+                .or_insert_with(|| PendingMetric::Histogram {
+                    count: 0,
+                    sum: 0.0,
+                    cumulative_buckets: vec![0; buckets.len()],
+                })
+        };
         let PendingMetric::Histogram {
             count,
             sum,
@@ -1587,7 +1673,7 @@ impl Aggregator {
             // count. These observations remain a notification path only.
             Observation::MigrationIssued { .. } | Observation::MigrationSettled { .. } => {}
             Observation::DialBackendFailed { backend } => self.counter(
-                MetricKey::new(
+                &MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
                     vec![("backend", backend)],
                 ),
@@ -1605,7 +1691,7 @@ impl Aggregator {
                 local,
             } => {
                 self.histogram(
-                    MetricKey::new(
+                    &MetricKey::new(
                         "tiproxy_session_handshake_duration_seconds",
                         vec![("backend", backend.clone())],
                     ),
@@ -1622,28 +1708,29 @@ impl Aggregator {
                 traffic,
                 local,
             } => {
-                let labels = vec![
-                    ("backend", backend.clone()),
-                    ("cmd_type", command.name().to_owned()),
-                ];
-                self.counter(
-                    MetricKey::new("tiproxy_session_query_total", labels.clone()),
-                    1,
+                let keys = Arc::clone(
+                    self.command_keys
+                        .entry((backend, command.name()))
+                        .or_insert_with_key(|(backend, cmd_type)| {
+                            Arc::new(CommandKeys::new(backend, cmd_type))
+                        }),
                 );
+                self.counter(&keys.query_total, 1);
+                self.histogram(&keys.query_duration, duration.as_secs_f64(), &QUERY_BUCKETS);
                 self.histogram(
-                    MetricKey::new("tiproxy_session_query_duration_seconds", labels),
-                    duration.as_secs_f64(),
-                    &QUERY_BUCKETS,
-                );
-                self.histogram(
-                    MetricKey::new(
-                        "tiproxy_session_query_time_since_conn_creation_seconds",
-                        vec![],
-                    ),
+                    &keys.since_connection,
                     since_connection.as_secs_f64(),
                     &QUERY_AGE_BUCKETS,
                 );
-                self.traffic(&backend, traffic, local);
+                for (key, field) in &keys.traffic {
+                    self.counter(key, field.pick(traffic));
+                }
+                if !local {
+                    self.counter(
+                        &keys.cross_location_bytes,
+                        traffic.inbound_bytes.saturating_add(traffic.outbound_bytes),
+                    );
+                }
             }
             Observation::SessionClosed {
                 source,
@@ -1651,14 +1738,14 @@ impl Aggregator {
                 traffic: _,
             } => {
                 self.counter(
-                    MetricKey::new(
+                    &MetricKey::new(
                         "tiproxy_server_disconnection_total",
                         vec![("type", source.metric_label().to_owned())],
                     ),
                     1,
                 );
                 self.histogram(
-                    MetricKey::new("tiproxy_session_conn_lifetime_seconds", vec![]),
+                    &MetricKey::new("tiproxy_session_conn_lifetime_seconds", vec![]),
                     lifetime.as_secs_f64(),
                     &CONN_LIFETIME_BUCKETS,
                 );
@@ -1668,7 +1755,7 @@ impl Aggregator {
 
     fn backend_keepalive_updated(&mut self, backend: String, healthy: bool, succeeded: bool) {
         self.counter(
-            MetricKey::new(
+            &MetricKey::new(
                 "tiproxy_backend_keepalive_update_total",
                 vec![
                     ("backend", backend),
@@ -1694,13 +1781,13 @@ impl Aggregator {
             ("tiproxy_traffic_outbound_packets", traffic.outbound_packets),
         ] {
             self.counter(
-                MetricKey::new(name, vec![("backend", backend.to_owned())]),
+                &MetricKey::new(name, vec![("backend", backend.to_owned())]),
                 delta,
             );
         }
         if !local {
             self.counter(
-                MetricKey::new("tiproxy_traffic_cross_location_bytes", vec![]),
+                &MetricKey::new("tiproxy_traffic_cross_location_bytes", vec![]),
                 traffic.inbound_bytes.saturating_add(traffic.outbound_bytes),
             );
         }
@@ -1803,7 +1890,7 @@ impl ExportTotals {
 
     fn accumulate_delta(self, previous: Self, aggregator: &mut Aggregator) {
         aggregator.counter(
-            MetricKey::new("tiproxy_server_create_connection_total", vec![]),
+            &MetricKey::new("tiproxy_server_create_connection_total", vec![]),
             self.registered.saturating_sub(previous.registered),
         );
         for (label, current, old) in [
@@ -1811,7 +1898,7 @@ impl ExportTotals {
             ("max_connections", self.rejected_max, previous.rejected_max),
         ] {
             aggregator.counter(
-                MetricKey::new(
+                &MetricKey::new(
                     "tiproxy_server_reject_connection_total",
                     vec![("type", label.to_owned())],
                 ),
@@ -1886,12 +1973,12 @@ impl ExportTotals {
             ),
         ] {
             aggregator.counter(
-                MetricKey::new("tiproxy_server_err", vec![("type", label.to_owned())]),
+                &MetricKey::new("tiproxy_server_err", vec![("type", label.to_owned())]),
                 current.saturating_sub(old),
             );
         }
         aggregator.counter(
-            MetricKey::new(
+            &MetricKey::new(
                 "tiproxy_server_event",
                 vec![("type", "rust_control_reconnect".to_owned())],
             ),
@@ -2302,7 +2389,7 @@ mod tests {
         let mut aggregator = Aggregator::default();
         for index in 0..=MAX_PENDING_SERIES {
             aggregator.counter(
-                MetricKey::new(
+                &MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
                     vec![("backend", format!("backend-{index}"))],
                 ),
