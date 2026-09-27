@@ -365,7 +365,7 @@ fn serve_over_read(over_read: &mut OverReadBuffer, buf: &mut [u8]) -> usize {
 /// All physical/logical read logic lives here as methods that borrow the
 /// transport for the duration of a call, so the same state drives both the
 /// read-only [`PacketReader`] and the duplex [`PacketIo`]. The state owns only
-/// the fixed prefetch window and a lazily allocated forwarding buffer; memory
+/// the fixed prefetch window and a lazily allocated read/forward scratch; memory
 /// never scales with the logical message length.
 #[derive(Debug)]
 struct ReaderState {
@@ -515,18 +515,37 @@ impl ReaderState {
         inner: &mut (impl AsyncRead + Unpin),
         payload_limit: usize,
     ) -> Result<LogicalPacket, PacketIoError> {
+        // Materialized commands share the same bounded scratch as forwarding.
+        // Restore it on errors too (including a fully drained oversized packet).
+        let mut scratch = std::mem::take(&mut self.forward_scratch);
+        let result = self
+            .read_logical_with_scratch(inner, payload_limit, &mut scratch)
+            .await;
+        self.forward_scratch = scratch;
+        result
+    }
+
+    async fn read_logical_with_scratch(
+        &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
+        payload_limit: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<LogicalPacket, PacketIoError> {
         let mut progress = ForwardProgress::new(payload_limit);
-        let mut scratch = vec![0_u8; self.stream_buffer_size.get()];
         loop {
             let (header, sequence) = self.read_header(inner).await?;
             progress.observe_header(header, sequence)?;
-            self.read_payload_into_progress(
-                inner,
-                header.payload_length(),
-                &mut scratch,
-                &mut progress,
-            )
-            .await?;
+            // Small commands need only their payload size; retain at most the
+            // streaming cap even when a logical packet spans multiple frames.
+            let needed = usize::try_from(header.payload_length())
+                .unwrap_or(usize::MAX)
+                .min(self.stream_buffer_size.get());
+            if scratch.len() < needed {
+                scratch.reserve_exact(needed - scratch.len());
+                scratch.resize(needed, 0);
+            }
+            self.read_payload_into_progress(inner, header.payload_length(), scratch, &mut progress)
+                .await?;
             self.finish_physical_packet()?;
             progress.finish_physical_packet(header.payload_length())?;
             if progress.is_complete() {
@@ -983,6 +1002,12 @@ async fn forward_inner(
     // returned. Every byte written is read_exact first, so old payload bytes
     // are never exposed on the next packet.
     let mut scratch = std::mem::take(&mut src_state.forward_scratch);
+    scratch.reserve_exact(
+        src_state
+            .stream_buffer_size
+            .get()
+            .saturating_sub(scratch.len()),
+    );
     scratch.resize(src_state.stream_buffer_size.get(), 0);
     let result = forward_inner_with_scratch(
         src_state,
@@ -2476,6 +2501,7 @@ mod tests {
         assert_eq!(reader.in_bytes(), 0);
         let empty = reader.read_logical(0).await?;
         assert!(empty.payload.is_empty());
+        assert!(reader.state.forward_scratch.is_empty());
         let error = reader
             .read_logical(2)
             .await
@@ -2488,9 +2514,41 @@ mod tests {
                 observed: 3
             }
         ));
+        let scratch = reader.state.forward_scratch.as_ptr();
+        assert_eq!(reader.state.forward_scratch.len(), 3);
         let final_packet = reader.read_logical(1).await?;
         assert_eq!(final_packet.payload, b"z");
+        assert_eq!(final_packet.progress.captured_prefix(), b"z");
+        assert_eq!(reader.state.forward_scratch.as_ptr(), scratch);
         assert_eq!(reader.in_packets(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialized_read_and_forward_share_bounded_scratch() -> Result<(), Box<dyn Error>> {
+        let mut wire = encoded_physical_packet(b"small", 0)?;
+        encode_physical_packet(b"larger than scratch capacity", 1, &mut wire)?;
+        encode_physical_packet(b"x", 2, &mut wire)?;
+        let size = NonZeroUsize::new(16).ok_or(io::Error::other("buffer size"))?;
+        let mut src = PacketIo::with_stream_buffer_size(Cursor::new(wire), size);
+        let first = src.read_logical(32).await?;
+        assert_eq!(first.payload, b"small");
+        assert_eq!(src.read.forward_scratch.len(), 5);
+
+        let second = src.read_logical(32).await?;
+        assert_eq!(second.payload, b"larger than scratch capacity");
+        assert_eq!(second.progress.captured_prefix(), second.payload);
+        assert_eq!(src.read.forward_scratch.len(), size.get());
+        assert_eq!(src.read.forward_scratch.capacity(), size.get());
+        let scratch = src.read.forward_scratch.as_ptr();
+        let mut dst = PacketIo::new(Cursor::new(Vec::new()));
+        let forwarded = PacketIo::forward_packet_to(&mut src, &mut dst, 16).await?;
+        assert_eq!(forwarded.captured_prefix(), b"x");
+        assert_eq!(src.read.forward_scratch.as_ptr(), scratch);
+        assert_eq!(src.in_packets(), 3);
+        assert_eq!(src.expected_read_sequence(), 3);
+        let output = dst.into_inner().into_inner();
+        assert_eq!(output, encoded_physical_packet(b"x", 0)?);
         Ok(())
     }
 
