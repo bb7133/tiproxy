@@ -418,6 +418,8 @@ struct ReaderState {
     over_read: OverReadBuffer,
     in_bytes: u64,
     in_packets: u64,
+    /// Physical packets forwarded straight from the over-read window (opt#18).
+    staged_forwards: u64,
 }
 
 /// Bounded read-side over-read buffer, mirroring Go's `bufio.Reader` on the
@@ -480,6 +482,7 @@ impl ReaderState {
                 .unwrap_or(NonZeroUsize::MIN),
             forward_scratch: Vec::new(),
             over_read: OverReadBuffer::disabled(),
+            staged_forwards: 0,
             in_bytes: 0,
             in_packets: 0,
         }
@@ -1091,6 +1094,99 @@ async fn forward_inner(
     result
 }
 
+/// Outcome of forwarding one packet straight from the over-read window.
+enum StagedForward {
+    /// The packet was forwarded and the logical packet continues.
+    Forwarded,
+    /// The packet was forwarded and completed the logical packet.
+    Complete,
+}
+
+/// opt#18: forwards one physical packet directly from the source's over-read
+/// window into the buffered destination, when the whole packet is already
+/// staged there and nothing older (prefetch window, raw prefix) is staged
+/// ahead of it. Decodes the header in place, regenerates the outbound header
+/// under the destination's sequence, appends header and payload to the
+/// pending queue, and advances the window, counters, capture and completion
+/// exactly as the read-through path does. Returns `None` (nothing consumed)
+/// when the fast path does not apply: window empty or partial, prefetch or
+/// raw-prefix bytes pending, over-read disabled, or a packet too large for the
+/// bounded queue — those keep the existing per-packet read path.
+async fn forward_staged_packet(
+    src_state: &mut ReaderState,
+    dst_state: &mut WriterState,
+    dst_inner: &mut (impl AsyncWrite + Unpin),
+    progress: &mut ForwardProgress,
+    scratch_len: usize,
+    flush_on_complete: bool,
+) -> Result<Option<StagedForward>, PacketIoError> {
+    if src_state.prefetched_len() != 0
+        || !src_state.raw_prefix_slice().is_empty()
+        || !src_state.over_read.enabled
+    {
+        return Ok(None);
+    }
+    let start = src_state.over_read.start;
+    let staged = src_state.over_read.end - start;
+    if staged < PHYSICAL_PACKET_HEADER_LEN {
+        return Ok(None);
+    }
+    let header =
+        PacketHeader::decode(&src_state.over_read.buf[start..start + PHYSICAL_PACKET_HEADER_LEN])?;
+    let payload_length =
+        usize::try_from(header.payload_length()).map_err(|_| PacketIoError::CounterOverflow {
+            field: "physical payload length",
+        })?;
+    let wire_length = PHYSICAL_PACKET_HEADER_LEN + payload_length;
+    if payload_length == 0
+        || payload_length > scratch_len.saturating_sub(PHYSICAL_PACKET_HEADER_LEN)
+        || staged < wire_length
+    {
+        return Ok(None);
+    }
+    let sequence = src_state.sequence.observe(header.sequence_id());
+    progress.observe_header(header, sequence)?;
+    // Consume the packet from the source first — the same order as the
+    // read-through path, where `read_exact` accounts the bytes before the
+    // destination write — so a failed write leaves the source state identical
+    // in both paths. The bytes stay in the window's backing buffer until the
+    // next fill, which cannot happen while this call holds the reader.
+    src_state.over_read.start += wire_length;
+    if src_state.over_read.start >= src_state.over_read.end {
+        src_state.over_read.start = 0;
+        src_state.over_read.end = 0;
+    }
+    src_state.add_in_bytes(wire_length)?;
+    src_state.staged_forwards = src_state.staged_forwards.saturating_add(1);
+    let outbound_header = dst_state.next_physical_header(header.payload_length())?;
+    {
+        let payload =
+            &src_state.over_read.buf[start + PHYSICAL_PACKET_HEADER_LEN..start + wire_length];
+        progress.observe_payload(payload)?;
+        dst_state
+            .write_forward(
+                dst_inner,
+                &outbound_header,
+                "writing physical packet header",
+                true,
+            )
+            .await?;
+        dst_state
+            .write_forward(dst_inner, payload, "writing physical packet payload", true)
+            .await?;
+    }
+    src_state.finish_physical_packet()?;
+    dst_state.finish_physical_packet()?;
+    progress.finish_physical_packet(header.payload_length())?;
+    if progress.is_complete() {
+        if flush_on_complete {
+            dst_state.flush(dst_inner).await?;
+        }
+        return Ok(Some(StagedForward::Complete));
+    }
+    Ok(Some(StagedForward::Forwarded))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_inner_with_scratch(
     src_state: &mut ReaderState,
@@ -1107,6 +1203,25 @@ async fn forward_inner_with_scratch(
     loop {
         if allow_cancel && is_cancelled() {
             return Ok(ForwardStatus::CancelledAtPacketBoundary);
+        }
+        // opt#18: a whole small physical packet already staged in the source's
+        // over-read window is forwarded straight from the window (no header
+        // read through the prefetch path, no copy through `scratch`).
+        if buffer_forward
+            && let Some(status) = forward_staged_packet(
+                src_state,
+                dst_state,
+                dst_inner,
+                progress,
+                scratch.len(),
+                flush_on_complete,
+            )
+            .await?
+        {
+            match status {
+                StagedForward::Complete => return Ok(ForwardStatus::Complete),
+                StagedForward::Forwarded => continue,
+            }
         }
         let (header, sequence) = src_state.read_header(src_inner).await?;
         progress.observe_header(header, sequence)?;
@@ -1756,6 +1871,13 @@ impl<T> PacketIo<T> {
     #[must_use]
     pub const fn in_packets(&self) -> u64 {
         self.read.in_packets
+    }
+
+    /// Physical packets this endpoint forwarded straight from its over-read
+    /// window instead of reading them through (opt#18 fast path).
+    #[must_use]
+    pub const fn staged_forwards(&self) -> u64 {
+        self.read.staged_forwards
     }
 
     /// Returns the next outgoing physical sequence.
@@ -3663,6 +3785,153 @@ mod tests {
         assert!(!io.has_deferred_write());
         assert_eq!(io.get_ref().writes, 2);
         assert_eq!(io.get_ref().bytes, (4 + 5) * 2 + (4 + 9));
+        Ok(())
+    }
+
+    /// Serves one chunk per `poll_read`, so a test controls exactly which
+    /// bytes are in the over-read window when a packet is forwarded.
+    #[derive(Debug)]
+    struct ChunkedSource {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl AsyncRead for ChunkedSource {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(chunk) = this.chunks.front_mut() {
+                let take = chunk.len().min(output.remaining());
+                output.put_slice(&chunk[..take]);
+                chunk.drain(..take);
+                if chunk.is_empty() {
+                    this.chunks.pop_front();
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl DirectionSync for ChunkedSource {
+        fn is_layered(&self) -> bool {
+            false
+        }
+    }
+
+    /// opt#18: with the over-read window holding several whole packets, the
+    /// buffered forward serves them from the window — bytes, regenerated
+    /// sequences, accounting and per-logical-packet completion identical to
+    /// the read-through path — and a trailing partial packet falls back to
+    /// the read path without loss.
+    #[tokio::test]
+    async fn staged_packets_forward_from_the_window_identically() -> Result<(), Box<dyn Error>> {
+        // Three small logical packets, then one whose payload arrives in two reads.
+        let mut wire = Vec::new();
+        for (seq, payload) in [
+            (1_u8, b"row-a".as_slice()),
+            (2, b"row-bb".as_slice()),
+            (3, b"row-ccc".as_slice()),
+        ] {
+            wire.extend_from_slice(&encoded_physical_packet(payload, seq)?);
+        }
+        let last = encoded_physical_packet(b"row-dddd", 4)?;
+        let split = last.len() - 3;
+        wire.extend_from_slice(&last[..split]);
+        let tail = last[split..].to_vec();
+        let run = |window: bool, first: Vec<u8>, second: Vec<u8>| async move {
+            let mut src = PacketIo::new(ChunkedSource {
+                chunks: [first, second].into_iter().collect(),
+            });
+            if window {
+                src.enable_read_buffering();
+            }
+            let mut dst = PacketIo::new(CountingWriter::default());
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                let progress =
+                    PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 8).await?;
+                out.push((
+                    progress.logical_payload_bytes(),
+                    progress.physical_packets(),
+                    progress.captured_prefix().to_vec(),
+                    src.in_bytes(),
+                    src.in_packets(),
+                    dst.out_packets(),
+                ));
+            }
+            dst.flush().await?;
+            Ok::<_, PacketIoError>((out, dst.get_ref().bytes, src.staged_forwards()))
+        };
+        let (through, through_bytes, through_staged) =
+            run(false, wire.clone(), tail.clone()).await?;
+        let (staged, staged_bytes, staged_count) = run(true, wire, tail).await?;
+        assert_eq!(staged, through, "per-packet progress and accounting match");
+        assert_eq!(
+            staged_bytes, through_bytes,
+            "same bytes reach the destination"
+        );
+        assert_eq!(through[3].0, 8, "the split packet is forwarded whole");
+        assert_eq!(
+            through_staged, 0,
+            "the read-through path never uses the window"
+        );
+        // Packet 1 fills the window through the read path; 2 and 3 are whole in
+        // the window; the split packet 4 falls back to the read path.
+        assert_eq!(staged_count, 2, "whole staged packets take the fast path");
+        Ok(())
+    }
+
+    /// opt#18: when the destination fails mid-run, both paths leave the source
+    /// in the same state — bytes already consumed and accounted for the packet
+    /// being written, its physical-packet count not yet advanced — so a later
+    /// teardown sees identical accounting whichever path forwarded.
+    #[tokio::test]
+    async fn staged_forward_write_failure_leaves_source_like_the_read_path()
+    -> Result<(), Box<dyn Error>> {
+        // Enough small packets to overflow the pending queue, which is where a
+        // failing destination first surfaces.
+        let mut wire = Vec::new();
+        for i in 0..400_u32 {
+            wire.extend_from_slice(&encoded_physical_packet(
+                &[b'r'; 100],
+                u8::try_from(i % 256)?,
+            )?);
+        }
+        let run = |window: bool, wire: Vec<u8>| async move {
+            let mut src = PacketIo::new(ChunkedSource {
+                chunks: [wire].into_iter().collect(),
+            });
+            if window {
+                src.enable_read_buffering();
+            }
+            let mut dst = PacketIo::new(CountingWriter::failing());
+            let mut forwarded = 0_u32;
+            let failed = loop {
+                match PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 8).await {
+                    Ok(_) => forwarded += 1,
+                    Err(error) => break error.to_string(),
+                }
+                if forwarded == 400 {
+                    break String::from("no failure");
+                }
+            };
+            (
+                forwarded,
+                failed,
+                src.in_bytes(),
+                src.in_packets(),
+                dst.out_packets(),
+            )
+        };
+        let through = run(false, wire.clone()).await;
+        let staged = run(true, wire).await;
+        assert_ne!(through.1, "no failure", "the failing destination surfaces");
+        assert_eq!(
+            staged, through,
+            "failure point and source/destination accounting match"
+        );
         Ok(())
     }
 }
