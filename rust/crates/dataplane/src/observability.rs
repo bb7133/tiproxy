@@ -86,6 +86,11 @@ const fn exponential_buckets<const N: usize>(start: f64, factor: f64) -> [f64; N
 /// consumer's `maxRustMetricSeries`. Beyond it new series are shed and counted.
 const MAX_REGISTRY_SERIES: usize = 4_096;
 
+/// Upper bound on cached per-(backend, command) key sets in the aggregator.
+/// Each entry is eight small keys; the bound only limits memory, never which
+/// observations are accepted.
+const MAX_COMMAND_KEY_CACHE: usize = 1_024;
+
 /// Prometheus metric kind of one catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
@@ -1488,7 +1493,7 @@ impl MetricKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum PendingMetric {
     Counter(u64),
     Histogram {
@@ -1504,7 +1509,12 @@ struct Aggregator {
     /// opt#7: per-(backend, command) pre-built metric keys. The per-command
     /// path used to allocate ~12 label/key values per observation; the keys
     /// are content-identical, so build each set once and update by reference.
+    ///
+    /// Bounded by `command_key_capacity`: once full, an unseen combination
+    /// builds its keys for that observation only and is not cached, so the
+    /// cache cannot grow with backend churn while the series bounds shed.
     command_keys: HashMap<(String, &'static str), Arc<CommandKeys>>,
+    command_key_capacity: usize,
     /// Cumulative twin of `pending`: every accepted delta is also folded into
     /// the process-local registry that backs the native `/metrics` exposition.
     registry: Arc<MetricsRegistry>,
@@ -1590,8 +1600,28 @@ impl Aggregator {
             pending: BTreeMap::new(),
             overflow_dropped: 0,
             command_keys: HashMap::new(),
+            command_key_capacity: MAX_COMMAND_KEY_CACHE,
             registry,
         }
+    }
+
+    /// Cached keys for one `(backend, command)` pair; past the cache bound an
+    /// unseen pair gets throwaway keys so the accept/shed rules below still
+    /// see every observation.
+    fn command_keys_for(&mut self, backend: String, cmd_type: &'static str) -> Arc<CommandKeys> {
+        if self.command_keys.len() < self.command_key_capacity {
+            return Arc::clone(
+                self.command_keys
+                    .entry((backend, cmd_type))
+                    .or_insert_with_key(|(backend, cmd_type)| {
+                        Arc::new(CommandKeys::new(backend, cmd_type))
+                    }),
+            );
+        }
+        let probe = (backend, cmd_type);
+        self.command_keys
+            .get(&probe)
+            .map_or_else(|| Arc::new(CommandKeys::new(&probe.0, probe.1)), Arc::clone)
     }
 
     fn get_backend(&mut self, registry: &mut RegistryState, duration: Duration, succeeded: bool) {
@@ -1757,13 +1787,7 @@ impl Aggregator {
                 traffic,
                 local,
             } => {
-                let keys = Arc::clone(
-                    self.command_keys
-                        .entry((backend, command.name()))
-                        .or_insert_with_key(|(backend, cmd_type)| {
-                            Arc::new(CommandKeys::new(backend, cmd_type))
-                        }),
-                );
+                let keys = self.command_keys_for(backend, command.name());
                 self.counter(registry, &keys.query_total, 1);
                 self.histogram(
                     registry,
@@ -3320,5 +3344,57 @@ mod tests {
             recorded,
             "the recorded delta batches no longer match the observation script"
         );
+    }
+
+    #[test]
+    fn command_key_cache_is_bounded_and_uncached_pairs_still_fold() {
+        let mut aggregator = Aggregator {
+            command_key_capacity: 2,
+            ..Aggregator::default()
+        };
+        let observe = |aggregator: &mut Aggregator, backend: &str| {
+            aggregator.observe(Observation::CommandCompleted {
+                backend: backend.to_owned(),
+                command: Command::Query,
+                duration: Duration::from_millis(1),
+                since_connection: Duration::from_secs(1),
+                traffic: BackendTraffic {
+                    inbound_bytes: 10,
+                    inbound_packets: 1,
+                    outbound_bytes: 5,
+                    outbound_packets: 1,
+                },
+                local: true,
+            });
+        };
+        observe(&mut aggregator, "backend-a");
+        observe(&mut aggregator, "backend-b");
+        observe(&mut aggregator, "backend-c");
+        assert_eq!(aggregator.command_keys.len(), 2);
+        let query_total = |backend: &str| {
+            MetricKey::new(
+                "tiproxy_session_query_total",
+                vec![
+                    ("backend", backend.to_owned()),
+                    ("cmd_type", Command::Query.name().to_owned()),
+                ],
+            )
+        };
+        assert_eq!(
+            aggregator.pending.get(&query_total("backend-c")),
+            Some(&PendingMetric::Counter(1))
+        );
+
+        aggregator.clear_sent();
+        observe(&mut aggregator, "backend-c");
+        observe(&mut aggregator, "backend-a");
+        assert_eq!(aggregator.command_keys.len(), 2);
+        assert_eq!(
+            aggregator.pending.get(&query_total("backend-c")),
+            Some(&PendingMetric::Counter(1))
+        );
+        let state = aggregator.registry.lock();
+        assert_eq!(state.counters.get(&query_total("backend-c")), Some(&2));
+        assert_eq!(state.counters.get(&query_total("backend-a")), Some(&2));
     }
 }
