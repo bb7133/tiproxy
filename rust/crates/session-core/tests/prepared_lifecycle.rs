@@ -250,6 +250,42 @@ fn reset_close_and_clear_all_have_exact_scope() {
     assert!(registry.is_empty());
 }
 
+#[test]
+fn repeated_guard_updates_and_id_reuse_preserve_aggregate() {
+    let mut registry = PreparedRegistry::new();
+    registry.register(metadata(1, 1));
+    registry.apply_mutation(PreparedMutation::LongData(1));
+    registry.apply_mutation(PreparedMutation::LongData(1));
+    registry.observe_response(
+        Command::StmtExecute,
+        1,
+        effect(
+            ResponseDisposition::CompleteSuccess,
+            Some(StatusFlags::CURSOR_EXISTS),
+        ),
+    );
+    registry.apply_mutation(PreparedMutation::LongData(999));
+    registry.register(metadata(1, 2));
+    assert!(registry.has_pending(), "unknown ID still has long data");
+    registry.apply_mutation(PreparedMutation::Reset(999));
+    assert!(!registry.has_pending(), "ID reuse cleared the other guard");
+    registry.apply_mutation(PreparedMutation::Reset(1));
+    registry.apply_mutation(PreparedMutation::Close(999));
+    assert!(!registry.has_pending(), "repeated clears are inert");
+
+    registry.apply_mutation(PreparedMutation::LongData(1));
+    registry.apply_mutation(PreparedMutation::LongData(2));
+    registry.apply_mutation(PreparedMutation::ClearAll);
+    assert!(!registry.has_pending());
+    registry.register(metadata(3, 0));
+    registry.apply_mutation(PreparedMutation::LongData(3));
+    registry.apply_mutation(PreparedMutation::Close(3));
+    assert!(
+        !registry.has_pending(),
+        "registry remains usable after reset"
+    );
+}
+
 /// SES-06's terminal result and SES-03's success-only dispatch mutation join
 /// at one boundary: rejected change-user preserves prepared guards, while OK
 /// clears the entire registry before SES-00 observes command completion.

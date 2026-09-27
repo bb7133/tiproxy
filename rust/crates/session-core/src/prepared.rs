@@ -101,6 +101,9 @@ impl PreparedStatementState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PreparedRegistry {
     statements: BTreeMap<u32, PreparedStatementState>,
+    // Number of non-Idle guards. Keep this in sync at mutation boundaries so
+    // each completion need not scan all cached prepared statements.
+    pending_count: usize,
 }
 
 impl PreparedRegistry {
@@ -109,6 +112,7 @@ impl PreparedRegistry {
     pub const fn new() -> Self {
         Self {
             statements: BTreeMap::new(),
+            pending_count: 0,
         }
     }
 
@@ -132,10 +136,8 @@ impl PreparedRegistry {
 
     /// Whether any independent statement guard blocks migration.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
-        self.statements
-            .values()
-            .any(|statement| statement.guard.is_pending())
+    pub const fn has_pending(&self) -> bool {
+        self.pending_count != 0
     }
 
     /// Produces the payload-free SES-00 synchronization event for the current
@@ -155,7 +157,7 @@ impl PreparedRegistry {
     /// Registers a completed prepare. Reusing an ID replaces stale metadata,
     /// parameter types, and guards atomically.
     pub fn register(&mut self, metadata: PrepareMetadata) {
-        self.statements.insert(
+        let previous = self.statements.insert(
             metadata.statement_id,
             PreparedStatementState {
                 metadata: Some(metadata),
@@ -163,6 +165,9 @@ impl PreparedRegistry {
                 parameter_types: Vec::new(),
             },
         );
+        if previous.is_some_and(|statement| statement.guard.is_pending()) {
+            self.pending_count -= 1;
+        }
     }
 
     /// Applies a dispatch-owned mutation at its declared forward/success
@@ -170,16 +175,24 @@ impl PreparedRegistry {
     pub fn apply_mutation(&mut self, mutation: PreparedMutation) {
         match mutation {
             PreparedMutation::LongData(statement_id) => {
-                self.statements.entry(statement_id).or_default().guard =
-                    PreparedGuard::LongDataPending;
+                self.set_pending_guard(statement_id, PreparedGuard::LongDataPending);
             }
             PreparedMutation::Close(statement_id) => {
-                self.statements.remove(&statement_id);
+                if self
+                    .statements
+                    .remove(&statement_id)
+                    .is_some_and(|statement| statement.guard.is_pending())
+                {
+                    self.pending_count -= 1;
+                }
             }
             PreparedMutation::Reset(statement_id) => {
                 self.clear_guard(statement_id);
             }
-            PreparedMutation::ClearAll => self.statements.clear(),
+            PreparedMutation::ClearAll => {
+                self.statements.clear();
+                self.pending_count = 0;
+            }
         }
     }
 
@@ -205,7 +218,7 @@ impl PreparedRegistry {
         };
         match guard {
             Some(guard) => {
-                self.statements.entry(statement_id).or_default().guard = guard;
+                self.set_pending_guard(statement_id, guard);
             }
             None => self.clear_guard(statement_id),
         }
@@ -259,8 +272,20 @@ impl PreparedRegistry {
         Ok(decode_statement_command(payload, command)?.statement_id)
     }
 
+    fn set_pending_guard(&mut self, statement_id: u32, guard: PreparedGuard) {
+        debug_assert!(guard.is_pending());
+        let statement = self.statements.entry(statement_id).or_default();
+        if !statement.guard.is_pending() {
+            self.pending_count += 1;
+        }
+        statement.guard = guard;
+    }
+
     fn clear_guard(&mut self, statement_id: u32) {
         let remove = if let Some(statement) = self.statements.get_mut(&statement_id) {
+            if statement.guard.is_pending() {
+                self.pending_count -= 1;
+            }
             statement.guard = PreparedGuard::Idle;
             statement.metadata.is_none()
         } else {
