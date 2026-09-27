@@ -1411,12 +1411,12 @@ struct Engine {
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
     closing: bool,
-    /// opt#13: raw outbound counter value up to which bytes have been
-    /// attributed to a command observation while a queued no-response
-    /// command is still unwritten. Bytes the queue writes later (an idle
-    /// flush, or the next command's write) are attributed from this
-    /// boundary by the next observation, so raw bytes are counted exactly
-    /// once from the actual counter and never estimated ahead of the write.
+    /// opt#13: raw outbound counter value at which a queued no-response
+    /// command's bytes start. Set when a command is queued rather than
+    /// written; cleared by the command observation whose window drains the
+    /// queue, or by a flush that publishes the raw delta since this point
+    /// as [`Observation::BackendTrafficSettled`]. Raw bytes are therefore
+    /// counted exactly once and never estimated ahead of the write.
     unsettled_outbound_from: Option<u64>,
     accepted_at: tokio::time::Instant,
     /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
@@ -1608,6 +1608,11 @@ impl Engine {
 
     async fn run(mut self) -> EngineExit {
         let end = self.lifecycle().await;
+        // A queued no-response command still unwritten at the end of the
+        // wire phase leaves with this flush; its raw bytes (and any earlier
+        // drained ones no observation covered) are settled here.
+        let _ = self.flush_deferred_backend_write_quiet().await;
+        self.settle_unsettled_outbound();
         if let Some(source) = end {
             self.wire_end.get_or_insert(source);
             if self.quit_source == QuitSource::None {
@@ -3132,6 +3137,7 @@ impl Engine {
             // per-command sequence reset cannot run over queued bytes.
             let deferred =
                 !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
+            let outbound_before = backend.counters.outbound();
             let written = if deferred {
                 backend
                     .backend_io
@@ -3143,9 +3149,13 @@ impl Engine {
                     .write_logical(&pending.payload, true)
                     .await
             };
+            let queued = backend.backend_io.has_deferred_write();
             if written.is_err() {
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
+            }
+            if queued {
+                self.unsettled_outbound_from.get_or_insert(outbound_before);
             }
             return None;
         }
@@ -3784,7 +3794,34 @@ impl Engine {
         if backend.backend_io.flush().await.is_err() {
             return false;
         }
+        self.settle_unsettled_outbound();
         true
+    }
+
+    /// Publishes the raw outbound bytes written since the queued command's
+    /// boundary as a pure traffic observation and clears the boundary. Used
+    /// after a flush outside any command window and at session end, so
+    /// queued bytes are attributed exactly once even when no command
+    /// observation follows (idle disconnect, control command, teardown).
+    fn settle_unsettled_outbound(&mut self) {
+        let Some(boundary) = self.unsettled_outbound_from.take() else {
+            return;
+        };
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        let outbound_bytes = backend.counters.outbound().saturating_sub(boundary);
+        if outbound_bytes == 0 {
+            return;
+        }
+        self.metrics.try_record(Observation::BackendTrafficSettled {
+            backend: backend.address.clone(),
+            traffic: BackendTraffic {
+                outbound_bytes,
+                ..BackendTraffic::default()
+            },
+            local: backend.local,
+        });
     }
 
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
@@ -3817,6 +3854,9 @@ impl Engine {
                 }
                 EngineCmd::PrepareRedirect(_) | EngineCmd::Effect(_) => {}
             }
+            // The request is answered, so the loop is free to consume: give
+            // the FSM its one termination signal, then abandon the wire.
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
             return Awaited::Closing;
         }
         match cmd {
@@ -5001,22 +5041,15 @@ impl Engine {
 
     fn record_command(&mut self, pending: &PendingCommand) {
         let current = self.backend_traffic();
-        // Outbound bytes are attributed from the actual raw counter. While a
-        // queued no-response command is unwritten, the boundary of what has
-        // been attributed so far is remembered, so bytes the queue writes
-        // later (idle flush or the next command's write) are picked up by
-        // the next observation exactly once; a command whose own window
-        // already spans the boundary is unaffected.
-        let outbound_from = self
-            .unsettled_outbound_from
-            .map_or(pending.traffic_before.outbound_bytes, |boundary| {
-                boundary.min(pending.traffic_before.outbound_bytes)
-            });
-        self.unsettled_outbound_from = self
+        // A command whose window drained a queued no-response command has
+        // those raw bytes inside its own delta; nothing is left to settle.
+        if !self
             .backend
             .as_ref()
             .is_some_and(|backend| backend.backend_io.has_deferred_write())
-            .then_some(current.outbound_bytes);
+        {
+            self.unsettled_outbound_from = None;
+        }
         let traffic = BackendTraffic {
             inbound_bytes: current
                 .inbound_bytes
@@ -5024,7 +5057,9 @@ impl Engine {
             inbound_packets: current
                 .inbound_packets
                 .saturating_sub(pending.traffic_before.inbound_packets),
-            outbound_bytes: current.outbound_bytes.saturating_sub(outbound_from),
+            outbound_bytes: current
+                .outbound_bytes
+                .saturating_sub(pending.traffic_before.outbound_bytes),
             outbound_packets: current
                 .outbound_packets
                 .saturating_sub(pending.traffic_before.outbound_packets),

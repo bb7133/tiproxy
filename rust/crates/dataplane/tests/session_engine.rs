@@ -9676,8 +9676,9 @@ async fn deferred_close_is_flushed_when_the_next_command_is_incomplete() {
 }
 
 /// opt#13: the bytes of queued `COM_STMT_CLOSE`s are counted exactly once from
-/// the raw counter — on an idle flush they are not lost, and no observation
-/// estimates bytes ahead of the actual write.
+/// the raw counter — an idle flush settles them as pure traffic, no observation
+/// estimates bytes ahead of the actual write, and the next query carries only
+/// its own bytes.
 #[tokio::test]
 async fn deferred_close_traffic_is_attributed_once() {
     let mut stack = spawn_stack().await;
@@ -9701,21 +9702,23 @@ async fn deferred_close_traffic_is_attributed_once() {
     assert!(client.query_ok("SELECT 1").await);
     client.quit().await;
     let mut close_traffic = Vec::new();
+    let mut settled = Vec::new();
     let mut query_after_close = None;
     while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
     {
-        if let Observation::CommandCompleted {
-            command, traffic, ..
-        } = observation
-        {
-            match command {
+        match observation {
+            Observation::CommandCompleted {
+                command, traffic, ..
+            } => match command {
                 session_core::command::Command::StmtClose => close_traffic.push(traffic),
                 session_core::command::Command::Query if !close_traffic.is_empty() => {
                     query_after_close = Some(traffic);
                     break;
                 }
                 _ => {}
-            }
+            },
+            Observation::BackendTrafficSettled { traffic, .. } => settled.push(traffic),
+            _ => {}
         }
     }
     assert_eq!(close_traffic.len(), 2, "both closes are observed");
@@ -9725,13 +9728,61 @@ async fn deferred_close_traffic_is_attributed_once() {
         assert_eq!(traffic.outbound_bytes, 0);
         assert_eq!(traffic.outbound_packets, 1);
     }
+    // The idle flush settles the two closes (2 x 9 raw bytes) as pure traffic.
+    assert_eq!(settled.len(), 1, "one settlement for the idle flush");
+    assert_eq!(settled[0].outbound_bytes, 18);
+    assert_eq!(settled[0].outbound_packets, 0);
     let Some(query_after_close) = query_after_close else {
         unreachable!("the query after the closes is observed")
     };
-    // The next observation picks up the two flushed closes (2 x 9 bytes)
-    // plus its own COM_QUERY "SELECT 1" (4 + 9): every byte exactly once.
-    assert_eq!(query_after_close.outbound_bytes, 18 + 13);
+    // COM_QUERY "SELECT 1" (4 + 9) carries only its own bytes.
+    assert_eq!(query_after_close.outbound_bytes, 13);
     assert_eq!(query_after_close.outbound_packets, 1);
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: a queued `COM_STMT_CLOSE` followed by an abrupt client disconnect
+/// (no QUIT, no next command) still has its raw bytes settled at session end.
+#[tokio::test]
+async fn deferred_close_bytes_settle_when_the_client_disconnects_at_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is written");
+    drop(client);
+    let mut settled_bytes = 0;
+    let mut close_observed = false;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtClose,
+                traffic,
+                ..
+            } => {
+                close_observed = true;
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(close_observed, "the close is observed");
+    // COM_STMT_CLOSE on the wire: 4-byte header + 5-byte payload, exactly once.
+    assert_eq!(settled_bytes, 9);
     stack.dispatch_task.abort();
 }
 

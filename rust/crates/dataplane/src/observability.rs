@@ -1339,6 +1339,18 @@ pub enum Observation {
         /// Issue-to-settlement elapsed time.
         elapsed: Duration,
     },
+    /// Backend bytes written outside any command's window: a queued
+    /// no-response command flushed while the client was idle, before a
+    /// control command, or at session end. Folds into the per-backend
+    /// traffic counters only; it is not a query.
+    BackendTrafficSettled {
+        /// Backend address label.
+        backend: String,
+        /// Raw byte delta since the last attributed boundary.
+        traffic: BackendTraffic,
+        /// Whether the backend shares the proxy's location.
+        local: bool,
+    },
     /// One admitted session closed.
     SessionClosed {
         /// Exact Go-compatible quit source.
@@ -1356,7 +1368,8 @@ impl Observation {
             Self::DialBackendFailed { backend }
             | Self::BackendKeepaliveUpdated { backend, .. }
             | Self::HandshakeCompleted { backend, .. }
-            | Self::CommandCompleted { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
+            | Self::CommandCompleted { backend, .. }
+            | Self::BackendTrafficSettled { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
             // Both endpoints are label values, so both are bounded.
             Self::MigrationIssued { from, to, .. } | Self::MigrationSettled { from, to, .. } => {
                 from.len() <= MAX_LABEL_BYTES && to.len() <= MAX_LABEL_BYTES
@@ -1812,6 +1825,11 @@ impl Aggregator {
                     );
                 }
             }
+            Observation::BackendTrafficSettled {
+                backend,
+                traffic,
+                local,
+            } => self.traffic(registry, &backend, traffic, local),
             Observation::SessionClosed {
                 source,
                 lifetime,
