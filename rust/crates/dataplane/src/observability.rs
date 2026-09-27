@@ -439,6 +439,51 @@ impl RegistryState {
     fn series_count(&self) -> usize {
         self.counters.len() + self.histograms.len() + self.gauges.len()
     }
+
+    /// opt#7b: the steady-state path (series already present) is one map
+    /// lookup and no allocation; the key is cloned only when a series is
+    /// first inserted. Callers that fold several updates per observation hold
+    /// the registry lock once around all of them.
+    fn add_counter(&mut self, key: &MetricKey, delta: u64) {
+        if let Some(value) = self.counters.get_mut(key) {
+            *value = value.saturating_add(delta);
+            return;
+        }
+        if self.series_count() >= MAX_REGISTRY_SERIES {
+            self.series_dropped = self.series_dropped.saturating_add(1);
+            return;
+        }
+        self.counters.insert(key.clone(), delta);
+    }
+
+    fn observe_histogram(&mut self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
+        if let Some(entry) = self.histograms.get_mut(key) {
+            entry.observe(seconds, buckets);
+            return;
+        }
+        if self.series_count() >= MAX_REGISTRY_SERIES {
+            self.series_dropped = self.series_dropped.saturating_add(1);
+            return;
+        }
+        let mut entry = HistogramState {
+            cumulative_buckets: vec![0; buckets.len()],
+            ..HistogramState::default()
+        };
+        entry.observe(seconds, buckets);
+        self.histograms.insert(key.clone(), entry);
+    }
+}
+
+impl HistogramState {
+    fn observe(&mut self, seconds: f64, buckets: &[f64]) {
+        self.count = self.count.saturating_add(1);
+        self.sum += seconds;
+        for (upper, bucket) in buckets.iter().zip(self.cumulative_buckets.iter_mut()) {
+            if seconds <= *upper {
+                *bucket = bucket.saturating_add(1);
+            }
+        }
+    }
 }
 
 /// Supplies the authoritative migration state at render time.
@@ -705,35 +750,7 @@ impl MetricsRegistry {
     }
 
     fn add_counter(&self, key: &MetricKey, delta: u64) {
-        let mut state = self.lock();
-        if !state.counters.contains_key(key) && state.series_count() >= MAX_REGISTRY_SERIES {
-            state.series_dropped = state.series_dropped.saturating_add(1);
-            return;
-        }
-        let value = state.counters.entry(key.clone()).or_insert(0);
-        *value = value.saturating_add(delta);
-    }
-
-    fn observe_histogram(&self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
-        let mut state = self.lock();
-        if !state.histograms.contains_key(key) && state.series_count() >= MAX_REGISTRY_SERIES {
-            state.series_dropped = state.series_dropped.saturating_add(1);
-            return;
-        }
-        let entry = state
-            .histograms
-            .entry(key.clone())
-            .or_insert_with(|| HistogramState {
-                cumulative_buckets: vec![0; buckets.len()],
-                ..HistogramState::default()
-            });
-        entry.count = entry.count.saturating_add(1);
-        entry.sum += seconds;
-        for (upper, bucket) in buckets.iter().zip(entry.cumulative_buckets.iter_mut()) {
-            if seconds <= *upper {
-                *bucket = bucket.saturating_add(1);
-            }
-        }
+        RegistryState::add_counter(&mut self.lock(), key, delta);
     }
 
     fn set_gauge(&self, name: &'static str, value: f64) {
@@ -1577,13 +1594,15 @@ impl Aggregator {
         }
     }
 
-    fn get_backend(&mut self, duration: Duration, succeeded: bool) {
+    fn get_backend(&mut self, registry: &mut RegistryState, duration: Duration, succeeded: bool) {
         self.histogram(
+            registry,
             &MetricKey::new("tiproxy_backend_get_backend_duration_seconds", vec![]),
             duration.as_secs_f64(),
             &GET_BACKEND_BUCKETS,
         );
         self.counter(
+            registry,
             &MetricKey::new(
                 "tiproxy_backend_get_backend",
                 vec![("res", if succeeded { "succeed" } else { "fail" }.to_owned())],
@@ -1592,87 +1611,116 @@ impl Aggregator {
         );
     }
 
-    /// The key is cloned only when the series is first inserted into
-    /// `pending` (i.e. once per export batch), never per observation.
-    fn counter(&mut self, key: &MetricKey, delta: u64) {
+    /// opt#7b: one `pending` lookup per update (the key is cloned only when
+    /// the series is first inserted into the batch) and the registry state
+    /// is passed in already locked, so an observation that folds several
+    /// updates takes the registry mutex once.
+    ///
+    /// Shed rule is unchanged: a series already in `pending` is always
+    /// accepted; a new one is accepted only below `MAX_PENDING_SERIES`, and a
+    /// shed update reaches neither `pending` nor the registry.
+    fn counter(&mut self, registry: &mut RegistryState, key: &MetricKey, delta: u64) {
         if delta == 0 {
             return;
         }
-        if !self.ensure_series(key) {
-            return;
-        }
-        self.registry.add_counter(key, delta);
-        let entry = if let Some(entry) = self.pending.get_mut(key) {
-            entry
-        } else {
-            self.pending
-                .entry(key.clone())
-                .or_insert(PendingMetric::Counter(0))
-        };
-        match entry {
-            PendingMetric::Counter(value) => *value = value.saturating_add(delta),
-            PendingMetric::Histogram { .. } => {
+        match self.pending.get_mut(key) {
+            Some(PendingMetric::Counter(value)) => *value = value.saturating_add(delta),
+            Some(PendingMetric::Histogram { .. }) => {
                 self.overflow_dropped = self.overflow_dropped.saturating_add(1);
             }
-        }
-    }
-
-    /// Clones the key only on first insert into `pending`.
-    fn histogram(&mut self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
-        if !seconds.is_finite() || seconds < 0.0 || !self.ensure_series(key) {
-            self.overflow_dropped = self.overflow_dropped.saturating_add(1);
-            return;
-        }
-        self.registry.observe_histogram(key, seconds, buckets);
-        let entry = if let Some(entry) = self.pending.get_mut(key) {
-            entry
-        } else {
-            self.pending
-                .entry(key.clone())
-                .or_insert_with(|| PendingMetric::Histogram {
-                    count: 0,
-                    sum: 0.0,
-                    cumulative_buckets: vec![0; buckets.len()],
-                })
-        };
-        let PendingMetric::Histogram {
-            count,
-            sum,
-            cumulative_buckets,
-        } = entry
-        else {
-            self.overflow_dropped = self.overflow_dropped.saturating_add(1);
-            return;
-        };
-        *count = count.saturating_add(1);
-        *sum += seconds;
-        for (upper, bucket) in buckets.iter().zip(cumulative_buckets.iter_mut()) {
-            if seconds <= *upper {
-                *bucket = bucket.saturating_add(1);
+            None => {
+                if self.pending.len() >= MAX_PENDING_SERIES {
+                    self.overflow_dropped = self.overflow_dropped.saturating_add(1);
+                    return;
+                }
+                self.pending
+                    .insert(key.clone(), PendingMetric::Counter(delta));
             }
         }
+        registry.add_counter(key, delta);
     }
 
-    fn ensure_series(&mut self, key: &MetricKey) -> bool {
-        if self.pending.contains_key(key) || self.pending.len() < MAX_PENDING_SERIES {
-            true
-        } else {
+    fn histogram(
+        &mut self,
+        registry: &mut RegistryState,
+        key: &MetricKey,
+        seconds: f64,
+        buckets: &[f64],
+    ) {
+        if !seconds.is_finite() || seconds < 0.0 {
             self.overflow_dropped = self.overflow_dropped.saturating_add(1);
-            false
+            return;
         }
+        match self.pending.get_mut(key) {
+            Some(PendingMetric::Histogram {
+                count,
+                sum,
+                cumulative_buckets,
+            }) => {
+                *count = count.saturating_add(1);
+                *sum += seconds;
+                for (upper, bucket) in buckets.iter().zip(cumulative_buckets.iter_mut()) {
+                    if seconds <= *upper {
+                        *bucket = bucket.saturating_add(1);
+                    }
+                }
+            }
+            Some(PendingMetric::Counter(_)) => {
+                self.overflow_dropped = self.overflow_dropped.saturating_add(1);
+            }
+            None => {
+                if self.pending.len() >= MAX_PENDING_SERIES {
+                    // Same count as before this path was flattened: the series
+                    // bound and the histogram guard each recorded the shed.
+                    self.overflow_dropped = self.overflow_dropped.saturating_add(2);
+                    return;
+                }
+                let mut cumulative_buckets = vec![0; buckets.len()];
+                for (upper, bucket) in buckets.iter().zip(cumulative_buckets.iter_mut()) {
+                    if seconds <= *upper {
+                        *bucket = 1;
+                    }
+                }
+                self.pending.insert(
+                    key.clone(),
+                    PendingMetric::Histogram {
+                        count: 1,
+                        sum: seconds,
+                        cumulative_buckets,
+                    },
+                );
+            }
+        }
+        registry.observe_histogram(key, seconds, buckets);
     }
 
+    /// Lock-per-call conveniences for the tick-time and test callers that
+    /// fold one update at a time.
+    fn counter_once(&mut self, key: &MetricKey, delta: u64) {
+        let registry = Arc::clone(&self.registry);
+        self.counter(&mut registry.lock(), key, delta);
+    }
+
+    /// Folds one observation, taking the registry lock exactly once for
+    /// every series it updates.
     fn observe(&mut self, observation: Observation) {
+        let registry = Arc::clone(&self.registry);
+        let mut state = registry.lock();
+        self.observe_in(&mut state, observation);
+    }
+
+    fn observe_in(&mut self, registry: &mut RegistryState, observation: Observation) {
         match observation {
             Observation::GetBackend {
                 duration,
                 succeeded,
-            } => self.get_backend(duration, succeeded),
+            } => self.get_backend(registry, duration, succeeded),
             // The three migration families render from authoritative router
             // and process state, so accumulating them here would double
             // count. These observations remain a notification path only.
             Observation::MigrationIssued { .. } | Observation::MigrationSettled { .. } => {}
             Observation::DialBackendFailed { backend } => self.counter(
+                registry,
                 &MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
                     vec![("backend", backend)],
@@ -1683,7 +1731,7 @@ impl Aggregator {
                 backend,
                 healthy,
                 succeeded,
-            } => self.backend_keepalive_updated(backend, healthy, succeeded),
+            } => self.backend_keepalive_updated(registry, backend, healthy, succeeded),
             Observation::HandshakeCompleted {
                 backend,
                 duration,
@@ -1691,6 +1739,7 @@ impl Aggregator {
                 local,
             } => {
                 self.histogram(
+                    registry,
                     &MetricKey::new(
                         "tiproxy_session_handshake_duration_seconds",
                         vec![("backend", backend.clone())],
@@ -1698,7 +1747,7 @@ impl Aggregator {
                     duration.as_secs_f64(),
                     &HANDSHAKE_BUCKETS,
                 );
-                self.traffic(&backend, traffic, local);
+                self.traffic(registry, &backend, traffic, local);
             }
             Observation::CommandCompleted {
                 backend,
@@ -1715,18 +1764,25 @@ impl Aggregator {
                             Arc::new(CommandKeys::new(backend, cmd_type))
                         }),
                 );
-                self.counter(&keys.query_total, 1);
-                self.histogram(&keys.query_duration, duration.as_secs_f64(), &QUERY_BUCKETS);
+                self.counter(registry, &keys.query_total, 1);
                 self.histogram(
+                    registry,
+                    &keys.query_duration,
+                    duration.as_secs_f64(),
+                    &QUERY_BUCKETS,
+                );
+                self.histogram(
+                    registry,
                     &keys.since_connection,
                     since_connection.as_secs_f64(),
                     &QUERY_AGE_BUCKETS,
                 );
                 for (key, field) in &keys.traffic {
-                    self.counter(key, field.pick(traffic));
+                    self.counter(registry, key, field.pick(traffic));
                 }
                 if !local {
                     self.counter(
+                        registry,
                         &keys.cross_location_bytes,
                         traffic.inbound_bytes.saturating_add(traffic.outbound_bytes),
                     );
@@ -1738,6 +1794,7 @@ impl Aggregator {
                 traffic: _,
             } => {
                 self.counter(
+                    registry,
                     &MetricKey::new(
                         "tiproxy_server_disconnection_total",
                         vec![("type", source.metric_label().to_owned())],
@@ -1745,6 +1802,7 @@ impl Aggregator {
                     1,
                 );
                 self.histogram(
+                    registry,
                     &MetricKey::new("tiproxy_session_conn_lifetime_seconds", vec![]),
                     lifetime.as_secs_f64(),
                     &CONN_LIFETIME_BUCKETS,
@@ -1753,8 +1811,15 @@ impl Aggregator {
         }
     }
 
-    fn backend_keepalive_updated(&mut self, backend: String, healthy: bool, succeeded: bool) {
+    fn backend_keepalive_updated(
+        &mut self,
+        registry: &mut RegistryState,
+        backend: String,
+        healthy: bool,
+        succeeded: bool,
+    ) {
         self.counter(
+            registry,
             &MetricKey::new(
                 "tiproxy_backend_keepalive_update_total",
                 vec![
@@ -1773,7 +1838,13 @@ impl Aggregator {
         );
     }
 
-    fn traffic(&mut self, backend: &str, traffic: BackendTraffic, local: bool) {
+    fn traffic(
+        &mut self,
+        registry: &mut RegistryState,
+        backend: &str,
+        traffic: BackendTraffic,
+        local: bool,
+    ) {
         for (name, delta) in [
             ("tiproxy_traffic_inbound_bytes", traffic.inbound_bytes),
             ("tiproxy_traffic_inbound_packets", traffic.inbound_packets),
@@ -1781,12 +1852,14 @@ impl Aggregator {
             ("tiproxy_traffic_outbound_packets", traffic.outbound_packets),
         ] {
             self.counter(
+                registry,
                 &MetricKey::new(name, vec![("backend", backend.to_owned())]),
                 delta,
             );
         }
         if !local {
             self.counter(
+                registry,
                 &MetricKey::new("tiproxy_traffic_cross_location_bytes", vec![]),
                 traffic.inbound_bytes.saturating_add(traffic.outbound_bytes),
             );
@@ -1889,7 +1962,7 @@ impl ExportTotals {
     }
 
     fn accumulate_delta(self, previous: Self, aggregator: &mut Aggregator) {
-        aggregator.counter(
+        aggregator.counter_once(
             &MetricKey::new("tiproxy_server_create_connection_total", vec![]),
             self.registered.saturating_sub(previous.registered),
         );
@@ -1897,7 +1970,7 @@ impl ExportTotals {
             ("memory", self.rejected_memory, previous.rejected_memory),
             ("max_connections", self.rejected_max, previous.rejected_max),
         ] {
-            aggregator.counter(
+            aggregator.counter_once(
                 &MetricKey::new(
                     "tiproxy_server_reject_connection_total",
                     vec![("type", label.to_owned())],
@@ -1972,12 +2045,12 @@ impl ExportTotals {
                 previous.dispatch_legacy_route_violations,
             ),
         ] {
-            aggregator.counter(
+            aggregator.counter_once(
                 &MetricKey::new("tiproxy_server_err", vec![("type", label.to_owned())]),
                 current.saturating_sub(old),
             );
         }
-        aggregator.counter(
+        aggregator.counter_once(
             &MetricKey::new(
                 "tiproxy_server_event",
                 vec![("type", "rust_control_reconnect".to_owned())],
@@ -2388,7 +2461,7 @@ mod tests {
     fn pending_series_reserve_room_for_reconnect_gauge() {
         let mut aggregator = Aggregator::default();
         for index in 0..=MAX_PENDING_SERIES {
-            aggregator.counter(
+            aggregator.counter_once(
                 &MetricKey::new(
                     "tiproxy_backend_dial_backend_fail",
                     vec![("backend", format!("backend-{index}"))],
