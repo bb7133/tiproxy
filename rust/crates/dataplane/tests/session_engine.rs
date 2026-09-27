@@ -9728,10 +9728,18 @@ async fn deferred_close_traffic_is_attributed_once() {
         assert_eq!(traffic.outbound_bytes, 0);
         assert_eq!(traffic.outbound_packets, 1);
     }
-    // The idle flush settles the two closes (2 x 9 raw bytes) as pure traffic.
-    assert_eq!(settled.len(), 1, "one settlement for the idle flush");
-    assert_eq!(settled[0].outbound_bytes, 18);
-    assert_eq!(settled[0].outbound_packets, 0);
+    // The idle flush(es) settle the two closes (2 x 9 raw bytes) as pure
+    // traffic. Whether both closes leave in one flush or one each depends on
+    // arrival timing, so only the total is fixed.
+    assert!(
+        !settled.is_empty(),
+        "the idle flush settles the queued closes"
+    );
+    let settled_bytes: u64 = settled.iter().map(|traffic| traffic.outbound_bytes).sum();
+    assert_eq!(settled_bytes, 18);
+    for traffic in &settled {
+        assert_eq!(traffic.outbound_packets, 0);
+    }
     let Some(query_after_close) = query_after_close else {
         unreachable!("the query after the closes is observed")
     };
