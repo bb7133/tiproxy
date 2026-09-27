@@ -90,7 +90,6 @@ use mysql_wire::{
     Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams,
     PHYSICAL_PACKET_HEADER_LEN, StatusFlags, encode_error_packet, encode_handshake_response,
     encode_initial_handshake, encode_ssl_request, parse_handshake_response, parse_ssl_request,
-    physical_packet_count,
 };
 use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
 use proxy_io::counted::{ByteCounters, CountedIo};
@@ -808,7 +807,7 @@ async fn run_bound_session_observed(
         wire_end: None,
         quit_source: QuitSource::None,
         closing: false,
-        deferred_outbound: BackendTraffic::default(),
+        unsettled_outbound_from: None,
         accepted_at,
         handshake_deadline: loop_config.handshake_deadline,
         frontend_tls_active: false,
@@ -1412,12 +1411,13 @@ struct Engine {
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
     closing: bool,
-    /// opt#13: wire bytes of no-response commands queued on the backend
-    /// writer and already attributed to their own command observation
-    /// (packet counts are taken by the framing layer at queue time). Folded
-    /// into the next command's traffic baseline, or cleared on an idle
-    /// flush, so the bytes are counted exactly once.
-    deferred_outbound: BackendTraffic,
+    /// opt#13: raw outbound counter value up to which bytes have been
+    /// attributed to a command observation while a queued no-response
+    /// command is still unwritten. Bytes the queue writes later (an idle
+    /// flush, or the next command's write) are attributed from this
+    /// boundary by the next observation, so raw bytes are counted exactly
+    /// once from the actual counter and never estimated ahead of the write.
+    unsettled_outbound_from: Option<u64>,
     accepted_at: tokio::time::Instant,
     /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
     /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
@@ -2740,7 +2740,7 @@ impl Engine {
                 streamed,
                 started: command_started,
                 since_connection: command_started.saturating_duration_since(self.accepted_at),
-                traffic_before: self.intake_traffic_baseline(),
+                traffic_before: self.backend_traffic(),
             });
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
@@ -3133,17 +3133,6 @@ impl Engine {
             let deferred =
                 !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
             let written = if deferred {
-                // The bytes are attributed to this command now (they leave
-                // with the next write or flush); the next command's baseline
-                // skips them so they are counted exactly once.
-                let payload_len = u64::try_from(pending.payload.len()).unwrap_or(u64::MAX);
-                let packets = physical_packet_count(payload_len);
-                let header_len = u64::try_from(PHYSICAL_PACKET_HEADER_LEN).unwrap_or(u64::MAX);
-                self.deferred_outbound.outbound_bytes = self
-                    .deferred_outbound
-                    .outbound_bytes
-                    .saturating_add(payload_len)
-                    .saturating_add(header_len.saturating_mul(packets));
                 backend
                     .backend_io
                     .write_logical_deferred(&pending.payload)
@@ -3795,23 +3784,7 @@ impl Engine {
         if backend.backend_io.flush().await.is_err() {
             return false;
         }
-        // The bytes are on the wire and in the raw counters now; the next
-        // command's baseline is taken after this point.
-        self.deferred_outbound = BackendTraffic::default();
         true
-    }
-
-    /// Traffic baseline for a command taken in: raw counters plus whatever
-    /// queued no-response bytes are still ahead of it on the writer (already
-    /// attributed to their own command), so a later drain inside this
-    /// command's window is not counted twice.
-    fn intake_traffic_baseline(&mut self) -> BackendTraffic {
-        let mut baseline = self.backend_traffic();
-        baseline.outbound_bytes = baseline
-            .outbound_bytes
-            .saturating_add(self.deferred_outbound.outbound_bytes);
-        self.deferred_outbound = BackendTraffic::default();
-        baseline
     }
 
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
@@ -3823,14 +3796,26 @@ impl Engine {
         if !self.flush_deferred_backend_write_quiet().await {
             self.closing = true;
             self.wire_end.get_or_insert(WireErrorSource::BackendNetwork);
+            if self.quit_source == QuitSource::None {
+                self.quit_source = QuitSource::BackendNetwork;
+            }
             match cmd {
                 EngineCmd::Probe(reply) => {
                     let _ = reply.send(false);
                 }
-                EngineCmd::PrepareRedirect(_) => {}
-                EngineCmd::Effect(effect) => {
+                // Only teardown effects still run; anything that would use
+                // or swap the backend (redirect handshake, swap, forwards)
+                // is refused now that the wire is over.
+                EngineCmd::Effect(
+                    effect @ (SessionEffect::BeginDrainTimer
+                    | SessionEffect::ReleaseBackend
+                    | SessionEffect::CloseBackend
+                    | SessionEffect::CloseClient
+                    | SessionEffect::ClassifySessionEnd),
+                ) => {
                     let _ = self.handle_effect(effect).await;
                 }
+                EngineCmd::PrepareRedirect(_) | EngineCmd::Effect(_) => {}
             }
             return Awaited::Closing;
         }
@@ -5014,12 +4999,24 @@ impl Engine {
             })
     }
 
-    fn record_command(&self, pending: &PendingCommand) {
-        let mut current = self.backend_traffic();
-        // Queued no-response bytes belong to the command that queued them.
-        current.outbound_bytes = current
-            .outbound_bytes
-            .saturating_add(self.deferred_outbound.outbound_bytes);
+    fn record_command(&mut self, pending: &PendingCommand) {
+        let current = self.backend_traffic();
+        // Outbound bytes are attributed from the actual raw counter. While a
+        // queued no-response command is unwritten, the boundary of what has
+        // been attributed so far is remembered, so bytes the queue writes
+        // later (idle flush or the next command's write) are picked up by
+        // the next observation exactly once; a command whose own window
+        // already spans the boundary is unaffected.
+        let outbound_from = self
+            .unsettled_outbound_from
+            .map_or(pending.traffic_before.outbound_bytes, |boundary| {
+                boundary.min(pending.traffic_before.outbound_bytes)
+            });
+        self.unsettled_outbound_from = self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.backend_io.has_deferred_write())
+            .then_some(current.outbound_bytes);
         let traffic = BackendTraffic {
             inbound_bytes: current
                 .inbound_bytes
@@ -5027,9 +5024,7 @@ impl Engine {
             inbound_packets: current
                 .inbound_packets
                 .saturating_sub(pending.traffic_before.inbound_packets),
-            outbound_bytes: current
-                .outbound_bytes
-                .saturating_sub(pending.traffic_before.outbound_bytes),
+            outbound_bytes: current.outbound_bytes.saturating_sub(outbound_from),
             outbound_packets: current
                 .outbound_packets
                 .saturating_sub(pending.traffic_before.outbound_packets),

@@ -9675,9 +9675,9 @@ async fn deferred_close_is_flushed_when_the_next_command_is_incomplete() {
     stack.dispatch_task.abort();
 }
 
-/// opt#13: the bytes of a queued `COM_STMT_CLOSE` are attributed to the close
-/// exactly once — on an idle flush they are neither lost nor charged to the
-/// following command.
+/// opt#13: the bytes of queued `COM_STMT_CLOSE`s are counted exactly once from
+/// the raw counter — on an idle flush they are not lost, and no observation
+/// estimates bytes ahead of the actual write.
 #[tokio::test]
 async fn deferred_close_traffic_is_attributed_once() {
     let mut stack = spawn_stack().await;
@@ -9693,12 +9693,14 @@ async fn deferred_close_traffic_is_attributed_once() {
         client.stmt_prepare("NOMETA").await,
         Some(PrepareOutcome::Ok { .. })
     ));
-    assert!(client.stmt_close(7).await, "the close is written");
-    // Idle: the queued close is flushed without a next command.
+    // Two closes in a row stay queued together; then idle flushes them
+    // without a next command.
+    assert!(client.stmt_close(7).await, "the first close is written");
+    assert!(client.stmt_close(7).await, "the second close is written");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(client.query_ok("SELECT 1").await);
     client.quit().await;
-    let mut close_traffic = None;
+    let mut close_traffic = Vec::new();
     let mut query_after_close = None;
     while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
     {
@@ -9707,8 +9709,8 @@ async fn deferred_close_traffic_is_attributed_once() {
         } = observation
         {
             match command {
-                session_core::command::Command::StmtClose => close_traffic = Some(traffic),
-                session_core::command::Command::Query if close_traffic.is_some() => {
+                session_core::command::Command::StmtClose => close_traffic.push(traffic),
+                session_core::command::Command::Query if !close_traffic.is_empty() => {
                     query_after_close = Some(traffic);
                     break;
                 }
@@ -9716,17 +9718,19 @@ async fn deferred_close_traffic_is_attributed_once() {
             }
         }
     }
-    let Some(close_traffic) = close_traffic else {
-        unreachable!("the close is observed")
-    };
-    // COM_STMT_CLOSE: 4-byte header + 5-byte payload, one physical packet.
-    assert_eq!(close_traffic.outbound_bytes, 9);
-    assert_eq!(close_traffic.outbound_packets, 1);
+    assert_eq!(close_traffic.len(), 2, "both closes are observed");
+    // Bytes come from the raw counter: nothing was written when the closes
+    // were recorded (their packets are framed at queue time).
+    for traffic in &close_traffic {
+        assert_eq!(traffic.outbound_bytes, 0);
+        assert_eq!(traffic.outbound_packets, 1);
+    }
     let Some(query_after_close) = query_after_close else {
-        unreachable!("the query after the close is observed")
+        unreachable!("the query after the closes is observed")
     };
-    // COM_QUERY "SELECT 1": 4-byte header + 9-byte payload, nothing from the close.
-    assert_eq!(query_after_close.outbound_bytes, 13);
+    // The next observation picks up the two flushed closes (2 x 9 bytes)
+    // plus its own COM_QUERY "SELECT 1" (4 + 9): every byte exactly once.
+    assert_eq!(query_after_close.outbound_bytes, 18 + 13);
     assert_eq!(query_after_close.outbound_packets, 1);
     stack.dispatch_task.abort();
 }
