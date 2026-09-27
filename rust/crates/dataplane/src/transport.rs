@@ -243,6 +243,10 @@ impl DirectionSync for ClientTransport {
             _ => Ok(()),
         }
     }
+
+    fn is_layered(&self) -> bool {
+        matches!(self, Self::Compressed(_))
+    }
 }
 
 impl DirectionSync for BackendTransport {
@@ -265,5 +269,9 @@ impl DirectionSync for BackendTransport {
             Self::Compressed(inner) => inner.reset_sequence().map_err(compression_io_error),
             _ => Ok(()),
         }
+    }
+
+    fn is_layered(&self) -> bool {
+        matches!(self, Self::Compressed(_))
     }
 }

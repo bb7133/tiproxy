@@ -2563,6 +2563,34 @@ impl Engine {
             // header is visible the logical read runs uncontended; a
             // client stalling mid-frame is bounded by the owner's force
             // deadline, like any other mid-command stall.
+            // opt#13: a deferred no-response command is still queued for the
+            // backend. If the next client command is already here, let it join
+            // that write (the select below re-peeks from the staged bytes);
+            // otherwise flush now, so the backend never waits on a queued
+            // command while the client is idle.
+            if self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.backend_io.has_deferred_write())
+            {
+                let staged = tokio::select! {
+                    biased;
+                    peeked = self.client_io.peek_packet() => Some(peeked),
+                    () = std::future::ready(()) => None,
+                };
+                match staged {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        let source = self.client_read_end(&error).await;
+                        return Some(source);
+                    }
+                    None => {
+                        if let Some(source) = self.flush_deferred_backend_write().await {
+                            return Some(source);
+                        }
+                    }
+                }
+            }
             let (intake, command_started) = tokio::select! {
                 changed = self.snapshot_updates.changed(), if snapshot_updates_open => {
                     if changed.is_err() {
@@ -3059,12 +3087,29 @@ impl Engine {
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
         if !pending.streamed {
-            if backend
-                .backend_io
-                .write_logical(&pending.payload, true)
-                .await
-                .is_err()
-            {
+            // opt#13: a command that expects no response (STMT_CLOSE,
+            // SEND_LONG_DATA) is queued rather than written, so the command
+            // that usually follows at once (the next PREPARE/EXECUTE) leaves
+            // in the same transport write and the backend wakes once for
+            // both — as it does behind Go, whose forwards are back to back.
+            // The command loop flushes the queue before it would wait for the
+            // client, and every backend write/read path drains it first.
+            // Layered (compressed) legs keep the immediate write: their
+            // per-command sequence reset cannot run over queued bytes.
+            let deferred =
+                !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
+            let written = if deferred {
+                backend
+                    .backend_io
+                    .write_logical_deferred(&pending.payload)
+                    .await
+            } else {
+                backend
+                    .backend_io
+                    .write_logical(&pending.payload, true)
+                    .await
+            };
+            if written.is_err() {
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
             }
@@ -3690,7 +3735,25 @@ impl Engine {
     }
 
     /// Executes one out-of-band command (control effects, probes).
+    /// Writes out a deferred no-response command (opt#13) before anything
+    /// that leaves the plain command loop: control effects, probes, and the
+    /// paths that swap or read the backend all see a drained queue.
+    async fn flush_deferred_backend_write(&mut self) -> Option<WireErrorSource> {
+        let backend = self.backend.as_mut()?;
+        if !backend.backend_io.has_deferred_write() {
+            return None;
+        }
+        if backend.backend_io.flush().await.is_err() {
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::BackendNetwork);
+        }
+        None
+    }
+
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
+        // A control command may redirect, probe, or drain the backend: the
+        // queued no-response command must reach the current backend first.
+        let _ = self.flush_deferred_backend_write().await;
         match cmd {
             EngineCmd::Probe(reply) => {
                 let _ = reply.send(self.backend_alive());

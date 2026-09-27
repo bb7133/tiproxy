@@ -7611,6 +7611,10 @@ impl DirectionSync for CompressedTestTransport {
     fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
         self.inner.reset_sequence().map_err(compression_io_error)
     }
+
+    fn is_layered(&self) -> bool {
+        true
+    }
 }
 
 /// A compressed `MySQL` client: negotiates `COMPRESS`/`ZSTD` during the plaintext
@@ -8495,6 +8499,10 @@ impl DirectionSync for BackendLegTransport {
 
     fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
         self.inner.reset_sequence().map_err(compression_io_error)
+    }
+
+    fn is_layered(&self) -> bool {
+        true
     }
 }
 
