@@ -62,7 +62,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState, TransitionError};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
 
@@ -259,6 +259,30 @@ enum LoopAction {
     BackendProbe,
 }
 
+/// Parks on the shared shutdown `watch` once and fires `fired` when the
+/// signal becomes `true` or its sender is dropped. Ignores changes back to
+/// `false`, which the loop treated as a no-op wake.
+async fn shutdown_relay(mut shutdown: watch::Receiver<bool>, fired: oneshot::Sender<()>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            break;
+        }
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+    let _ = fired.send(());
+}
+
+/// Aborts the relay on every exit path of the event loop.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     /// Creates a session loop; the FSM starts at `Accept`.
     #[must_use]
@@ -390,6 +414,22 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             Box::pin(sleep_until(armed_deadline.map_or(far_future, |(at, _)| at)));
         let mut probe_sleep = Box::pin(sleep_until(next_probe.unwrap_or(far_future)));
 
+        // opt#12: the server shutdown signal is one `watch` shared by every
+        // session. Awaiting `changed()` inside the select registered this
+        // task on the channel's waiter list and unlinked it again on every
+        // iteration, serializing all sessions on that list's mutex. Instead a
+        // per-session relay task parks on the shared channel once and fires a
+        // private oneshot; the loop polls the oneshot (no shared state) and
+        // keeps an exact lock-free precheck via `has_changed`.
+        // `mark_changed` makes the first precheck read the current value, so
+        // a shutdown that predates the loop is still seen before any select.
+        self.shutdown.mark_changed();
+        let (relay_tx, mut shutdown_fired) = oneshot::channel::<()>();
+        let _relay = AbortOnDrop(tokio::spawn(shutdown_relay(
+            self.shutdown.clone(),
+            relay_tx,
+        )));
+
         // The wire engine has at most one unacknowledged command. Its payload
         // stays in the engine; retain only the classified event while a
         // redirect owns the command boundary (Go's processLock).
@@ -422,6 +462,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             let action = self
                 .next_action(
                     events,
+                    &mut shutdown_fired,
                     &mut deadline_sleep,
                     &mut probe_sleep,
                     armed_deadline,
@@ -490,15 +531,24 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     async fn next_action(
         &mut self,
         events: &mut mpsc::Receiver<SessionEvent>,
+        shutdown_fired: &mut oneshot::Receiver<()>,
         deadline_sleep: &mut Pin<Box<Sleep>>,
         probe_sleep: &mut Pin<Box<Sleep>>,
         armed_deadline: Option<(Instant, SessionEvent)>,
         next_probe: Option<Instant>,
     ) -> LoopAction {
         // A shutdown that predates this call (including one set before the
-        // loop started) must not be lost to `changed()`'s edge semantics.
-        if *self.shutdown.borrow() {
-            return LoopAction::ServerShutdown;
+        // loop started) must not be lost to the relay's scheduling. The
+        // version check is a lock-free atomic load; the value is read only
+        // when the version moved. A dropped sender is a shutdown, as before.
+        match self.shutdown.has_changed() {
+            Err(_) => return LoopAction::ServerShutdown,
+            Ok(true) => {
+                if *self.shutdown.borrow_and_update() {
+                    return LoopAction::ServerShutdown;
+                }
+            }
+            Ok(false) => {}
         }
         // opt#6: poll the caller's persistent timers instead of building a
         // fresh `sleep_until` here. A new timer per call armed and (on the
@@ -507,13 +557,9 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // resets these only when the deadline actually changes.
         tokio::select! {
             biased;
-            changed = self.shutdown.changed() => {
-                if changed.is_err() || *self.shutdown.borrow() {
-                    LoopAction::ServerShutdown
-                } else {
-                    LoopAction::ChildFinished
-                }
-            }
+            // The relay fires once the shared signal is `true` or its sender
+            // is gone; a relay that vanished (runtime teardown) reads the same.
+            _ = &mut *shutdown_fired => LoopAction::ServerShutdown,
             command = self.control.recv(), if !self.control_detached => match command {
                 Some(command) => LoopAction::Control(command),
                 None => LoopAction::ControlDetached,
