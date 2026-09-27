@@ -1102,24 +1102,30 @@ enum StagedForward {
     Complete,
 }
 
-/// opt#18: forwards one physical packet directly from the source's over-read
-/// window into the buffered destination, when the whole packet is already
-/// staged there and nothing older (prefetch window, raw prefix) is staged
-/// ahead of it. Decodes the header in place, regenerates the outbound header
-/// under the destination's sequence, appends header and payload to the
-/// pending queue, and advances the window, counters, capture and completion
-/// exactly as the read-through path does. Returns `None` (nothing consumed)
-/// when the fast path does not apply: window empty or partial, prefetch or
-/// raw-prefix bytes pending, over-read disabled, or a packet too large for the
-/// bounded queue — those keep the existing per-packet read path.
-async fn forward_staged_packet(
-    src_state: &mut ReaderState,
-    dst_state: &mut WriterState,
-    dst_inner: &mut (impl AsyncWrite + Unpin),
-    progress: &mut ForwardProgress,
+/// A whole physical packet staged in the over-read window, located but not
+/// yet consumed.
+#[derive(Clone, Copy)]
+struct StagedPacket {
+    header: PacketHeader,
+    start: usize,
+    payload_length: usize,
+}
+
+impl StagedPacket {
+    const fn wire_length(self) -> usize {
+        PHYSICAL_PACKET_HEADER_LEN + self.payload_length
+    }
+}
+
+/// Locates a whole small physical packet at the head of the source's over-read
+/// window when nothing older (prefetch window, raw prefix) is staged ahead of
+/// it. `None` means the fast paths do not apply and the read-through path must
+/// be used: window empty or partial, packet too large for the bounded queue,
+/// prefetch or raw-prefix bytes pending, or over-read disabled.
+fn staged_packet(
+    src_state: &ReaderState,
     scratch_len: usize,
-    flush_on_complete: bool,
-) -> Result<Option<StagedForward>, PacketIoError> {
+) -> Result<Option<StagedPacket>, PacketIoError> {
     if src_state.prefetched_len() != 0
         || !src_state.raw_prefix_slice().is_empty()
         || !src_state.over_read.enabled
@@ -1137,20 +1143,36 @@ async fn forward_staged_packet(
         usize::try_from(header.payload_length()).map_err(|_| PacketIoError::CounterOverflow {
             field: "physical payload length",
         })?;
-    let wire_length = PHYSICAL_PACKET_HEADER_LEN + payload_length;
     if payload_length == 0
         || payload_length > scratch_len.saturating_sub(PHYSICAL_PACKET_HEADER_LEN)
-        || staged < wire_length
+        || staged < PHYSICAL_PACKET_HEADER_LEN + payload_length
     {
         return Ok(None);
     }
-    let sequence = src_state.sequence.observe(header.sequence_id());
-    progress.observe_header(header, sequence)?;
-    // Consume the packet from the source first — the same order as the
-    // read-through path, where `read_exact` accounts the bytes before the
-    // destination write — so a failed write leaves the source state identical
-    // in both paths. The bytes stay in the window's backing buffer until the
-    // next fill, which cannot happen while this call holds the reader.
+    Ok(Some(StagedPacket {
+        header,
+        start,
+        payload_length,
+    }))
+}
+
+/// Forwards one located staged packet from the window into the buffered
+/// destination: consumes and accounts the source bytes first (the same order
+/// as the read-through path, so a failed write leaves identical source state),
+/// regenerates the outbound header under the destination sequence, appends
+/// header and payload, then advances the packet counters and `progress`.
+async fn forward_window_packet(
+    src_state: &mut ReaderState,
+    dst_state: &mut WriterState,
+    dst_inner: &mut (impl AsyncWrite + Unpin),
+    progress: &mut ForwardProgress,
+    packet: StagedPacket,
+) -> Result<(), PacketIoError> {
+    let wire_length = packet.wire_length();
+    let sequence = src_state.sequence.observe(packet.header.sequence_id());
+    progress.observe_header(packet.header, sequence)?;
+    // The bytes stay in the window's backing buffer until the next fill, which
+    // cannot happen while this call holds the reader.
     src_state.over_read.start += wire_length;
     if src_state.over_read.start >= src_state.over_read.end {
         src_state.over_read.start = 0;
@@ -1158,10 +1180,10 @@ async fn forward_staged_packet(
     }
     src_state.add_in_bytes(wire_length)?;
     src_state.staged_forwards = src_state.staged_forwards.saturating_add(1);
-    let outbound_header = dst_state.next_physical_header(header.payload_length())?;
+    let outbound_header = dst_state.next_physical_header(packet.header.payload_length())?;
     {
-        let payload =
-            &src_state.over_read.buf[start + PHYSICAL_PACKET_HEADER_LEN..start + wire_length];
+        let payload = &src_state.over_read.buf
+            [packet.start + PHYSICAL_PACKET_HEADER_LEN..packet.start + wire_length];
         progress.observe_payload(payload)?;
         dst_state
             .write_forward(
@@ -1177,7 +1199,24 @@ async fn forward_staged_packet(
     }
     src_state.finish_physical_packet()?;
     dst_state.finish_physical_packet()?;
-    progress.finish_physical_packet(header.payload_length())?;
+    progress.finish_physical_packet(packet.header.payload_length())
+}
+
+/// opt#18: forwards one physical packet directly from the source's over-read
+/// window when [`staged_packet`] locates one; otherwise returns `None` and
+/// the caller keeps the existing per-packet read path.
+async fn forward_staged_packet(
+    src_state: &mut ReaderState,
+    dst_state: &mut WriterState,
+    dst_inner: &mut (impl AsyncWrite + Unpin),
+    progress: &mut ForwardProgress,
+    scratch_len: usize,
+    flush_on_complete: bool,
+) -> Result<Option<StagedForward>, PacketIoError> {
+    let Some(packet) = staged_packet(src_state, scratch_len)? else {
+        return Ok(None);
+    };
+    forward_window_packet(src_state, dst_state, dst_inner, progress, packet).await?;
     if progress.is_complete() {
         if flush_on_complete {
             dst_state.flush(dst_inner).await?;
@@ -1185,6 +1224,35 @@ async fn forward_staged_packet(
         return Ok(Some(StagedForward::Complete));
     }
     Ok(Some(StagedForward::Forwarded))
+}
+
+/// What a run classifier decides for one staged packet (opt#19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDecision {
+    /// Forward this packet and keep going.
+    Continue,
+    /// Forward this packet, then stop: the caller handles what it means.
+    StopAfter,
+    /// Do not forward this packet; leave it staged for the caller's own path.
+    StopBefore,
+}
+
+/// A staged single-fragment logical packet presented to a run classifier.
+#[derive(Debug, Clone, Copy)]
+pub struct RunPacket<'a> {
+    /// Payload length of the (single) physical packet.
+    pub payload_length: u32,
+    /// The first `min(payload_length, limit)` payload bytes, still in the window.
+    pub prefix: &'a [u8],
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOutcome {
+    /// Packets forwarded by this run.
+    pub forwarded: u32,
+    /// `true` when the classifier said `StopAfter` on the last forwarded packet.
+    pub stopped_after: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2242,6 +2310,79 @@ where
         }
         forwarded?;
         Ok(progress)
+    }
+
+    /// opt#19: forwards a run of whole single-fragment packets straight from
+    /// this endpoint's over-read window into the buffered destination, asking
+    /// `classify` about each packet (its length and bounded prefix, still in
+    /// the window) before forwarding it. Stops at `max_packets`, when the
+    /// window no longer holds a whole small packet, or per the classifier.
+    /// Each forwarded packet is one complete logical packet; bytes, sequence
+    /// rewrite and accounting are identical to forwarding it alone. Nothing is
+    /// read from the transport: an empty or partial window ends the run and
+    /// the caller's per-packet path fills it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed framing, destination I/O, or accounting error.
+    pub async fn forward_response_run_buffered<B, F>(
+        src: &mut Self,
+        dst: &mut PacketIo<B>,
+        max_packets: u32,
+        prefix_limit: usize,
+        mut classify: F,
+    ) -> Result<RunOutcome, PacketIoError>
+    where
+        B: AsyncWrite + Unpin + DirectionSync,
+        F: FnMut(RunPacket<'_>) -> RunDecision,
+    {
+        let mut outcome = RunOutcome {
+            forwarded: 0,
+            stopped_after: false,
+        };
+        if max_packets == 0 {
+            return Ok(outcome);
+        }
+        src.begin_read_direction()?;
+        dst.begin_write_direction()?;
+        let scratch_len = src.read.stream_buffer_size.get();
+        while outcome.forwarded < max_packets {
+            let Some(packet) = staged_packet(&src.read, scratch_len)? else {
+                break;
+            };
+            // A maximal fragment starts a multi-packet logical packet: leave it
+            // to the read-through path, which follows the fragments.
+            if packet.header.payload_length() >= MAX_PAYLOAD_LEN {
+                break;
+            }
+            let decision = {
+                let payload_start = packet.start + PHYSICAL_PACKET_HEADER_LEN;
+                let prefix = &src.read.over_read.buf
+                    [payload_start..payload_start + packet.payload_length.min(prefix_limit)];
+                classify(RunPacket {
+                    payload_length: packet.header.payload_length(),
+                    prefix,
+                })
+            };
+            if decision == RunDecision::StopBefore {
+                break;
+            }
+            let mut progress = ForwardProgress::new(0);
+            forward_window_packet(
+                &mut src.read,
+                &mut dst.write,
+                &mut dst.inner,
+                &mut progress,
+                packet,
+            )
+            .await?;
+            outcome.forwarded += 1;
+            if decision == RunDecision::StopAfter {
+                outcome.stopped_after = true;
+                break;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Cross-object resumable forward checked only at physical boundaries.
