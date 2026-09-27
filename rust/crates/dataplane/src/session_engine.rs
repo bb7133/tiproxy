@@ -2470,6 +2470,10 @@ impl Engine {
                     traffic: current,
                     local: self.backend.as_ref().is_some_and(|backend| backend.local),
                 });
+                // The handshake observation carried every byte so far: the
+                // shared attribution boundary moves with it, so a session that
+                // ends without a command does not settle them a second time.
+                self.attributed_outbound = current.outbound_bytes;
                 if let Some(backend) = &self.backend {
                     log_session(
                         "connection_ready",
@@ -4016,8 +4020,13 @@ impl Engine {
             self.backend = None;
             return self.close_for_invariant();
         };
-        // The new backend's raw counters start at zero.
-        self.attributed_outbound = 0;
+        // The candidate's counters already hold its authentication/restore
+        // bytes: attribution starts at the activation point, so only command
+        // bytes written from here on are ever settled.
+        self.attributed_outbound = self
+            .backend
+            .as_ref()
+            .map_or(0, |backend| backend.counters.outbound());
         if let Some(registry) = &self.metering {
             let Some(current) = self.backend.as_ref() else {
                 registry.fail_closed();

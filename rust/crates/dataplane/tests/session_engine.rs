@@ -9908,3 +9908,41 @@ async fn deferred_partial_drain_counts_every_byte_once() {
     );
     stack.dispatch_task.abort();
 }
+
+/// opt#13: the handshake observation already carried the handshake bytes, so
+/// a client that disconnects right after the handshake (no command) must not
+/// have them settled a second time at session end.
+#[tokio::test]
+async fn handshake_then_disconnect_settles_nothing_twice() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    drop(client);
+    let mut handshake_outbound = None;
+    let mut settled_bytes = 0;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::HandshakeCompleted { traffic, .. } => {
+                handshake_outbound = Some(traffic.outbound_bytes);
+            }
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        handshake_outbound.is_some_and(|bytes| bytes > 0),
+        "the handshake observation carried the handshake bytes"
+    );
+    assert_eq!(settled_bytes, 0, "nothing is settled again at session end");
+    stack.dispatch_task.abort();
+}
