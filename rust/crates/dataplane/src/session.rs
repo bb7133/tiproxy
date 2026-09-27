@@ -58,12 +58,13 @@
 //! client EOF tears the session down rather than lingering on a half-open
 //! pair.
 
+use std::pin::Pin;
 use std::time::Duration;
 
 use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState, TransitionError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
 
 /// Control-plane commands delivered to one session's loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +380,16 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         let mut next_probe = (!self.config.backend_check_interval.is_zero())
             .then(|| Instant::now() + self.config.backend_check_interval);
 
+        // opt#6: two persistent timers held across loop iterations. Resetting a
+        // timer is a wheel operation, but the deadlines only change on rare
+        // events (handshake/drain arming, and the probe re-arming every
+        // `backend_check_interval`), not per packet. A disabled timer parks at
+        // `far_future` and never fires; its branch guard keeps it inert.
+        let far_future = Instant::now() + Duration::from_secs(86_400);
+        let mut deadline_sleep =
+            Box::pin(sleep_until(armed_deadline.map_or(far_future, |(at, _)| at)));
+        let mut probe_sleep = Box::pin(sleep_until(next_probe.unwrap_or(far_future)));
+
         // The wire engine has at most one unacknowledged command. Its payload
         // stays in the engine; retain only the classified event while a
         // redirect owns the command boundary (Go's processLock).
@@ -397,7 +408,26 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     .await;
                 continue;
             }
-            let action = self.next_action(events, armed_deadline, next_probe).await;
+            // Sync the persistent timers to the current deadlines; reset only
+            // when a deadline actually changed (rare), so the steady-state data
+            // path touches the timer wheel zero times per packet.
+            let deadline_at = armed_deadline.map_or(far_future, |(at, _)| at);
+            if deadline_sleep.deadline() != deadline_at {
+                deadline_sleep.as_mut().reset(deadline_at);
+            }
+            let probe_at = next_probe.unwrap_or(far_future);
+            if probe_sleep.deadline() != probe_at {
+                probe_sleep.as_mut().reset(probe_at);
+            }
+            let action = self
+                .next_action(
+                    events,
+                    &mut deadline_sleep,
+                    &mut probe_sleep,
+                    armed_deadline,
+                    next_probe,
+                )
+                .await;
             match action {
                 LoopAction::ServerShutdown => return LoopEnd::Shutdown,
                 LoopAction::SourceExhausted => return LoopEnd::SourceExhausted,
@@ -460,6 +490,8 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     async fn next_action(
         &mut self,
         events: &mut mpsc::Receiver<SessionEvent>,
+        deadline_sleep: &mut Pin<Box<Sleep>>,
+        probe_sleep: &mut Pin<Box<Sleep>>,
         armed_deadline: Option<(Instant, SessionEvent)>,
         next_probe: Option<Instant>,
     ) -> LoopAction {
@@ -468,9 +500,11 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         if *self.shutdown.borrow() {
             return LoopAction::ServerShutdown;
         }
-        let far_future = Instant::now() + Duration::from_secs(86_400);
-        let deadline_at = armed_deadline.map_or(far_future, |(at, _)| at);
-        let probe_at = next_probe.unwrap_or(far_future);
+        // opt#6: poll the caller's persistent timers instead of building a
+        // fresh `sleep_until` here. A new timer per call armed and (on the
+        // untaken branch) dropped a tokio timer-wheel entry on every packet,
+        // serializing all sessions on the wheel's global mutex. The caller
+        // resets these only when the deadline actually changes.
         tokio::select! {
             biased;
             changed = self.shutdown.changed() => {
@@ -484,13 +518,13 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 Some(command) => LoopAction::Control(command),
                 None => LoopAction::ControlDetached,
             },
-            () = sleep_until(deadline_at), if armed_deadline.is_some() => {
+            () = deadline_sleep.as_mut(), if armed_deadline.is_some() => {
                 match armed_deadline {
                     Some((_, event)) => LoopAction::Deadline(event),
                     None => LoopAction::ChildFinished,
                 }
             }
-            () = sleep_until(probe_at), if next_probe.is_some() => LoopAction::BackendProbe,
+            () = probe_sleep.as_mut(), if next_probe.is_some() => LoopAction::BackendProbe,
             joined = self.children.join_next(), if !self.children.is_empty() => {
                 let _ = joined;
                 LoopAction::ChildFinished
