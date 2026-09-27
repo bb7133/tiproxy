@@ -1202,6 +1202,44 @@ async fn forward_window_packet(
     progress.finish_physical_packet(packet.header.payload_length())
 }
 
+/// opt#20: forwards one located staged packet from the window straight into
+/// the destination's pending forward queue, synchronously. The caller has
+/// already made room in the queue for the whole physical packet, so this
+/// never touches the transport. Source accounting happens first, then the
+/// outbound header is regenerated under the destination sequence and header
+/// plus payload are appended as one physical packet.
+fn forward_window_packet_queued(
+    src_state: &mut ReaderState,
+    dst_state: &mut WriterState,
+    packet: StagedPacket,
+) -> Result<(), PacketIoError> {
+    let wire_length = packet.wire_length();
+    let _sequence = src_state.sequence.observe(packet.header.sequence_id());
+    src_state.over_read.start += wire_length;
+    if src_state.over_read.start >= src_state.over_read.end {
+        src_state.over_read.start = 0;
+        src_state.over_read.end = 0;
+    }
+    src_state.add_in_bytes(wire_length)?;
+    src_state.staged_forwards = src_state.staged_forwards.saturating_add(1);
+    let outbound_header = dst_state.next_physical_header(packet.header.payload_length())?;
+    if dst_state.forward_pending.capacity() == 0 {
+        dst_state
+            .forward_pending
+            .reserve_exact(dst_state.stream_buffer_size.get());
+    }
+    dst_state
+        .forward_pending
+        .extend_from_slice(&outbound_header);
+    dst_state.forward_pending.extend_from_slice(
+        &src_state.over_read.buf
+            [packet.start + PHYSICAL_PACKET_HEADER_LEN..packet.start + wire_length],
+    );
+    src_state.finish_physical_packet()?;
+    dst_state.finish_physical_packet()?;
+    Ok(())
+}
+
 /// opt#18: forwards one physical packet directly from the source's over-read
 /// window when [`staged_packet`] locates one; otherwise returns `None` and
 /// the caller keeps the existing per-packet read path.
@@ -2367,15 +2405,29 @@ where
             if decision == RunDecision::StopBefore {
                 break;
             }
-            let mut progress = ForwardProgress::new(0);
-            forward_window_packet(
-                &mut src.read,
-                &mut dst.write,
-                &mut dst.inner,
-                &mut progress,
-                packet,
-            )
-            .await?;
+            // Make room in the pending queue first (older complete packets
+            // drain before this one, so wire ordering never changes), then
+            // append the packet synchronously.
+            let wire_length = packet.wire_length();
+            let queue_cap = dst.write.stream_buffer_size.get();
+            if wire_length > queue_cap.saturating_sub(dst.write.forward_pending.len()) {
+                dst.write.drain_forward_pending(&mut dst.inner).await?;
+            }
+            if wire_length > queue_cap {
+                // Larger than the queue itself: keep the buffered read-through
+                // semantics (direct transport write) via the existing path.
+                let mut progress = ForwardProgress::new(0);
+                forward_window_packet(
+                    &mut src.read,
+                    &mut dst.write,
+                    &mut dst.inner,
+                    &mut progress,
+                    packet,
+                )
+                .await?;
+            } else {
+                forward_window_packet_queued(&mut src.read, &mut dst.write, packet)?;
+            }
             outcome.forwarded += 1;
             if decision == RunDecision::StopAfter {
                 outcome.stopped_after = true;
