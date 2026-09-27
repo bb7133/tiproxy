@@ -100,7 +100,7 @@ use proxy_io::proxy_protocol::{
 use proxy_io::tls::{
     DEFAULT_CONN_BUFFER_SIZE, accept_frontend, build_backend_config, connect_backend,
 };
-use proxy_io::{InboundProxyV2Header, IoSide, PacketIo, PacketIoError};
+use proxy_io::{InboundProxyV2Header, IoSide, PacketIo, PacketIoError, RunDecision};
 use session_core::auth::{
     AuthEffect, AuthEvent, AuthOutcome, AuthRelay, AuthTurn, BackendTlsMode, CompressionSelection,
     UNKNOWN_AUTH_PLUGIN, classify_backend_auth_packet, compression_selection,
@@ -3405,41 +3405,111 @@ impl Engine {
         // indefinitely on a continuously readable response).
         let mut bypass_since_yield: u32 = 0;
         loop {
-            let forwarded = {
+            // opt#19: after the first packet, forward whole staged packets as
+            // a run: each packet is classified through the observer (state
+            // machine, flush accounting) inside the run without returning to
+            // this loop, and forwarded from the backend's over-read window.
+            // The run ends at a packet whose disposition is not a plain
+            // `Continue` or that needs a flush (that packet is forwarded and
+            // its effect is handled below exactly as before), at the yield
+            // interval, or when the window holds no whole packet (the
+            // per-packet path below then reads through the transport).
+            let mut run_effect: Option<ResponseEffect> = None;
+            let mut run_forwarded: u32 = 0;
+            if !first_packet {
                 let Some(backend) = self.backend.as_mut() else {
                     return Some(WireErrorSource::Proxy);
                 };
-                PacketIo::forward_response_packet_buffered(
+                let run = PacketIo::forward_response_run_buffered(
                     &mut backend.backend_io,
                     &mut self.client_io,
+                    BYPASS_YIELD_INTERVAL
+                        .saturating_sub(bypass_since_yield)
+                        .max(1),
                     RESPONSE_CAPTURE,
+                    |staged| {
+                        let Ok(packet) = ResponsePacket::from_forwarded(
+                            staged.prefix,
+                            u64::from(staged.payload_length),
+                            staged.payload_length,
+                            1,
+                        ) else {
+                            return RunDecision::StopBefore;
+                        };
+                        match observer.observe_backend(packet) {
+                            Ok(effect) => {
+                                let plain =
+                                    matches!(effect.disposition, ResponseDisposition::Continue)
+                                        && matches!(effect.flush, FlushAction::None);
+                                run_effect = Some(effect);
+                                if plain {
+                                    RunDecision::Continue
+                                } else {
+                                    RunDecision::StopAfter
+                                }
+                            }
+                            // Left staged: the per-packet path reads it and
+                            // reports the observer error as it always did.
+                            Err(_) => RunDecision::StopBefore,
+                        }
+                    },
                 )
-                .await
-            };
-            let progress = match forwarded {
-                Ok(progress) => progress,
-                Err(error) => {
-                    // backend -> client forward: attribute a source-read break
-                    // to the backend and a destination-write break to the
-                    // client (IoSide inversion fix).
-                    let source =
-                        classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
-                    let _ = self.events.send(SessionEvent::BackendIoError).await;
-                    return Some(self.end_source(source));
+                .await;
+                match run {
+                    Ok(outcome) => run_forwarded = outcome.forwarded,
+                    Err(error) => {
+                        let source =
+                            classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
+                        let _ = self.events.send(SessionEvent::BackendIoError).await;
+                        return Some(self.end_source(source));
+                    }
                 }
-            };
-            let first_physical = progress.first_packet_length().unwrap_or(0);
-            let Ok(packet) = ResponsePacket::from_forwarded(
-                progress.captured_prefix(),
-                progress.logical_payload_bytes(),
-                first_physical,
-                progress.physical_packets(),
-            ) else {
-                return Some(WireErrorSource::Proxy);
-            };
-            let Ok(effect) = observer.observe_backend(packet) else {
-                let _ = self.events.send(SessionEvent::BackendIoError).await;
-                return Some(WireErrorSource::BackendNetwork);
+                if run_forwarded == 0 {
+                    run_effect = None;
+                }
+            }
+            let effect = if let Some(effect) = run_effect {
+                // Every packet before the last was a bypassed `Continue`.
+                bypass_since_yield = bypass_since_yield.saturating_add(run_forwarded - 1);
+                effect
+            } else {
+                let forwarded = {
+                    let Some(backend) = self.backend.as_mut() else {
+                        return Some(WireErrorSource::Proxy);
+                    };
+                    PacketIo::forward_response_packet_buffered(
+                        &mut backend.backend_io,
+                        &mut self.client_io,
+                        RESPONSE_CAPTURE,
+                    )
+                    .await
+                };
+                let progress = match forwarded {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        // backend -> client forward: attribute a source-read break
+                        // to the backend and a destination-write break to the
+                        // client (IoSide inversion fix).
+                        let source =
+                            classify_packet_io(&error, SideMarker::Backend, SideMarker::Client);
+                        let _ = self.events.send(SessionEvent::BackendIoError).await;
+                        return Some(self.end_source(source));
+                    }
+                };
+                let first_physical = progress.first_packet_length().unwrap_or(0);
+                let Ok(packet) = ResponsePacket::from_forwarded(
+                    progress.captured_prefix(),
+                    progress.logical_payload_bytes(),
+                    first_physical,
+                    progress.physical_packets(),
+                ) else {
+                    return Some(WireErrorSource::Proxy);
+                };
+                let Ok(effect) = observer.observe_backend(packet) else {
+                    let _ = self.events.send(SessionEvent::BackendIoError).await;
+                    return Some(WireErrorSource::BackendNetwork);
+                };
+                effect
             };
             self.in_transaction = effect.in_transaction;
             if !matches!(effect.flush, FlushAction::None) && self.client_io.flush().await.is_err() {

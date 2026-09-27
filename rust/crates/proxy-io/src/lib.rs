@@ -37,7 +37,8 @@ pub use error::{IoSide, PacketIoError};
 pub use packet::{
     DEFAULT_STREAM_BUFFER_SIZE, ForwardProgress, ForwardStatus, ForwardUntilDecision,
     ForwardUntilResult, ForwardUntilStatus, InboundProxyV2Header, LogicalPacket, PacketIo,
-    PacketIoUpgradeState, PacketPreview, PacketReader, PacketWriter,
+    PacketIoUpgradeState, PacketPreview, PacketReader, PacketWriter, RunDecision, RunOutcome,
+    RunPacket,
 };
 pub use pump::{
     BufferPool, BufferPoolStats, DEFAULT_PUMP_BUFFER_SIZE, DEFAULT_WRITE_HIGH_WATER,
