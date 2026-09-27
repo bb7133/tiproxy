@@ -628,8 +628,23 @@ impl WriterState {
                 field: "physical packet payload",
                 length: payload.len(),
             })?;
-        self.start_physical_packet(inner, payload_length).await?;
-        self.write_payload(inner, payload).await?;
+        if self.stream_buffer_size.get() >= PHYSICAL_PACKET_HEADER_LEN
+            && payload.len() <= self.stream_buffer_size.get() - PHYSICAL_PACKET_HEADER_LEN
+        {
+            // Materialized commands use this path rather than packet forward.
+            // Reuse the bounded queue to write their header and payload together,
+            // but drain now even when the caller does not request a flush.
+            self.drain_forward_pending(inner).await?;
+            let header = self.next_physical_header(payload_length)?;
+            self.write_forward(inner, &header, "writing physical packet header", true)
+                .await?;
+            self.write_forward(inner, payload, "writing physical packet payload", true)
+                .await?;
+            self.drain_forward_pending(inner).await?;
+        } else {
+            self.start_physical_packet(inner, payload_length).await?;
+            self.write_payload(inner, payload).await?;
+        }
         self.finish_physical_packet()
     }
 
@@ -646,7 +661,6 @@ impl WriterState {
             })?;
         let mut position = 0_usize;
         for fragment_length in LogicalPacketFragments::new(logical_length) {
-            self.start_physical_packet(inner, fragment_length).await?;
             let fragment_length =
                 usize::try_from(fragment_length).map_err(|_| PacketIoError::CounterOverflow {
                     field: "physical payload length",
@@ -657,8 +671,7 @@ impl WriterState {
                     .ok_or(PacketIoError::CounterOverflow {
                         field: "logical payload offset",
                     })?;
-            self.write_payload(inner, &payload[position..end]).await?;
-            self.finish_physical_packet()?;
+            self.write_physical(inner, &payload[position..end]).await?;
             position = end;
         }
         if flush {
@@ -2629,6 +2642,49 @@ mod tests {
         let mut reader = PacketReader::new(output.as_slice());
         assert_eq!(reader.read_logical(16).await?.payload, b"secret payload");
         assert_eq!(reader.read_logical(16).await?.payload, b"x");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_logical_write_coalesces_without_deferring_until_flush()
+    -> Result<(), Box<dyn Error>> {
+        let size = NonZeroUsize::new(16).ok_or(io::Error::other("nonzero buffer size"))?;
+        let mut writer = PacketWriter::with_stream_buffer_size(CountingWriter::default(), size);
+        writer.write_logical(b"\x03SELECT 1", false).await?;
+        assert_eq!(writer.get_ref().writes, 1);
+        assert_eq!(writer.out_bytes(), 13);
+        assert_eq!(writer.get_ref().flushes, 0);
+
+        // Exactly the queue capacity still fits. A larger packet keeps the
+        // direct header/payload path; an empty packet still emits its header.
+        writer.write_logical(&[1; 12], false).await?;
+        assert_eq!(writer.get_ref().writes, 2);
+        writer.write_logical(&[2; 13], false).await?;
+        assert_eq!(writer.get_ref().writes, 4);
+        writer.write_logical(&[], true).await?;
+        assert_eq!(writer.get_ref().writes, 5);
+        assert_eq!(writer.out_packets(), 4);
+        assert_eq!(writer.out_bytes(), 50);
+        assert_eq!(writer.get_ref().flushes, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logical_write_preserves_queued_response_order_and_sequence()
+    -> Result<(), Box<dyn Error>> {
+        let wire = encoded_physical_packet(b"first", 0)?;
+        let mut src = PacketIo::new(Cursor::new(wire.clone()));
+        let mut dst = PacketIo::new(Cursor::new(Vec::new()));
+        PacketIo::forward_response_packet_buffered(&mut src, &mut dst, 0).await?;
+        assert_eq!(dst.out_bytes(), 0);
+        dst.write_logical(b"next", false).await?;
+        let mut expected = wire;
+        encode_physical_packet(b"next", 1, &mut expected)?;
+        assert_eq!(dst.get_ref().get_ref(), &expected);
+        assert_eq!(dst.out_packets(), 2);
+        assert_eq!(dst.out_bytes(), 17);
+        // No explicit flush is needed to clear the temporary coalescing queue.
+        dst.begin_read_direction()?;
         Ok(())
     }
 
