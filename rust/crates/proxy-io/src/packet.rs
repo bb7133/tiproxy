@@ -515,6 +515,18 @@ impl ReaderState {
         inner: &mut (impl AsyncRead + Unpin),
         payload_limit: usize,
     ) -> Result<LogicalPacket, PacketIoError> {
+        let progress = self.read_logical_progress(inner, payload_limit).await?;
+        Ok(LogicalPacket {
+            payload: progress.captured_prefix.clone(),
+            progress,
+        })
+    }
+
+    async fn read_logical_progress(
+        &mut self,
+        inner: &mut (impl AsyncRead + Unpin),
+        payload_limit: usize,
+    ) -> Result<ForwardProgress, PacketIoError> {
         // Materialized commands share the same bounded scratch as forwarding.
         // Restore it on errors too (including a fully drained oversized packet).
         let mut scratch = std::mem::take(&mut self.forward_scratch);
@@ -530,7 +542,7 @@ impl ReaderState {
         inner: &mut (impl AsyncRead + Unpin),
         payload_limit: usize,
         scratch: &mut Vec<u8>,
-    ) -> Result<LogicalPacket, PacketIoError> {
+    ) -> Result<ForwardProgress, PacketIoError> {
         let mut progress = ForwardProgress::new(payload_limit);
         loop {
             let (header, sequence) = self.read_header(inner).await?;
@@ -558,10 +570,7 @@ impl ReaderState {
                 observed: progress.logical_payload_bytes(),
             });
         }
-        Ok(LogicalPacket {
-            payload: progress.captured_prefix.clone(),
-            progress,
-        })
+        Ok(progress)
     }
 
     async fn read_payload_into_progress(
@@ -1867,6 +1876,26 @@ where
         self.read.read_logical(&mut self.inner, payload_limit).await
     }
 
+    /// Reads a logical payload without retaining a second copy in framing
+    /// observations. Uses the same limits, sequence tracking and accounting as
+    /// [`Self::read_logical`], transferring the captured payload to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed framing/I/O error, or a size error after draining an
+    /// oversized message.
+    pub async fn read_logical_payload(
+        &mut self,
+        payload_limit: usize,
+    ) -> Result<Vec<u8>, PacketIoError> {
+        self.begin_read_direction()?;
+        let progress = self
+            .read
+            .read_logical_progress(&mut self.inner, payload_limit)
+            .await?;
+        Ok(progress.captured_prefix)
+    }
+
     /// Reads exactly `buf.len()` raw bytes directly from the transport,
     /// bypassing `MySQL` framing (used for a transport-level preamble such as a
     /// PROXY v2 header). The raw prefix is empty at probe time, so this reads
@@ -2521,6 +2550,30 @@ mod tests {
         assert_eq!(final_packet.progress.captured_prefix(), b"z");
         assert_eq!(reader.state.forward_scratch.as_ptr(), scratch);
         assert_eq!(reader.in_packets(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payload_only_read_preserves_peek_limits_and_accounting() -> Result<(), Box<dyn Error>>
+    {
+        let mut wire = encoded_physical_packet(&[], 0)?;
+        encode_physical_packet(b"oversized", 1, &mut wire)?;
+        encode_physical_packet(b"\x03SELECT 1", 2, &mut wire)?;
+        let wire_len = wire.len() as u64;
+        let mut reader = PacketIo::new(Cursor::new(wire));
+        assert!(reader.read_logical_payload(0).await?.is_empty());
+        assert!(matches!(
+            reader.read_logical_payload(3).await,
+            Err(PacketIoError::LogicalPayloadTooLarge {
+                limit: 3,
+                observed: 9
+            })
+        ));
+        assert_eq!(reader.peek_packet().await?.first_byte, Some(3));
+        assert_eq!(reader.read_logical_payload(9).await?, b"\x03SELECT 1");
+        assert_eq!(reader.in_bytes(), wire_len);
+        assert_eq!(reader.in_packets(), 3);
+        assert_eq!(reader.expected_read_sequence(), 3);
         Ok(())
     }
 

@@ -2620,9 +2620,9 @@ impl Engine {
                             (CommandIntake::Streamed(command), started)
                         }
                         PeekDecision::Materialize => {
-                            match self.client_io.read_logical(COMMAND_PAYLOAD_LIMIT).await {
-                                Ok(packet) => {
-                                    (CommandIntake::Materialized(packet.payload), started)
+                            match self.client_io.read_logical_payload(COMMAND_PAYLOAD_LIMIT).await {
+                                Ok(payload) => {
+                                    (CommandIntake::Materialized(payload), started)
                                 }
                                 Err(error) => {
                                     let source = self.client_read_end(&error).await;
