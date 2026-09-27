@@ -9615,3 +9615,163 @@ async fn probe_due_while_commands_are_queued_keeps_completing() {
     stack.dispatch_task.abort();
     stack.server_task.abort();
 }
+
+/// opt#13: a queued `COM_STMT_CLOSE` must not wait for a next command that is
+/// only partially here. The client sends the close, then just the header and
+/// command byte of a `COM_STMT_PREPARE` and stalls; the backend must still
+/// receive the close promptly. Completing the prepare afterwards works.
+#[tokio::test]
+async fn deferred_close_is_flushed_when_the_next_command_is_incomplete() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is written");
+    // Header (7-byte payload, sequence 0) plus the COM_STMT_PREPARE byte only.
+    let prefix = [7_u8, 0, 0, 0, 0x16];
+    assert!(client.writer.get_mut().write_all(&prefix).await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    let close_seen = timeout(Duration::from_secs(2), async {
+        loop {
+            let seen = stack
+                .backend_transcript
+                .lock()
+                .ok()
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.first() == Some(&0x19))
+                });
+            if seen {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        close_seen,
+        Ok(true),
+        "a stalled partial next command does not hold the queued close"
+    );
+    // Finish the prepare: the rest of its payload, then its OK response.
+    assert!(client.writer.get_mut().write_all(b"NOMETA").await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    client.reader.reset_sequence(1);
+    let Ok(response) = client.reader.read_logical(64 * 1024).await else {
+        unreachable!("the completed prepare is answered")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: the bytes of a queued `COM_STMT_CLOSE` are attributed to the close
+/// exactly once — on an idle flush they are neither lost nor charged to the
+/// following command.
+#[tokio::test]
+async fn deferred_close_traffic_is_attributed_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is written");
+    // Idle: the queued close is flushed without a next command.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client.query_ok("SELECT 1").await);
+    client.quit().await;
+    let mut close_traffic = None;
+    let mut query_after_close = None;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        if let Observation::CommandCompleted {
+            command, traffic, ..
+        } = observation
+        {
+            match command {
+                session_core::command::Command::StmtClose => close_traffic = Some(traffic),
+                session_core::command::Command::Query if close_traffic.is_some() => {
+                    query_after_close = Some(traffic);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(close_traffic) = close_traffic else {
+        unreachable!("the close is observed")
+    };
+    // COM_STMT_CLOSE: 4-byte header + 5-byte payload, one physical packet.
+    assert_eq!(close_traffic.outbound_bytes, 9);
+    assert_eq!(close_traffic.outbound_packets, 1);
+    let Some(query_after_close) = query_after_close else {
+        unreachable!("the query after the close is observed")
+    };
+    // COM_QUERY "SELECT 1": 4-byte header + 9-byte payload, nothing from the close.
+    assert_eq!(query_after_close.outbound_bytes, 13);
+    assert_eq!(query_after_close.outbound_packets, 1);
+    stack.dispatch_task.abort();
+}
+
+/// A maximal first packet whose command byte is unknown is refused from the
+/// header and ends the session after exactly one error: the prefix is never
+/// consumed, so continuing would answer the same prefix forever.
+#[tokio::test]
+async fn oversized_unknown_command_ends_the_session_after_one_error() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    // Header: payload length 0xFF_FFFF, sequence 0; then a byte that is not a command.
+    let prefix = [0xFF_u8, 0xFF, 0xFF, 0x00, 0x7F];
+    assert!(client.writer.get_mut().write_all(&prefix).await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    client.reader.reset_sequence(1);
+    let Ok(Ok(error)) = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await
+    else {
+        unreachable!("one error packet answers the refused command")
+    };
+    assert_eq!(error.payload.first(), Some(&0xFF));
+    assert_eq!(
+        u16::from_le_bytes([error.payload[1], error.payload[2]]),
+        1047,
+        "unknown command"
+    );
+    let next = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        matches!(next, Ok(Err(_))),
+        "the session ends instead of answering the same prefix again: {next:?}"
+    );
+    stack.dispatch_task.abort();
+}

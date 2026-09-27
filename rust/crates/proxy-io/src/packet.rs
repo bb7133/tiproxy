@@ -2294,9 +2294,34 @@ where
     /// Returns an encoding or destination I/O error (a fragment too large for
     /// the bounded queue is written through directly).
     pub async fn write_logical_deferred(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+        // A layered transport resets its own sequence per command and must
+        // never see queued bytes across that boundary: refuse rather than
+        // rely on every caller checking `is_layered` first.
+        if self.inner.is_layered() {
+            return Err(PacketIoError::io(
+                IoSide::Destination,
+                "deferring a write",
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "deferred writes are not supported on a layered transport",
+                ),
+            ));
+        }
+        self.begin_write_direction()?;
         self.write
             .write_logical_deferred(&mut self.inner, payload)
             .await
+    }
+
+    /// Bytes already staged above the transport for reading (prefetch window,
+    /// raw prefix, over-read window), in stream order. After a `peek_packet`
+    /// this tells whether the whole first physical packet can be read without
+    /// touching the transport.
+    #[must_use]
+    pub fn staged_read_len(&self) -> usize {
+        self.read.prefetched_len()
+            + self.read.raw_prefix_slice().len()
+            + self.read.over_read.pending().len()
     }
 
     /// Whether queued output is waiting for a write, drain, or flush.

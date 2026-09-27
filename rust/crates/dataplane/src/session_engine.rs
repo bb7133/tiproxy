@@ -87,9 +87,10 @@ use control_router::{
 use control_routing::{RouteAssignment, RouteResult};
 use mysql_wire::limits::MAX_PHYSICAL_PAYLOAD_LEN;
 use mysql_wire::{
-    Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
-    encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
-    parse_handshake_response, parse_ssl_request,
+    Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams,
+    PHYSICAL_PACKET_HEADER_LEN, StatusFlags, encode_error_packet, encode_handshake_response,
+    encode_initial_handshake, encode_ssl_request, parse_handshake_response, parse_ssl_request,
+    physical_packet_count,
 };
 use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
 use proxy_io::counted::{ByteCounters, CountedIo};
@@ -807,6 +808,7 @@ async fn run_bound_session_observed(
         wire_end: None,
         quit_source: QuitSource::None,
         closing: false,
+        deferred_outbound: BackendTraffic::default(),
         accepted_at,
         handshake_deadline: loop_config.handshake_deadline,
         frontend_tls_active: false,
@@ -1410,6 +1412,12 @@ struct Engine {
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
     closing: bool,
+    /// opt#13: wire bytes of no-response commands queued on the backend
+    /// writer and already attributed to their own command observation
+    /// (packet counts are taken by the framing layer at queue time). Folded
+    /// into the next command's traffic baseline, or cleared on an idle
+    /// flush, so the bytes are counted exactly once.
+    deferred_outbound: BackendTraffic,
     accepted_at: tokio::time::Instant,
     /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
     /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
@@ -2534,6 +2542,16 @@ impl Engine {
         // (advancing the shared sequence) when the control arm won the select.
         let mut just_served_control = false;
         let mut snapshot_updates_open = true;
+        // opt#13: on a plaintext/TLS client leg, let one transport read stage
+        // whatever the client already sent (the same bounded over-read window
+        // the backend reader uses). The deferred-write decision below then
+        // knows whether the whole next command is present without blocking,
+        // and a small command costs one `recvfrom` instead of two. A layered
+        // client leg keeps exact reads: its per-command sequence reset must
+        // not find staged bytes.
+        if !self.client_io.is_layered() {
+            self.client_io.enable_read_buffering();
+        }
         let first_health_recheck = tokio::time::Instant::now() + BACKEND_HEALTH_RECHECK_INTERVAL;
         let mut health_recheck =
             tokio::time::interval_at(first_health_recheck, BACKEND_HEALTH_RECHECK_INTERVAL);
@@ -2578,17 +2596,26 @@ impl Engine {
                     peeked = self.client_io.peek_packet() => Some(peeked),
                     () = std::future::ready(()) => None,
                 };
-                match staged {
-                    Some(Ok(_)) => {}
+                // Keep the queue only when the whole next command is staged
+                // and can be consumed without another transport read; a
+                // header-only or partial command (a client that stalls
+                // mid-packet) must not hold the queued command hostage.
+                let whole_next_command_staged = match staged {
+                    Some(Ok(preview)) => {
+                        let payload_length = preview.first_packet_length as usize;
+                        payload_length < MAX_PHYSICAL_PAYLOAD_LEN
+                            && self.client_io.staged_read_len()
+                                >= PHYSICAL_PACKET_HEADER_LEN + payload_length
+                    }
                     Some(Err(error)) => {
                         let source = self.client_read_end(&error).await;
                         return Some(source);
                     }
-                    None => {
-                        if let Some(source) = self.flush_deferred_backend_write().await {
-                            return Some(source);
-                        }
-                    }
+                    None => false,
+                };
+                if !whole_next_command_staged && !self.flush_deferred_backend_write_quiet().await {
+                    let _ = self.events.send(SessionEvent::BackendIoError).await;
+                    return Some(WireErrorSource::BackendNetwork);
                 }
             }
             let (intake, command_started) = tokio::select! {
@@ -2639,10 +2666,17 @@ impl Engine {
                         // would reintroduce exactly the allocation this row
                         // exists to remove — so it is refused from the header.
                         PeekDecision::RejectUnknown => {
+                            // The peeked prefix is never consumed, so the
+                            // session cannot continue: end it explicitly with
+                            // the same attribution the layered-sequence guard
+                            // used to produce here, instead of re-peeking the
+                            // same prefix and answering the error forever.
                             let _ = self
                                 .write_client_error(1047, *b"08S01", "Unknown command")
                                 .await;
-                            continue;
+                            self.quit_source = QuitSource::ProxyError;
+                            let _ = self.events.send(SessionEvent::ClientIoError).await;
+                            return Some(WireErrorSource::Proxy);
                         }
                         PeekDecision::Stream(command) => {
                             (CommandIntake::Streamed(command), started)
@@ -2706,7 +2740,7 @@ impl Engine {
                 streamed,
                 started: command_started,
                 since_connection: command_started.saturating_duration_since(self.accepted_at),
-                traffic_before: self.backend_traffic(),
+                traffic_before: self.intake_traffic_baseline(),
             });
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
@@ -3099,6 +3133,17 @@ impl Engine {
             let deferred =
                 !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
             let written = if deferred {
+                // The bytes are attributed to this command now (they leave
+                // with the next write or flush); the next command's baseline
+                // skips them so they are counted exactly once.
+                let payload_len = u64::try_from(pending.payload.len()).unwrap_or(u64::MAX);
+                let packets = physical_packet_count(payload_len);
+                let header_len = u64::try_from(PHYSICAL_PACKET_HEADER_LEN).unwrap_or(u64::MAX);
+                self.deferred_outbound.outbound_bytes = self
+                    .deferred_outbound
+                    .outbound_bytes
+                    .saturating_add(payload_len)
+                    .saturating_add(header_len.saturating_mul(packets));
                 backend
                     .backend_io
                     .write_logical_deferred(&pending.payload)
@@ -3737,23 +3782,58 @@ impl Engine {
     /// Executes one out-of-band command (control effects, probes).
     /// Writes out a deferred no-response command (opt#13) before anything
     /// that leaves the plain command loop: control effects, probes, and the
-    /// paths that swap or read the backend all see a drained queue.
-    async fn flush_deferred_backend_write(&mut self) -> Option<WireErrorSource> {
-        let backend = self.backend.as_mut()?;
+    /// paths that swap or read the backend all see a drained queue. Returns
+    /// whether the backend writer is still usable; never touches the event
+    /// queue, so it is safe while the loop may be waiting on a reply.
+    async fn flush_deferred_backend_write_quiet(&mut self) -> bool {
+        let Some(backend) = self.backend.as_mut() else {
+            return true;
+        };
         if !backend.backend_io.has_deferred_write() {
-            return None;
+            return true;
         }
         if backend.backend_io.flush().await.is_err() {
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
-            return Some(WireErrorSource::BackendNetwork);
+            return false;
         }
-        None
+        // The bytes are on the wire and in the raw counters now; the next
+        // command's baseline is taken after this point.
+        self.deferred_outbound = BackendTraffic::default();
+        true
+    }
+
+    /// Traffic baseline for a command taken in: raw counters plus whatever
+    /// queued no-response bytes are still ahead of it on the writer (already
+    /// attributed to their own command), so a later drain inside this
+    /// command's window is not counted twice.
+    fn intake_traffic_baseline(&mut self) -> BackendTraffic {
+        let mut baseline = self.backend_traffic();
+        baseline.outbound_bytes = baseline
+            .outbound_bytes
+            .saturating_add(self.deferred_outbound.outbound_bytes);
+        self.deferred_outbound = BackendTraffic::default();
+        baseline
     }
 
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
         // A control command may redirect, probe, or drain the backend: the
         // queued no-response command must reach the current backend first.
-        let _ = self.flush_deferred_backend_write().await;
+        // If it cannot, the wire is over: answer the request (the loop may be
+        // waiting on the reply, so nothing is sent on the event queue here)
+        // and abandon the wire phase with the backend-network attribution.
+        if !self.flush_deferred_backend_write_quiet().await {
+            self.closing = true;
+            self.wire_end.get_or_insert(WireErrorSource::BackendNetwork);
+            match cmd {
+                EngineCmd::Probe(reply) => {
+                    let _ = reply.send(false);
+                }
+                EngineCmd::PrepareRedirect(_) => {}
+                EngineCmd::Effect(effect) => {
+                    let _ = self.handle_effect(effect).await;
+                }
+            }
+            return Awaited::Closing;
+        }
         match cmd {
             EngineCmd::Probe(reply) => {
                 let _ = reply.send(self.backend_alive());
@@ -4935,7 +5015,11 @@ impl Engine {
     }
 
     fn record_command(&self, pending: &PendingCommand) {
-        let current = self.backend_traffic();
+        let mut current = self.backend_traffic();
+        // Queued no-response bytes belong to the command that queued them.
+        current.outbound_bytes = current
+            .outbound_bytes
+            .saturating_add(self.deferred_outbound.outbound_bytes);
         let traffic = BackendTraffic {
             inbound_bytes: current
                 .inbound_bytes
