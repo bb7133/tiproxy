@@ -101,6 +101,36 @@ pub trait SessionEventSource: Send + 'static {
     /// Waits for the next classified event. `None` means the transport is
     /// exhausted (both directions closed at the wire level).
     fn next_event(&mut self) -> impl Future<Output = Option<SessionEvent>> + Send;
+
+    /// A source that is already a bounded channel of classified events may
+    /// hand that channel to the loop so it is read directly, without the
+    /// classifier pump task in between. Generic sources (which poll a
+    /// transport and need the pump's cancel protection) keep the default.
+    ///
+    /// Contract for an implementation that returns `Ok`:
+    /// - the channel carries only already-classified `SessionEvent`s;
+    /// - `recv` on it is cancel-safe (the loop selects over it);
+    /// - handing over the receiver does not transfer any other resource:
+    ///   whatever the source owns besides the channel must still be released
+    ///   by the source's owner (for the engine's `EventRx` there is nothing
+    ///   else). When the loop finally drops the receiver, the producer's
+    ///   `send` fails; the producer's sender is not dropped by the loop.
+    ///
+    /// Nothing about FSM admission changes: a `ClientCommand` still waits for
+    /// its admission ACK, the FSM enters the in-command state before that ACK
+    /// is produced, response/prepare events arise only while in flight, and
+    /// the next command stays bound by the existing ACK/event order.
+    ///
+    /// # Errors
+    /// Returns `Err(self)` when the source is not a plain classified channel
+    /// and must keep being polled through the pump; the source is handed back
+    /// unchanged.
+    fn into_event_channel(self) -> Result<mpsc::Receiver<SessionEvent>, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
 }
 
 /// Executes FSM effects. Implementations borrow the session's child set to
@@ -269,26 +299,38 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // future to completion, and hands events over a bounded channel.
         // `events.recv()` below is cancel-safe, so losing a select race
         // can never drop a half-polled classifier future.
-        let (event_tx, mut events) = mpsc::channel::<SessionEvent>(EVENT_PUMP_CAPACITY);
         // `new` always fills the slot; `run` consumes `self`.
-        let Some(mut source) = self.source.take() else {
+        let Some(source) = self.source.take() else {
             unreachable!("session source taken twice")
         };
-        let pump: JoinHandle<()> = tokio::spawn(async move {
-            loop {
-                // Reserve the slot **before** touching the transport: the
-                // classifier reads at most one event ahead of the loop,
-                // so transport backpressure is real (an unconsumed event
-                // never triggers speculative classification of the next).
-                let Ok(permit) = event_tx.reserve().await else {
-                    break;
-                };
-                match source.next_event().await {
-                    Some(event) => permit.send(event),
-                    None => break,
+        // A pre-classified channel source (the engine's `EventRx`) is read
+        // directly: the pump would only forward events from one one-slot
+        // channel into another, so this removes that task/channel forward on
+        // the engine path. Every other source keeps the pump and its cancel
+        // protection.
+        let (mut events, pump): (mpsc::Receiver<SessionEvent>, Option<JoinHandle<()>>) =
+            match source.into_event_channel() {
+                Ok(events) => (events, None),
+                Err(mut source) => {
+                    let (event_tx, events) = mpsc::channel::<SessionEvent>(EVENT_PUMP_CAPACITY);
+                    let pump: JoinHandle<()> = tokio::spawn(async move {
+                        loop {
+                            // Reserve the slot **before** touching the transport: the
+                            // classifier reads at most one event ahead of the loop,
+                            // so transport backpressure is real (an unconsumed event
+                            // never triggers speculative classification of the next).
+                            let Ok(permit) = event_tx.reserve().await else {
+                                break;
+                            };
+                            match source.next_event().await {
+                                Some(event) => permit.send(event),
+                                None => break,
+                            }
+                        }
+                    });
+                    (events, Some(pump))
                 }
-            }
-        });
+            };
 
         let end = self.event_loop(&mut events).await;
         // One absolute budget for the whole terminal sequence.
@@ -297,9 +339,14 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // must release before any teardown child is waited on, so
         // teardown work that needs the transport's file descriptors or
         // locks cannot deadlock against the pump.
+        // Dropping the receiver closes the producer's sender either way: for
+        // the direct channel the engine's sends now fail exactly as they did
+        // once the pump (which owned the receiver) was aborted.
         drop(events);
-        pump.abort();
-        self.cleanup_within_deadline &= timeout_at(cleanup_by, pump).await.is_ok();
+        if let Some(pump) = pump {
+            pump.abort();
+            self.cleanup_within_deadline &= timeout_at(cleanup_by, pump).await.is_ok();
+        }
         // Terminal accounting: reach Closed through the FSM when possible so
         // teardown effects execute exactly once.
         let end = match end {

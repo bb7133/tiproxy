@@ -426,6 +426,10 @@ impl SessionEventSource for EventRx {
     async fn next_event(&mut self) -> Option<SessionEvent> {
         self.events.recv().await
     }
+
+    fn into_event_channel(self) -> Result<mpsc::Receiver<SessionEvent>, Self> {
+        Ok(self.events)
+    }
 }
 
 /// The effect-handler half: forwards each FSM effect into the engine's

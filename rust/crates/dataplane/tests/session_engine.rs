@@ -9529,3 +9529,81 @@ async fn reloaded_backend_tls_requirement_binds_the_next_session_only() {
     plane.shutdown().await;
     backend.shutdown().await;
 }
+
+// ---------------------------------------------------------------------
+// Direct engine event channel (no classifier pump): probes due while
+// commands are queued
+// ---------------------------------------------------------------------
+
+/// With the loop reading the engine's classified channel directly, the engine
+/// can be parked in its one-slot `events` send at the moment the loop's backend
+/// probe becomes due. The probe must still be serviced (the engine answers
+/// `Probe` while awaiting the command's admission ACK) and the command stream
+/// must keep completing: a 5 ms probe interval against a burst of commands
+/// exercises probes becoming due around queued commands many times, and any
+/// lost ACK or send/probe wait cycle shows up as a hang caught by the timeouts.
+/// Scope: liveness smoke only; the deterministic "probe selected before a
+/// queued `ClientCommand`" ordering is covered at the loop level in
+/// `tests/session_loop.rs`.
+#[tokio::test]
+async fn probe_due_while_commands_are_queued_keeps_completing() {
+    // Fixed count under one total budget (CI-speed independent): the probe
+    // interval is far shorter than a command round-trip, so probes become due
+    // between and around queued commands throughout the burst.
+    const BURST_COMMANDS: u32 = 64;
+    let stack = spawn_stack_full(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(5),
+        false,
+        None,
+    )
+    .await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("handshake+auth completes end to end")
+    };
+    let burst = timeout(Duration::from_secs(30), async {
+        for index in 0..BURST_COMMANDS {
+            assert!(
+                client.query_ok("SELECT 1").await,
+                "command {index} completes while probes keep becoming due"
+            );
+        }
+    })
+    .await;
+    assert!(
+        burst.is_ok(),
+        "the {BURST_COMMANDS}-command burst finishes within its budget"
+    );
+    // Let probes run in the probe-safe idle state, then prove the session
+    // still serves a command and closes within the budget.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        timeout(Duration::from_secs(5), client.query_ok("SELECT 2"))
+            .await
+            .unwrap_or(false),
+        "a command after idle probes still round-trips"
+    );
+    stack.shutdown_tx.send(true).ok();
+    let closed = timeout(
+        Duration::from_secs(5),
+        wait_sent(
+            &stack.sender,
+            |e| matches!(&e.body, Some(Body::ConnectionEvent(event)) if event.kind == 3),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Some(_))),
+        "session closes within the budget after the probe/command interleaving"
+    );
+    drop(client);
+    stack.dispatch_task.abort();
+    stack.server_task.abort();
+}

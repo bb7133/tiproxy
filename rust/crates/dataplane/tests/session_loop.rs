@@ -1232,3 +1232,153 @@ async fn next_command_waits_for_redirect_after_commit() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Direct engine event channel: a due probe is selected before a queued
+// command
+// ---------------------------------------------------------------------
+
+/// A source that is already a one-slot channel of classified events (the
+/// shape of the engine's `EventRx`) and hands that channel to the loop.
+struct DirectChannelSource {
+    rx: mpsc::Receiver<SessionEvent>,
+}
+
+impl DirectChannelSource {
+    fn new() -> (mpsc::Sender<SessionEvent>, Self) {
+        let (tx, rx) = mpsc::channel(1);
+        (tx, Self { rx })
+    }
+}
+
+impl SessionEventSource for DirectChannelSource {
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        self.rx.recv().await
+    }
+
+    fn into_event_channel(self) -> Result<mpsc::Receiver<SessionEvent>, Self> {
+        Ok(self.rx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Probe,
+    Effect(SessionEffect),
+}
+
+/// Records probes and effects in one sequence so their relative order is
+/// observable, and can park the loop inside one chosen effect until the test
+/// releases it (the FSM has already transitioned when effects execute).
+struct OrderRecorder {
+    marks: Arc<Mutex<Vec<Mark>>>,
+    park_on: SessionEffect,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl OrderRecorder {
+    fn record(&self, mark: Mark) {
+        match self.marks.lock() {
+            Ok(mut marks) => marks.push(mark),
+            Err(poisoned) => poisoned.into_inner().push(mark),
+        }
+    }
+}
+
+impl EffectHandler for OrderRecorder {
+    async fn execute(&mut self, effect: SessionEffect, _children: &mut JoinSet<()>) {
+        self.record(Mark::Effect(effect));
+        if effect == self.park_on {
+            // Hold the loop here until the test opens the gate.
+            let permit = self.gate.acquire().await;
+            drop(permit);
+        }
+    }
+
+    async fn backend_active(&mut self) -> bool {
+        self.record(Mark::Probe);
+        true
+    }
+}
+
+/// With the loop reading the engine's classified channel directly, a probe
+/// that is due while a `ClientCommand` already sits in the one-slot channel
+/// must be selected first (the `biased` select order), answered, and only
+/// then must the command be admitted and forwarded; the command still
+/// completes and the session still closes within the budget.
+///
+/// The interleaving is exact: the loop is parked inside the last handshake
+/// effect (state already `Ready`), the command is queued into the unpolled
+/// slot, the paused clock moves past the probe deadline while everything is
+/// idle, and only then is the loop released.
+#[tokio::test(start_paused = true)]
+async fn due_probe_is_selected_before_a_queued_command_on_the_direct_channel() {
+    let (event_tx, source) = DirectChannelSource::new();
+    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler = OrderRecorder {
+        marks: Arc::new(Mutex::new(Vec::new())),
+        park_on: SessionEffect::ForwardAuthResultToClient,
+        gate: Arc::clone(&gate),
+    };
+    let marks = Arc::clone(&handler.marks);
+    let config = SessionLoopConfig {
+        backend_check_interval: Duration::from_secs(1),
+        ..SessionLoopConfig::default()
+    };
+    let run =
+        tokio::spawn(SessionLoop::new(source, handler, control_rx, shutdown_rx, config).run());
+    for event in HANDSHAKE {
+        let _ = event_tx.send(event).await;
+    }
+    quiesce().await;
+    assert!(
+        locked(&marks).contains(&Mark::Effect(SessionEffect::ForwardAuthResultToClient)),
+        "the loop is parked inside the last handshake effect: {:?}",
+        locked(&marks)
+    );
+    assert!(
+        !locked(&marks).contains(&Mark::Probe),
+        "no probe before the session is idle at Ready"
+    );
+
+    // Queue the command into the unpolled slot, let the probe become due
+    // while the loop is parked, then release the loop.
+    assert!(
+        event_tx.try_send(SessionEvent::ClientCommand).is_ok(),
+        "the one-slot channel accepts the queued command"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let parked_marks = locked(&marks).len();
+    gate.add_permits(1);
+    quiesce().await;
+
+    let after = locked(&marks)[parked_marks..].to_vec();
+    assert_eq!(
+        after.first(),
+        Some(&Mark::Probe),
+        "the due probe is selected before the queued command: {after:?}"
+    );
+    let probe_index = after.iter().position(|m| *m == Mark::Probe);
+    let forward_index = after
+        .iter()
+        .position(|m| *m == Mark::Effect(SessionEffect::ForwardCommandToBackend));
+    assert!(
+        forward_index.is_some() && probe_index < forward_index,
+        "the queued command is admitted after the probe: {after:?}"
+    );
+
+    // The command completes and the session closes within the budget.
+    let _ = event_tx.send(SessionEvent::BackendResponseTxnDone).await;
+    quiesce().await;
+    assert!(
+        locked(&marks).contains(&Mark::Effect(SessionEffect::ForwardResponseToClient)),
+        "the response is forwarded after the probe/command interleaving"
+    );
+    let _ = shutdown_tx.send(true);
+    quiesce().await;
+    let Ok(Ok(summary)) = tokio::time::timeout(Duration::from_secs(30), run).await else {
+        unreachable!("the loop exits within the budget and its task completes")
+    };
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+}
