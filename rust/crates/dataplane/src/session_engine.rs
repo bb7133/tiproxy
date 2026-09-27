@@ -807,7 +807,8 @@ async fn run_bound_session_observed(
         wire_end: None,
         quit_source: QuitSource::None,
         closing: false,
-        unsettled_outbound_from: None,
+        attributed_outbound: 0,
+        wire_failed: false,
         accepted_at,
         handshake_deadline: loop_config.handshake_deadline,
         frontend_tls_active: false,
@@ -1411,13 +1412,20 @@ struct Engine {
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
     closing: bool,
-    /// opt#13: raw outbound counter value at which a queued no-response
-    /// command's bytes start. Set when a command is queued rather than
-    /// written; cleared by the command observation whose window drains the
-    /// queue, or by a flush that publishes the raw delta since this point
-    /// as [`Observation::BackendTrafficSettled`]. Raw bytes are therefore
-    /// counted exactly once and never estimated ahead of the write.
-    unsettled_outbound_from: Option<u64>,
+    /// opt#13: raw outbound counter value (current backend) up to which
+    /// bytes have been attributed to an observation — by a command's
+    /// window or by a pure-traffic settlement. Both start from this shared
+    /// boundary, so a queued no-response command's bytes are counted
+    /// exactly once wherever they leave (inside a later command's write,
+    /// on an idle/control flush, at session end) and never estimated ahead
+    /// of the write. Reset to zero when the backend (and its counters) is
+    /// swapped.
+    attributed_outbound: u64,
+    /// opt#13: set once a queued no-response command could not be written.
+    /// From then on control commands are answered but only teardown effects
+    /// run, whatever a later flush reports (a failed drain empties the
+    /// queue, so the flush result alone is not a durable gate).
+    wire_failed: bool,
     accepted_at: tokio::time::Instant,
     /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
     /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
@@ -1612,7 +1620,7 @@ impl Engine {
         // wire phase leaves with this flush; its raw bytes (and any earlier
         // drained ones no observation covered) are settled here.
         let _ = self.flush_deferred_backend_write_quiet().await;
-        self.settle_unsettled_outbound();
+        self.settle_outbound();
         if let Some(source) = end {
             self.wire_end.get_or_insert(source);
             if self.quit_source == QuitSource::None {
@@ -3137,7 +3145,6 @@ impl Engine {
             // per-command sequence reset cannot run over queued bytes.
             let deferred =
                 !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
-            let outbound_before = backend.counters.outbound();
             let written = if deferred {
                 backend
                     .backend_io
@@ -3149,13 +3156,9 @@ impl Engine {
                     .write_logical(&pending.payload, true)
                     .await
             };
-            let queued = backend.backend_io.has_deferred_write();
             if written.is_err() {
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
-            }
-            if queued {
-                self.unsettled_outbound_from.get_or_insert(outbound_before);
             }
             return None;
         }
@@ -3794,23 +3797,22 @@ impl Engine {
         if backend.backend_io.flush().await.is_err() {
             return false;
         }
-        self.settle_unsettled_outbound();
+        self.settle_outbound();
         true
     }
 
-    /// Publishes the raw outbound bytes written since the queued command's
-    /// boundary as a pure traffic observation and clears the boundary. Used
-    /// after a flush outside any command window and at session end, so
-    /// queued bytes are attributed exactly once even when no command
+    /// Publishes the raw outbound bytes written since the shared attributed
+    /// boundary as a pure traffic observation and advances the boundary.
+    /// Used after a flush outside any command window and at session end,
+    /// so queued bytes are attributed exactly once even when no command
     /// observation follows (idle disconnect, control command, teardown).
-    fn settle_unsettled_outbound(&mut self) {
-        let Some(boundary) = self.unsettled_outbound_from.take() else {
-            return;
-        };
+    fn settle_outbound(&mut self) {
         let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        let outbound_bytes = backend.counters.outbound().saturating_sub(boundary);
+        let current = backend.counters.outbound();
+        let outbound_bytes = current.saturating_sub(self.attributed_outbound);
+        self.attributed_outbound = current;
         if outbound_bytes == 0 {
             return;
         }
@@ -3827,10 +3829,15 @@ impl Engine {
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
         // A control command may redirect, probe, or drain the backend: the
         // queued no-response command must reach the current backend first.
-        // If it cannot, the wire is over: answer the request (the loop may be
-        // waiting on the reply, so nothing is sent on the event queue here)
-        // and abandon the wire phase with the backend-network attribution.
-        if !self.flush_deferred_backend_write_quiet().await {
+        // If it cannot (now or earlier — `wire_failed` is durable, a failed
+        // drain empties the queue so a later flush would look clean), the
+        // wire is over: answer the request (the loop may be waiting on the
+        // reply, so nothing is sent on the event queue before that), run
+        // only teardown effects, and abandon the wire phase with the
+        // backend-network attribution.
+        if self.wire_failed || !self.flush_deferred_backend_write_quiet().await {
+            let first_failure = !self.wire_failed;
+            self.wire_failed = true;
             self.closing = true;
             self.wire_end.get_or_insert(WireErrorSource::BackendNetwork);
             if self.quit_source == QuitSource::None {
@@ -3855,8 +3862,10 @@ impl Engine {
                 EngineCmd::PrepareRedirect(_) | EngineCmd::Effect(_) => {}
             }
             // The request is answered, so the loop is free to consume: give
-            // the FSM its one termination signal, then abandon the wire.
-            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            // the FSM its one termination signal (once), then abandon the wire.
+            if first_failure {
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+            }
             return Awaited::Closing;
         }
         match cmd {
@@ -4007,6 +4016,8 @@ impl Engine {
             self.backend = None;
             return self.close_for_invariant();
         };
+        // The new backend's raw counters start at zero.
+        self.attributed_outbound = 0;
         if let Some(registry) = &self.metering {
             let Some(current) = self.backend.as_ref() else {
                 registry.fail_closed();
@@ -5041,15 +5052,15 @@ impl Engine {
 
     fn record_command(&mut self, pending: &PendingCommand) {
         let current = self.backend_traffic();
-        // A command whose window drained a queued no-response command has
-        // those raw bytes inside its own delta; nothing is left to settle.
-        if !self
-            .backend
-            .as_ref()
-            .is_some_and(|backend| backend.backend_io.has_deferred_write())
-        {
-            self.unsettled_outbound_from = None;
-        }
+        // Outbound bytes start at the later of this command's own baseline
+        // and the shared attributed boundary, so bytes a settlement already
+        // published (a control flush between intake and completion) are not
+        // counted again; everything written up to now is attributed after.
+        let outbound_from = pending
+            .traffic_before
+            .outbound_bytes
+            .max(self.attributed_outbound);
+        self.attributed_outbound = current.outbound_bytes;
         let traffic = BackendTraffic {
             inbound_bytes: current
                 .inbound_bytes
@@ -5057,9 +5068,7 @@ impl Engine {
             inbound_packets: current
                 .inbound_packets
                 .saturating_sub(pending.traffic_before.inbound_packets),
-            outbound_bytes: current
-                .outbound_bytes
-                .saturating_sub(pending.traffic_before.outbound_bytes),
+            outbound_bytes: current.outbound_bytes.saturating_sub(outbound_from),
             outbound_packets: current
                 .outbound_packets
                 .saturating_sub(pending.traffic_before.outbound_packets),

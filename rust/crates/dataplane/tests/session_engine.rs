@@ -9830,3 +9830,81 @@ async fn oversized_unknown_command_ends_the_session_after_one_error() {
     );
     stack.dispatch_task.abort();
 }
+
+/// opt#13: a queued `COM_STMT_CLOSE` followed by a `COM_STMT_SEND_LONG_DATA`
+/// that overflows the bounded queue: the overflow drains the close plus the
+/// long-data header inside the long-data command's window and leaves the
+/// payload queued for the idle settlement. Whatever the exact split, no byte
+/// is counted twice or lost (9 + 4 + 32764 in total).
+#[tokio::test]
+async fn deferred_partial_drain_counts_every_byte_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is queued");
+    // COM_STMT_SEND_LONG_DATA: command byte, statement id 7, parameter 0, data.
+    let mut long_data = vec![0x18_u8, 7, 0, 0, 0, 0, 0];
+    long_data.resize(32_764, b'x');
+    client.writer.reset_sequence(0);
+    assert!(client.writer.write_logical(&long_data, true).await.is_ok());
+    // Idle: the queued payload is flushed without a next command.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.quit().await;
+    let mut close_bytes = None;
+    let mut long_data_bytes = None;
+    let mut settled = Vec::new();
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtClose,
+                traffic,
+                ..
+            } => close_bytes = Some(traffic.outbound_bytes),
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtSendLongData,
+                traffic,
+                ..
+            } => long_data_bytes = Some(traffic.outbound_bytes),
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled.push(traffic.outbound_bytes);
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        close_bytes,
+        Some(0),
+        "the close was still queued when recorded"
+    );
+    // Either the long-data arrived while the close was still queued (the
+    // overflow drained the close plus the long-data header: 13 bytes in the
+    // long-data window, the payload settles later) or the close was flushed
+    // first (9 bytes settled, the long-data queued whole). In both cases the
+    // command windows and the settlements together carry every byte once.
+    let Some(long_data_bytes) = long_data_bytes else {
+        unreachable!("the long-data command is observed")
+    };
+    assert!(
+        long_data_bytes == 13 || long_data_bytes == 0,
+        "long-data window carries the drained tail or nothing: {long_data_bytes}"
+    );
+    let settled_total: u64 = settled.iter().sum();
+    assert_eq!(
+        long_data_bytes + settled_total,
+        9 + 4 + 32_764,
+        "close + long-data header + payload, each exactly once"
+    );
+    stack.dispatch_task.abort();
+}
