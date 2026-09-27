@@ -65,8 +65,18 @@ pub trait DirectionSync {
     fn reset_layer_sequence(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Whether this transport carries a layered sequence of its own (a
+    /// compression layer). Plaintext and TLS transports report `false`, so
+    /// the packet layer skips layered-sequence bookkeeping for them. Required
+    /// (no default) so a layered transport cannot silently opt out of it.
+    fn is_layered(&self) -> bool;
 }
 
 /// A byte cursor carries no layered sequence; the test transports built on it
 /// coordinate nothing.
-impl<T> DirectionSync for io::Cursor<T> {}
+impl<T> DirectionSync for io::Cursor<T> {
+    fn is_layered(&self) -> bool {
+        false
+    }
+}

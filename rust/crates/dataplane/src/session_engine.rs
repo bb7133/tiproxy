@@ -87,9 +87,9 @@ use control_router::{
 use control_routing::{RouteAssignment, RouteResult};
 use mysql_wire::limits::MAX_PHYSICAL_PAYLOAD_LEN;
 use mysql_wire::{
-    Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams, StatusFlags,
-    encode_error_packet, encode_handshake_response, encode_initial_handshake, encode_ssl_request,
-    parse_handshake_response, parse_ssl_request,
+    Attribute, CapabilityFlags, CommandCode, CommandPacket, HandshakeResponseParams,
+    PHYSICAL_PACKET_HEADER_LEN, StatusFlags, encode_error_packet, encode_handshake_response,
+    encode_initial_handshake, encode_ssl_request, parse_handshake_response, parse_ssl_request,
 };
 use proxy_io::compression::{CompressedIo, CompressionAlgorithm, CompressionLimits};
 use proxy_io::counted::{ByteCounters, CountedIo};
@@ -807,6 +807,8 @@ async fn run_bound_session_observed(
         wire_end: None,
         quit_source: QuitSource::None,
         closing: false,
+        attributed_outbound: 0,
+        wire_failed: false,
         accepted_at,
         handshake_deadline: loop_config.handshake_deadline,
         frontend_tls_active: false,
@@ -1410,6 +1412,20 @@ struct Engine {
     wire_end: Option<WireErrorSource>,
     quit_source: QuitSource,
     closing: bool,
+    /// opt#13: raw outbound counter value (current backend) up to which
+    /// bytes have been attributed to an observation — by a command's
+    /// window or by a pure-traffic settlement. Both start from this shared
+    /// boundary, so a queued no-response command's bytes are counted
+    /// exactly once wherever they leave (inside a later command's write,
+    /// on an idle/control flush, at session end) and never estimated ahead
+    /// of the write. Reset to zero when the backend (and its counters) is
+    /// swapped.
+    attributed_outbound: u64,
+    /// opt#13: set once a queued no-response command could not be written.
+    /// From then on control commands are answered but only teardown effects
+    /// run, whatever a later flush reports (a failed drain empties the
+    /// queue, so the flush result alone is not a durable gate).
+    wire_failed: bool,
     accepted_at: tokio::time::Instant,
     /// Absolute handshake budget (Go parity, `handshake_deadline`), measured
     /// from `accepted_at`. TLS accept/connect consume the *remaining* budget
@@ -1600,6 +1616,11 @@ impl Engine {
 
     async fn run(mut self) -> EngineExit {
         let end = self.lifecycle().await;
+        // A queued no-response command still unwritten at the end of the
+        // wire phase leaves with this flush; its raw bytes (and any earlier
+        // drained ones no observation covered) are settled here.
+        let _ = self.flush_deferred_backend_write_quiet().await;
+        self.settle_outbound();
         if let Some(source) = end {
             self.wire_end.get_or_insert(source);
             if self.quit_source == QuitSource::None {
@@ -2449,6 +2470,10 @@ impl Engine {
                     traffic: current,
                     local: self.backend.as_ref().is_some_and(|backend| backend.local),
                 });
+                // The handshake observation carried every byte so far: the
+                // shared attribution boundary moves with it, so a session that
+                // ends without a command does not settle them a second time.
+                self.attributed_outbound = current.outbound_bytes;
                 if let Some(backend) = &self.backend {
                     log_session(
                         "connection_ready",
@@ -2534,6 +2559,16 @@ impl Engine {
         // (advancing the shared sequence) when the control arm won the select.
         let mut just_served_control = false;
         let mut snapshot_updates_open = true;
+        // opt#13: on a plaintext/TLS client leg, let one transport read stage
+        // whatever the client already sent (the same bounded over-read window
+        // the backend reader uses). The deferred-write decision below then
+        // knows whether the whole next command is present without blocking,
+        // and a small command costs one `recvfrom` instead of two. A layered
+        // client leg keeps exact reads: its per-command sequence reset must
+        // not find staged bytes.
+        if !self.client_io.is_layered() {
+            self.client_io.enable_read_buffering();
+        }
         let first_health_recheck = tokio::time::Instant::now() + BACKEND_HEALTH_RECHECK_INTERVAL;
         let mut health_recheck =
             tokio::time::interval_at(first_health_recheck, BACKEND_HEALTH_RECHECK_INTERVAL);
@@ -2563,6 +2598,43 @@ impl Engine {
             // header is visible the logical read runs uncontended; a
             // client stalling mid-frame is bounded by the owner's force
             // deadline, like any other mid-command stall.
+            // opt#13: a deferred no-response command is still queued for the
+            // backend. If the next client command is already here, let it join
+            // that write (the select below re-peeks from the staged bytes);
+            // otherwise flush now, so the backend never waits on a queued
+            // command while the client is idle.
+            if self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.backend_io.has_deferred_write())
+            {
+                let staged = tokio::select! {
+                    biased;
+                    peeked = self.client_io.peek_packet() => Some(peeked),
+                    () = std::future::ready(()) => None,
+                };
+                // Keep the queue only when the whole next command is staged
+                // and can be consumed without another transport read; a
+                // header-only or partial command (a client that stalls
+                // mid-packet) must not hold the queued command hostage.
+                let whole_next_command_staged = match staged {
+                    Some(Ok(preview)) => {
+                        let payload_length = preview.first_packet_length as usize;
+                        payload_length < MAX_PHYSICAL_PAYLOAD_LEN
+                            && self.client_io.staged_read_len()
+                                >= PHYSICAL_PACKET_HEADER_LEN + payload_length
+                    }
+                    Some(Err(error)) => {
+                        let source = self.client_read_end(&error).await;
+                        return Some(source);
+                    }
+                    None => false,
+                };
+                if !whole_next_command_staged && !self.flush_deferred_backend_write_quiet().await {
+                    let _ = self.events.send(SessionEvent::BackendIoError).await;
+                    return Some(WireErrorSource::BackendNetwork);
+                }
+            }
             let (intake, command_started) = tokio::select! {
                 changed = self.snapshot_updates.changed(), if snapshot_updates_open => {
                     if changed.is_err() {
@@ -2611,10 +2683,17 @@ impl Engine {
                         // would reintroduce exactly the allocation this row
                         // exists to remove — so it is refused from the header.
                         PeekDecision::RejectUnknown => {
+                            // The peeked prefix is never consumed, so the
+                            // session cannot continue: end it explicitly with
+                            // the same attribution the layered-sequence guard
+                            // used to produce here, instead of re-peeking the
+                            // same prefix and answering the error forever.
                             let _ = self
                                 .write_client_error(1047, *b"08S01", "Unknown command")
                                 .await;
-                            continue;
+                            self.quit_source = QuitSource::ProxyError;
+                            let _ = self.events.send(SessionEvent::ClientIoError).await;
+                            return Some(WireErrorSource::Proxy);
                         }
                         PeekDecision::Stream(command) => {
                             (CommandIntake::Streamed(command), started)
@@ -3059,12 +3138,29 @@ impl Engine {
         backend.backend_io.reset_write_sequence(0);
         backend.backend_io.reset_read_sequence(1);
         if !pending.streamed {
-            if backend
-                .backend_io
-                .write_logical(&pending.payload, true)
-                .await
-                .is_err()
-            {
+            // opt#13: a command that expects no response (STMT_CLOSE,
+            // SEND_LONG_DATA) is queued rather than written, so the command
+            // that usually follows at once (the next PREPARE/EXECUTE) leaves
+            // in the same transport write and the backend wakes once for
+            // both — as it does behind Go, whose forwards are back to back.
+            // The command loop flushes the queue before it would wait for the
+            // client, and every backend write/read path drains it first.
+            // Layered (compressed) legs keep the immediate write: their
+            // per-command sequence reset cannot run over queued bytes.
+            let deferred =
+                !pending.expected.waits_for_backend() && !backend.backend_io.is_layered();
+            let written = if deferred {
+                backend
+                    .backend_io
+                    .write_logical_deferred(&pending.payload)
+                    .await
+            } else {
+                backend
+                    .backend_io
+                    .write_logical(&pending.payload, true)
+                    .await
+            };
+            if written.is_err() {
                 let _ = self.events.send(SessionEvent::BackendIoError).await;
                 return Some(WireErrorSource::BackendNetwork);
             }
@@ -3690,7 +3786,92 @@ impl Engine {
     }
 
     /// Executes one out-of-band command (control effects, probes).
+    /// Writes out a deferred no-response command (opt#13) before anything
+    /// that leaves the plain command loop: control effects, probes, and the
+    /// paths that swap or read the backend all see a drained queue. Returns
+    /// whether the backend writer is still usable; never touches the event
+    /// queue, so it is safe while the loop may be waiting on a reply.
+    async fn flush_deferred_backend_write_quiet(&mut self) -> bool {
+        let Some(backend) = self.backend.as_mut() else {
+            return true;
+        };
+        if !backend.backend_io.has_deferred_write() {
+            return true;
+        }
+        if backend.backend_io.flush().await.is_err() {
+            return false;
+        }
+        self.settle_outbound();
+        true
+    }
+
+    /// Publishes the raw outbound bytes written since the shared attributed
+    /// boundary as a pure traffic observation and advances the boundary.
+    /// Used after a flush outside any command window and at session end,
+    /// so queued bytes are attributed exactly once even when no command
+    /// observation follows (idle disconnect, control command, teardown).
+    fn settle_outbound(&mut self) {
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        let current = backend.counters.outbound();
+        let outbound_bytes = current.saturating_sub(self.attributed_outbound);
+        self.attributed_outbound = current;
+        if outbound_bytes == 0 {
+            return;
+        }
+        self.metrics.try_record(Observation::BackendTrafficSettled {
+            backend: backend.address.clone(),
+            traffic: BackendTraffic {
+                outbound_bytes,
+                ..BackendTraffic::default()
+            },
+            local: backend.local,
+        });
+    }
+
     async fn handle_cmd(&mut self, cmd: EngineCmd) -> Awaited {
+        // A control command may redirect, probe, or drain the backend: the
+        // queued no-response command must reach the current backend first.
+        // If it cannot (now or earlier — `wire_failed` is durable, a failed
+        // drain empties the queue so a later flush would look clean), the
+        // wire is over: answer the request (the loop may be waiting on the
+        // reply, so nothing is sent on the event queue before that), run
+        // only teardown effects, and abandon the wire phase with the
+        // backend-network attribution.
+        if self.wire_failed || !self.flush_deferred_backend_write_quiet().await {
+            let first_failure = !self.wire_failed;
+            self.wire_failed = true;
+            self.closing = true;
+            self.wire_end.get_or_insert(WireErrorSource::BackendNetwork);
+            if self.quit_source == QuitSource::None {
+                self.quit_source = QuitSource::BackendNetwork;
+            }
+            match cmd {
+                EngineCmd::Probe(reply) => {
+                    let _ = reply.send(false);
+                }
+                // Only teardown effects still run; anything that would use
+                // or swap the backend (redirect handshake, swap, forwards)
+                // is refused now that the wire is over.
+                EngineCmd::Effect(
+                    effect @ (SessionEffect::BeginDrainTimer
+                    | SessionEffect::ReleaseBackend
+                    | SessionEffect::CloseBackend
+                    | SessionEffect::CloseClient
+                    | SessionEffect::ClassifySessionEnd),
+                ) => {
+                    let _ = self.handle_effect(effect).await;
+                }
+                EngineCmd::PrepareRedirect(_) | EngineCmd::Effect(_) => {}
+            }
+            // The request is answered, so the loop is free to consume: give
+            // the FSM its one termination signal (once), then abandon the wire.
+            if first_failure {
+                let _ = self.events.send(SessionEvent::BackendIoError).await;
+            }
+            return Awaited::Closing;
+        }
         match cmd {
             EngineCmd::Probe(reply) => {
                 let _ = reply.send(self.backend_alive());
@@ -3839,6 +4020,13 @@ impl Engine {
             self.backend = None;
             return self.close_for_invariant();
         };
+        // The candidate's counters already hold its authentication/restore
+        // bytes: attribution starts at the activation point, so only command
+        // bytes written from here on are ever settled.
+        self.attributed_outbound = self
+            .backend
+            .as_ref()
+            .map_or(0, |backend| backend.counters.outbound());
         if let Some(registry) = &self.metering {
             let Some(current) = self.backend.as_ref() else {
                 registry.fail_closed();
@@ -4871,8 +5059,17 @@ impl Engine {
             })
     }
 
-    fn record_command(&self, pending: &PendingCommand) {
+    fn record_command(&mut self, pending: &PendingCommand) {
         let current = self.backend_traffic();
+        // Outbound bytes start at the later of this command's own baseline
+        // and the shared attributed boundary, so bytes a settlement already
+        // published (a control flush between intake and completion) are not
+        // counted again; everything written up to now is attributed after.
+        let outbound_from = pending
+            .traffic_before
+            .outbound_bytes
+            .max(self.attributed_outbound);
+        self.attributed_outbound = current.outbound_bytes;
         let traffic = BackendTraffic {
             inbound_bytes: current
                 .inbound_bytes
@@ -4880,9 +5077,7 @@ impl Engine {
             inbound_packets: current
                 .inbound_packets
                 .saturating_sub(pending.traffic_before.inbound_packets),
-            outbound_bytes: current
-                .outbound_bytes
-                .saturating_sub(pending.traffic_before.outbound_bytes),
+            outbound_bytes: current.outbound_bytes.saturating_sub(outbound_from),
             outbound_packets: current
                 .outbound_packets
                 .saturating_sub(pending.traffic_before.outbound_packets),

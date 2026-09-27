@@ -7611,6 +7611,10 @@ impl DirectionSync for CompressedTestTransport {
     fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
         self.inner.reset_sequence().map_err(compression_io_error)
     }
+
+    fn is_layered(&self) -> bool {
+        true
+    }
 }
 
 /// A compressed `MySQL` client: negotiates `COMPRESS`/`ZSTD` during the plaintext
@@ -8495,6 +8499,10 @@ impl DirectionSync for BackendLegTransport {
 
     fn reset_layer_sequence(&mut self) -> std::io::Result<()> {
         self.inner.reset_sequence().map_err(compression_io_error)
+    }
+
+    fn is_layered(&self) -> bool {
+        true
     }
 }
 
@@ -9606,4 +9614,343 @@ async fn probe_due_while_commands_are_queued_keeps_completing() {
     drop(client);
     stack.dispatch_task.abort();
     stack.server_task.abort();
+}
+
+/// opt#13: a queued `COM_STMT_CLOSE` must not wait for a next command that is
+/// only partially here. The client sends the close, then just the header and
+/// command byte of a `COM_STMT_PREPARE` and stalls; the backend must still
+/// receive the close promptly. Completing the prepare afterwards works.
+#[tokio::test]
+async fn deferred_close_is_flushed_when_the_next_command_is_incomplete() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is written");
+    // Header (7-byte payload, sequence 0) plus the COM_STMT_PREPARE byte only.
+    let prefix = [7_u8, 0, 0, 0, 0x16];
+    assert!(client.writer.get_mut().write_all(&prefix).await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    let close_seen = timeout(Duration::from_secs(2), async {
+        loop {
+            let seen = stack
+                .backend_transcript
+                .lock()
+                .ok()
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.first() == Some(&0x19))
+                });
+            if seen {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        close_seen,
+        Ok(true),
+        "a stalled partial next command does not hold the queued close"
+    );
+    // Finish the prepare: the rest of its payload, then its OK response.
+    assert!(client.writer.get_mut().write_all(b"NOMETA").await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    client.reader.reset_sequence(1);
+    let Ok(response) = client.reader.read_logical(64 * 1024).await else {
+        unreachable!("the completed prepare is answered")
+    };
+    assert_eq!(response.payload.first(), Some(&0x00));
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: the bytes of queued `COM_STMT_CLOSE`s are counted exactly once from
+/// the raw counter — an idle flush settles them as pure traffic, no observation
+/// estimates bytes ahead of the actual write, and the next query carries only
+/// its own bytes.
+#[tokio::test]
+async fn deferred_close_traffic_is_attributed_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    // Two closes in a row stay queued together; then idle flushes them
+    // without a next command.
+    assert!(client.stmt_close(7).await, "the first close is written");
+    assert!(client.stmt_close(7).await, "the second close is written");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client.query_ok("SELECT 1").await);
+    client.quit().await;
+    let mut close_traffic = Vec::new();
+    let mut settled = Vec::new();
+    let mut query_after_close = None;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::CommandCompleted {
+                command, traffic, ..
+            } => match command {
+                session_core::command::Command::StmtClose => close_traffic.push(traffic),
+                session_core::command::Command::Query if !close_traffic.is_empty() => {
+                    query_after_close = Some(traffic);
+                    break;
+                }
+                _ => {}
+            },
+            Observation::BackendTrafficSettled { traffic, .. } => settled.push(traffic),
+            _ => {}
+        }
+    }
+    assert_eq!(close_traffic.len(), 2, "both closes are observed");
+    // Bytes come from the raw counter: nothing was written when the closes
+    // were recorded (their packets are framed at queue time).
+    for traffic in &close_traffic {
+        assert_eq!(traffic.outbound_bytes, 0);
+        assert_eq!(traffic.outbound_packets, 1);
+    }
+    // The idle flush(es) settle the two closes (2 x 9 raw bytes) as pure
+    // traffic. Whether both closes leave in one flush or one each depends on
+    // arrival timing, so only the total is fixed.
+    assert!(
+        !settled.is_empty(),
+        "the idle flush settles the queued closes"
+    );
+    let settled_bytes: u64 = settled.iter().map(|traffic| traffic.outbound_bytes).sum();
+    assert_eq!(settled_bytes, 18);
+    for traffic in &settled {
+        assert_eq!(traffic.outbound_packets, 0);
+    }
+    let Some(query_after_close) = query_after_close else {
+        unreachable!("the query after the closes is observed")
+    };
+    // COM_QUERY "SELECT 1" (4 + 9) carries only its own bytes.
+    assert_eq!(query_after_close.outbound_bytes, 13);
+    assert_eq!(query_after_close.outbound_packets, 1);
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: a queued `COM_STMT_CLOSE` followed by an abrupt client disconnect
+/// (no QUIT, no next command) still has its raw bytes settled at session end.
+#[tokio::test]
+async fn deferred_close_bytes_settle_when_the_client_disconnects_at_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is written");
+    drop(client);
+    let mut settled_bytes = 0;
+    let mut close_observed = false;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtClose,
+                traffic,
+                ..
+            } => {
+                close_observed = true;
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(close_observed, "the close is observed");
+    // COM_STMT_CLOSE on the wire: 4-byte header + 5-byte payload, exactly once.
+    assert_eq!(settled_bytes, 9);
+    stack.dispatch_task.abort();
+}
+
+/// A maximal first packet whose command byte is unknown is refused from the
+/// header and ends the session after exactly one error: the prefix is never
+/// consumed, so continuing would answer the same prefix forever.
+#[tokio::test]
+async fn oversized_unknown_command_ends_the_session_after_one_error() {
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    // Header: payload length 0xFF_FFFF, sequence 0; then a byte that is not a command.
+    let prefix = [0xFF_u8, 0xFF, 0xFF, 0x00, 0x7F];
+    assert!(client.writer.get_mut().write_all(&prefix).await.is_ok());
+    assert!(client.writer.get_mut().flush().await.is_ok());
+    client.reader.reset_sequence(1);
+    let Ok(Ok(error)) = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await
+    else {
+        unreachable!("one error packet answers the refused command")
+    };
+    assert_eq!(error.payload.first(), Some(&0xFF));
+    assert_eq!(
+        u16::from_le_bytes([error.payload[1], error.payload[2]]),
+        1047,
+        "unknown command"
+    );
+    let next = timeout(
+        Duration::from_secs(2),
+        client.reader.read_logical(64 * 1024),
+    )
+    .await;
+    assert!(
+        matches!(next, Ok(Err(_))),
+        "the session ends instead of answering the same prefix again: {next:?}"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: a queued `COM_STMT_CLOSE` followed by a `COM_STMT_SEND_LONG_DATA`
+/// that overflows the bounded queue: the overflow drains the close plus the
+/// long-data header inside the long-data command's window and leaves the
+/// payload queued for the idle settlement. Whatever the exact split, no byte
+/// is counted twice or lost (9 + 4 + 32764 in total).
+#[tokio::test]
+async fn deferred_partial_drain_counts_every_byte_once() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    assert!(matches!(
+        client.stmt_prepare("NOMETA").await,
+        Some(PrepareOutcome::Ok { .. })
+    ));
+    assert!(client.stmt_close(7).await, "the close is queued");
+    // COM_STMT_SEND_LONG_DATA: command byte, statement id 7, parameter 0, data.
+    let mut long_data = vec![0x18_u8, 7, 0, 0, 0, 0, 0];
+    long_data.resize(32_764, b'x');
+    client.writer.reset_sequence(0);
+    assert!(client.writer.write_logical(&long_data, true).await.is_ok());
+    // Idle: the queued payload is flushed without a next command.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.quit().await;
+    let mut close_bytes = None;
+    let mut long_data_bytes = None;
+    let mut settled = Vec::new();
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtClose,
+                traffic,
+                ..
+            } => close_bytes = Some(traffic.outbound_bytes),
+            Observation::CommandCompleted {
+                command: session_core::command::Command::StmtSendLongData,
+                traffic,
+                ..
+            } => long_data_bytes = Some(traffic.outbound_bytes),
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled.push(traffic.outbound_bytes);
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        close_bytes,
+        Some(0),
+        "the close was still queued when recorded"
+    );
+    // Either the long-data arrived while the close was still queued (the
+    // overflow drained the close plus the long-data header: 13 bytes in the
+    // long-data window, the payload settles later) or the close was flushed
+    // first (9 bytes settled, the long-data queued whole). In both cases the
+    // command windows and the settlements together carry every byte once.
+    let Some(long_data_bytes) = long_data_bytes else {
+        unreachable!("the long-data command is observed")
+    };
+    assert!(
+        long_data_bytes == 13 || long_data_bytes == 0,
+        "long-data window carries the drained tail or nothing: {long_data_bytes}"
+    );
+    let settled_total: u64 = settled.iter().sum();
+    assert_eq!(
+        long_data_bytes + settled_total,
+        9 + 4 + 32_764,
+        "close + long-data header + payload, each exactly once"
+    );
+    stack.dispatch_task.abort();
+}
+
+/// opt#13: the handshake observation already carried the handshake bytes, so
+/// a client that disconnects right after the handshake (no command) must not
+/// have them settled a second time at session end.
+#[tokio::test]
+async fn handshake_then_disconnect_settles_nothing_twice() {
+    let mut stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+    drop(client);
+    let mut handshake_outbound = None;
+    let mut settled_bytes = 0;
+    while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
+    {
+        match observation {
+            Observation::HandshakeCompleted { traffic, .. } => {
+                handshake_outbound = Some(traffic.outbound_bytes);
+            }
+            Observation::BackendTrafficSettled { traffic, .. } => {
+                settled_bytes += traffic.outbound_bytes;
+            }
+            Observation::SessionClosed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        handshake_outbound.is_some_and(|bytes| bytes > 0),
+        "the handshake observation carried the handshake bytes"
+    );
+    assert_eq!(settled_bytes, 0, "nothing is settled again at session end");
+    stack.dispatch_task.abort();
 }

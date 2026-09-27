@@ -219,6 +219,10 @@ impl DirectionSync for CompressedTransport {
     fn reset_layer_sequence(&mut self) -> io::Result<()> {
         self.inner.reset_sequence().map_err(compression_io_error)
     }
+
+    fn is_layered(&self) -> bool {
+        true
+    }
 }
 
 fn compressed_packet_io(input: Vec<u8>, algorithm: CompressionAlgorithm) -> TestResult2 {

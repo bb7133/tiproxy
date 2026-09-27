@@ -771,6 +771,7 @@ impl WriterState {
         &mut self,
         inner: &mut (impl AsyncWrite + Unpin),
         payload: &[u8],
+        drain_after: bool,
     ) -> Result<(), PacketIoError> {
         let payload_length =
             u32::try_from(payload.len()).map_err(|_| EncodeError::LengthOverflow {
@@ -781,15 +782,18 @@ impl WriterState {
             && payload.len() <= self.stream_buffer_size.get() - PHYSICAL_PACKET_HEADER_LEN
         {
             // Materialized commands use this path rather than packet forward.
-            // Reuse the bounded queue to write their header and payload together,
-            // but drain now even when the caller does not request a flush.
-            self.drain_forward_pending(inner).await?;
+            // Reuse the bounded queue to write their header and payload together
+            // behind anything already queued (the queue is FIFO, so wire order
+            // never changes). A deferred write leaves them queued for the next
+            // write or flush; otherwise drain now even without a flush request.
             let header = self.next_physical_header(payload_length)?;
             self.write_forward(inner, &header, "writing physical packet header", true)
                 .await?;
             self.write_forward(inner, payload, "writing physical packet payload", true)
                 .await?;
-            self.drain_forward_pending(inner).await?;
+            if drain_after {
+                self.drain_forward_pending(inner).await?;
+            }
         } else {
             self.start_physical_packet(inner, payload_length).await?;
             self.write_payload(inner, payload).await?;
@@ -820,11 +824,45 @@ impl WriterState {
                     .ok_or(PacketIoError::CounterOverflow {
                         field: "logical payload offset",
                     })?;
-            self.write_physical(inner, &payload[position..end]).await?;
+            self.write_physical(inner, &payload[position..end], true)
+                .await?;
             position = end;
         }
         if flush {
             self.flush(inner).await?;
+        }
+        Ok(())
+    }
+
+    /// Queues one logical packet behind any queued output without writing or
+    /// flushing the transport. The bytes leave with the next write, drain, or
+    /// flush, in order. A fragment too large for the bounded queue is written
+    /// through directly (draining the queue first), as any large packet is.
+    async fn write_logical_deferred(
+        &mut self,
+        inner: &mut (impl AsyncWrite + Unpin),
+        payload: &[u8],
+    ) -> Result<(), PacketIoError> {
+        let logical_length =
+            u64::try_from(payload.len()).map_err(|_| EncodeError::LengthOverflow {
+                field: "logical packet payload",
+                length: payload.len(),
+            })?;
+        let mut position = 0_usize;
+        for fragment_length in LogicalPacketFragments::new(logical_length) {
+            let fragment_length =
+                usize::try_from(fragment_length).map_err(|_| PacketIoError::CounterOverflow {
+                    field: "physical payload length",
+                })?;
+            let end =
+                position
+                    .checked_add(fragment_length)
+                    .ok_or(PacketIoError::CounterOverflow {
+                        field: "logical payload offset",
+                    })?;
+            self.write_physical(inner, &payload[position..end], false)
+                .await?;
+            position = end;
         }
         Ok(())
     }
@@ -1548,7 +1586,9 @@ where
     ///
     /// Returns a typed header encode or destination I/O error.
     pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
-        self.state.write_physical(&mut self.inner, payload).await
+        self.state
+            .write_physical(&mut self.inner, payload, true)
+            .await
     }
 
     /// Writes one logical packet from a caller-owned payload slice.
@@ -1829,6 +1869,12 @@ where
     /// Returns a framing error when unread prefetch/raw-prefix bytes remain, or
     /// propagates the transport layer's in-flight rejection.
     pub fn reset_layer_sequence(&mut self) -> io::Result<()> {
+        // A plaintext or TLS transport has no layered sequence to reset, so
+        // staged bytes (a prefetched next command, a deferred no-response
+        // command) are not in flight for anything this reset could rewind.
+        if !self.inner.is_layered() {
+            return Ok(());
+        }
         if self.read.has_buffered_read() || !self.write.forward_pending.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2196,7 +2242,9 @@ where
     /// Returns a typed header encode or destination I/O error.
     pub async fn write_physical(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
         self.begin_write_direction()?;
-        self.write.write_physical(&mut self.inner, payload).await
+        self.write
+            .write_physical(&mut self.inner, payload, true)
+            .await
     }
 
     /// Writes one logical packet from a caller-owned payload slice.
@@ -2234,6 +2282,58 @@ where
         self.write
             .write_logical_from(&mut self.inner, source, logical_length, flush)
             .await
+    }
+
+    /// Queues one logical packet for the destination without writing it yet:
+    /// it leaves with the next write, drain, or flush on this endpoint, in
+    /// order. Used for commands that expect no response, so a command that
+    /// follows immediately shares the same transport write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding or destination I/O error (a fragment too large for
+    /// the bounded queue is written through directly).
+    pub async fn write_logical_deferred(&mut self, payload: &[u8]) -> Result<(), PacketIoError> {
+        // A layered transport resets its own sequence per command and must
+        // never see queued bytes across that boundary: refuse rather than
+        // rely on every caller checking `is_layered` first.
+        if self.inner.is_layered() {
+            return Err(PacketIoError::io(
+                IoSide::Destination,
+                "deferring a write",
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "deferred writes are not supported on a layered transport",
+                ),
+            ));
+        }
+        self.begin_write_direction()?;
+        self.write
+            .write_logical_deferred(&mut self.inner, payload)
+            .await
+    }
+
+    /// Bytes already staged above the transport for reading (prefetch window,
+    /// raw prefix, over-read window), in stream order. After a `peek_packet`
+    /// this tells whether the whole first physical packet can be read without
+    /// touching the transport.
+    #[must_use]
+    pub fn staged_read_len(&self) -> usize {
+        self.read.prefetched_len()
+            + self.read.raw_prefix_slice().len()
+            + self.read.over_read.pending().len()
+    }
+
+    /// Whether queued output is waiting for a write, drain, or flush.
+    #[must_use]
+    pub fn has_deferred_write(&self) -> bool {
+        !self.write.forward_pending.is_empty()
+    }
+
+    /// Whether the transport carries a layered (compression) sequence.
+    #[must_use]
+    pub fn is_layered(&self) -> bool {
+        self.inner.is_layered()
     }
 
     /// Flushes the underlying destination transport.
@@ -2416,7 +2516,11 @@ mod tests {
         }
     }
 
-    impl DirectionSync for CountingWriter {}
+    impl DirectionSync for CountingWriter {
+        fn is_layered(&self) -> bool {
+            false
+        }
+    }
 
     #[derive(Debug)]
     struct FailingReader;
@@ -3531,6 +3635,34 @@ mod tests {
             !state.has_buffered_read(),
             "fully drained window => idle-healthy"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_logical_packet_leaves_with_the_next_write_or_flush()
+    -> Result<(), Box<dyn Error>> {
+        let mut io = PacketIo::new(CountingWriter::default());
+        // COM_STMT_CLOSE (no response): queued, nothing reaches the transport.
+        io.write_logical_deferred(b"\x19\x01\x00\x00\x00").await?;
+        assert!(io.has_deferred_write());
+        assert_eq!(io.get_ref().writes, 0);
+        // The next command shares one transport write with the queued one,
+        // in order, and the queue is empty afterwards.
+        io.write_logical(b"\x16SELECT 1", true).await?;
+        assert!(!io.has_deferred_write());
+        assert_eq!(
+            io.get_ref().writes,
+            1,
+            "queued and next packet share one write"
+        );
+        assert_eq!(io.get_ref().bytes, (4 + 5) + (4 + 9));
+        // A flush alone also drains a queued packet.
+        io.write_logical_deferred(b"\x19\x02\x00\x00\x00").await?;
+        assert!(io.has_deferred_write());
+        io.flush().await?;
+        assert!(!io.has_deferred_write());
+        assert_eq!(io.get_ref().writes, 2);
+        assert_eq!(io.get_ref().bytes, (4 + 5) * 2 + (4 + 9));
         Ok(())
     }
 }
