@@ -1754,8 +1754,9 @@ impl Clone for MetricsRecorder {
 }
 
 impl Drop for MetricsRecorder {
-    /// Session close: whatever the sweep has not taken yet goes through the
-    /// queue as batches, so nothing is lost with the accumulator.
+    /// Session close: whatever the sweep has not taken yet is submitted to
+    /// the queue as batches, best-effort; a batch the queue cannot take is
+    /// shed and counted per completion.
     fn drop(&mut self) {
         let Some(local) = self.local.get() else {
             return;
@@ -2627,8 +2628,8 @@ impl ExportTotals {
 
 /// Folds every live session accumulator and prunes closed ones. The list
 /// lock is held only to copy the live handles; a session mid-accumulation
-/// (its own lock busy) is skipped until the next tick, which adds one tick
-/// to that session's lag.
+/// (its own lock busy) is skipped, which defers its fold at least to the
+/// next attempt (every consecutive miss defers it again).
 fn sweep_accumulators(accumulators: &Accumulators, aggregator: &mut Aggregator) {
     let live: Vec<Arc<Mutex<LocalCommandStats>>> = {
         let mut list = lock_recovering(accumulators);
