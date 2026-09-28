@@ -86,7 +86,7 @@ fn error_code(envelope: &ControlEnvelope) -> Option<ErrorCode> {
 }
 
 struct Session {
-    control: mpsc::Receiver<SessionDirective>,
+    control: mpsc::Receiver<Box<SessionDirective>>,
 }
 
 fn register(
@@ -702,8 +702,10 @@ async fn force_close_marks_only_on_delivery() {
     handler.register_session(identity(1), "ns-a", 7, "sql-a", tx.clone(), None);
     let _ = handler.set_backend(1, "tidb-a");
     assert!(
-        tx.try_send(SessionDirective::bare(SessionControl::GracefulClose))
-            .is_ok(),
+        tx.try_send(Box::new(SessionDirective::bare(
+            SessionControl::GracefulClose
+        )))
+        .is_ok(),
         "pre-fill the slot"
     );
 
@@ -3064,7 +3066,7 @@ async fn instant_completion_binds_exact_terminal_id() {
 
     // The instant session: every directive is answered with its
     // completion notice immediately, using only the carried token.
-    let (control_tx, mut control_rx) = mpsc::channel::<SessionDirective>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<Box<SessionDirective>>(8);
     let notices = harness.notice_tx.clone();
     let instant_session = tokio::spawn(async move {
         while let Some(directive) = control_rx.recv().await {

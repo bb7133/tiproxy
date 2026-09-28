@@ -244,8 +244,8 @@ impl SessionDirective {
 /// Go-response channel, the currently armed response expectation, and
 /// the drain-scoping metadata.
 struct SessionEntry {
-    control: mpsc::Sender<SessionDirective>,
-    responses: Option<mpsc::Sender<ControlEnvelope>>,
+    control: mpsc::Sender<Box<SessionDirective>>,
+    responses: Option<mpsc::Sender<Box<ControlEnvelope>>>,
     /// Fail-closed correlation: only a response matching the armed
     /// `(initiating request id, body kind)` is delivered; everything
     /// else — unsolicited, wrong id, wrong kind — is answered as a
@@ -726,8 +726,8 @@ impl ControlCommandHandler {
         namespace: &str,
         snapshot_generation: u64,
         listener_name: &str,
-        control: mpsc::Sender<SessionDirective>,
-        responses: Option<mpsc::Sender<ControlEnvelope>>,
+        control: mpsc::Sender<Box<SessionDirective>>,
+        responses: Option<mpsc::Sender<Box<ControlEnvelope>>>,
     ) {
         let connection_id = identity.connection_id;
         self.gate
@@ -1204,7 +1204,7 @@ impl ControlCommandHandler {
         // ended between routing and delivery — answered like an
         // unknown connection so the peer reconciles instead of
         // mistaking silence for delivery.
-        match responses.try_send(envelope.clone()) {
+        match responses.try_send(Box::new(envelope.clone())) {
             Ok(()) => Vec::new(),
             Err(mpsc::error::TrySendError::Full(_)) => vec![result_envelope(
                 OutboundControl::ProtocolError {
@@ -1882,7 +1882,7 @@ impl ControlCommandHandler {
 
     fn forward(&mut self, connection_id: u64, directive: SessionDirective) -> ForwardOutcome {
         match self.sessions.get(&connection_id) {
-            Some(entry) => match entry.control.try_send(directive) {
+            Some(entry) => match entry.control.try_send(Box::new(directive)) {
                 Ok(()) => ForwardOutcome::Sent,
                 Err(mpsc::error::TrySendError::Full(_)) => ForwardOutcome::Full,
                 Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Gone,
@@ -2049,10 +2049,10 @@ pub enum DispatchNotice {
         /// Configured listener name (drain scoping).
         listener_name: String,
         /// The session loop's control channel.
-        control: mpsc::Sender<SessionDirective>,
+        control: mpsc::Sender<Box<SessionDirective>>,
         /// Correlated Go answers (route assignments, handshake
         /// decisions/results) for this session, when it routes.
-        responses: Option<mpsc::Sender<ControlEnvelope>>,
+        responses: Option<mpsc::Sender<Box<ControlEnvelope>>>,
         /// Completed when the registration is applied.
         applied: tokio::sync::oneshot::Sender<()>,
     },
@@ -2307,8 +2307,8 @@ impl ControlDispatchHandle {
         namespace: String,
         snapshot_generation: u64,
         listener_name: String,
-        control: mpsc::Sender<SessionDirective>,
-        responses: Option<mpsc::Sender<ControlEnvelope>>,
+        control: mpsc::Sender<Box<SessionDirective>>,
+        responses: Option<mpsc::Sender<Box<ControlEnvelope>>>,
     ) -> bool {
         let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
         if !self

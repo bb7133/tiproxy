@@ -34,6 +34,10 @@ const INLINE_CAPTURE_SIZE: usize = 32;
 /// Default payload-copy buffer used by streaming packet operations.
 pub const DEFAULT_STREAM_BUFFER_SIZE: usize = 32 * 1024;
 
+/// opt#24: first allocation of a per-connection pending forward queue; it
+/// then doubles on demand up to the stream buffer size.
+const MIN_FORWARD_PENDING_CAPACITY: usize = 1024;
+
 /// One complete inbound PROXY v2 header retained for a backend hop.
 ///
 /// Go keeps the parsed inbound header and emits it again after changing only
@@ -359,10 +363,25 @@ async fn drain_or_read(
         // this request from it. The raw prefix is drained above, so bytes read
         // here are strictly later in the stream than the prefetch window and
         // raw prefix — matching the replay order on upgrade.
-        if over_read.buf.len() != over_read.capacity {
-            over_read.buf = vec![0_u8; over_read.capacity];
+        // opt#24: allocate the window's capacity without zero-filling it and
+        // read straight into the spare capacity, so only the bytes a read
+        // actually delivers are ever touched. An idle connection that has only
+        // seen small packets keeps a few resident bytes instead of the whole
+        // window.
+        if over_read.buf.capacity() < over_read.capacity {
+            over_read.buf = Vec::with_capacity(over_read.capacity);
+            over_read.initialized = 0;
         }
-        let filled = inner.read(&mut over_read.buf[..over_read.capacity]).await?;
+        over_read.buf.clear();
+        // `take` bounds the read to the configured window even if the
+        // allocator granted more capacity than requested; `read_buf` fills
+        // only the uninitialized tail it is offered.
+        let window = u64::try_from(over_read.capacity).unwrap_or(u64::MAX);
+        let filled = (&mut *inner)
+            .take(window)
+            .read_buf(&mut over_read.buf)
+            .await?;
+        over_read.initialized = over_read.initialized.max(over_read.buf.len());
         if filled == 0 {
             return Ok(0);
         }
@@ -434,6 +453,11 @@ struct OverReadBuffer {
     /// Fill capacity; the backing `Vec` is allocated lazily on first fill.
     capacity: usize,
     buf: Vec<u8>,
+    /// opt#24: high-water mark of bytes ever written into the allocation.
+    /// Refills truncate `buf` to what the read delivered, so a short refill
+    /// after a long one leaves older bytes beyond `len()`; `clear_zero` zeroes
+    /// up to this mark so the freed allocation never keeps stream data.
+    initialized: usize,
     start: usize,
     end: usize,
 }
@@ -444,6 +468,7 @@ impl OverReadBuffer {
             enabled: false,
             capacity: 0,
             buf: Vec::new(),
+            initialized: 0,
             start: 0,
             end: 0,
         }
@@ -462,8 +487,14 @@ impl OverReadBuffer {
     /// bytes have been moved into the replay prefix). Preserves the enabled flag
     /// and capacity so a reused read state keeps buffering after the upgrade.
     fn clear_zero(&mut self) {
+        // Zero every byte a refill ever wrote, including a longer earlier
+        // fill that a shorter refill left beyond `len()` (opt#24).
+        if self.buf.len() < self.initialized {
+            self.buf.resize(self.initialized, 0);
+        }
         self.buf.fill(0);
         self.buf = Vec::new();
+        self.initialized = 0;
         self.start = 0;
         self.end = 0;
     }
@@ -965,14 +996,28 @@ impl WriterState {
         if input.len() > self.stream_buffer_size.get() - self.forward_pending.len() {
             self.drain_forward_pending(inner).await?;
         }
-        if self.forward_pending.capacity() == 0 {
-            // Reserve the configured cap once. Repeated incremental growth
-            // would otherwise give this per-connection queue excess capacity.
-            self.forward_pending
-                .reserve_exact(self.stream_buffer_size.get());
-        }
+        self.reserve_forward_pending(input.len());
         self.forward_pending.extend_from_slice(input);
         Ok(())
+    }
+
+    /// opt#24: grow the pending queue geometrically up to the stream buffer
+    /// cap as the data queued through it requires, instead of reserving the
+    /// whole cap on first use. The cap still bounds it (callers drain before
+    /// an append that would not fit), and an idle connection that only ever
+    /// queued small responses keeps a small queue.
+    fn reserve_forward_pending(&mut self, additional: usize) {
+        let needed = self.forward_pending.len().saturating_add(additional);
+        let capacity = self.forward_pending.capacity();
+        if needed <= capacity {
+            return;
+        }
+        let target = needed
+            .max(capacity.saturating_mul(2))
+            .max(MIN_FORWARD_PENDING_CAPACITY)
+            .min(self.stream_buffer_size.get().max(needed));
+        self.forward_pending
+            .reserve_exact(target - self.forward_pending.len());
     }
 
     async fn drain_forward_pending(
@@ -1069,14 +1114,10 @@ async fn forward_inner(
     // framing and accounting; restore it even when an I/O or framing error is
     // returned. Every byte written is read_exact first, so old payload bytes
     // are never exposed on the next packet.
+    // opt#24: the scratch grows to what the packets forwarded through it
+    // actually need (never beyond the stream buffer cap) instead of being
+    // zero-filled to the full cap up front.
     let mut scratch = std::mem::take(&mut src_state.forward_scratch);
-    scratch.reserve_exact(
-        src_state
-            .stream_buffer_size
-            .get()
-            .saturating_sub(scratch.len()),
-    );
-    scratch.resize(src_state.stream_buffer_size.get(), 0);
     let result = forward_inner_with_scratch(
         src_state,
         src_inner,
@@ -1223,11 +1264,7 @@ fn forward_window_packet_queued(
     src_state.add_in_bytes(wire_length)?;
     src_state.staged_forwards = src_state.staged_forwards.saturating_add(1);
     let outbound_header = dst_state.next_physical_header(packet.header.payload_length())?;
-    if dst_state.forward_pending.capacity() == 0 {
-        dst_state
-            .forward_pending
-            .reserve_exact(dst_state.stream_buffer_size.get());
-    }
+    dst_state.reserve_forward_pending(wire_length);
     dst_state
         .forward_pending
         .extend_from_slice(&outbound_header);
@@ -1304,8 +1341,9 @@ async fn forward_inner_with_scratch(
     is_cancelled: &mut impl FnMut() -> bool,
     flush_on_complete: bool,
     buffer_forward: bool,
-    scratch: &mut [u8],
+    scratch: &mut Vec<u8>,
 ) -> Result<ForwardStatus, PacketIoError> {
+    let scratch_cap = src_state.stream_buffer_size.get();
     loop {
         if allow_cancel && is_cancelled() {
             return Ok(ForwardStatus::CancelledAtPacketBoundary);
@@ -1319,7 +1357,7 @@ async fn forward_inner_with_scratch(
                 dst_state,
                 dst_inner,
                 progress,
-                scratch.len(),
+                scratch_cap,
                 flush_on_complete,
             )
             .await?
@@ -1337,13 +1375,16 @@ async fn forward_inner_with_scratch(
             }
         })?;
         if payload_length > 0
-            && payload_length <= scratch.len().saturating_sub(PHYSICAL_PACKET_HEADER_LEN)
+            && payload_length <= scratch_cap.saturating_sub(PHYSICAL_PACKET_HEADER_LEN)
         {
             // A small physical packet fits in one bounded write. Reading the
             // complete payload before emission avoids a separate socket write
             // for its regenerated header, while keeping the stream buffer cap.
             let outbound_header = dst_state.next_physical_header(header.payload_length())?;
             let end = PHYSICAL_PACKET_HEADER_LEN + payload_length;
+            if scratch.len() < end {
+                scratch.resize(end, 0);
+            }
             src_state
                 .read_exact(
                     src_inner,
@@ -1373,7 +1414,10 @@ async fn forward_inner_with_scratch(
                 .await?;
             let mut remaining = payload_length;
             while remaining > 0 {
-                let chunk_length = remaining.min(scratch.len());
+                let chunk_length = remaining.min(scratch_cap);
+                if scratch.len() < chunk_length {
+                    scratch.resize(chunk_length, 0);
+                }
                 src_state
                     .read_exact(
                         src_inner,
@@ -3280,7 +3324,10 @@ mod tests {
         let mut dst = PacketIo::new(Cursor::new(Vec::new()));
 
         PacketIo::forward_packet_to(&mut src, &mut dst, 0).await?;
-        assert_eq!(src.read.forward_scratch.len(), buffer_size.get());
+        // opt#24: the scratch grows to what the packet needed (a 14-byte
+        // payload read in one chunk), never beyond the stream buffer cap.
+        assert_eq!(src.read.forward_scratch.len(), b"secret payload".len());
+        assert!(src.read.forward_scratch.len() <= buffer_size.get());
         let first_buffer = src.read.forward_scratch.as_ptr();
 
         let second = PacketIo::forward_packet_to(&mut src, &mut dst, 16).await?;
@@ -3983,6 +4030,55 @@ mod tests {
 
     /// Serves one chunk per `poll_read`, so a test controls exactly which
     /// bytes are in the over-read window when a packet is forwarded.
+    /// opt#24 review: a long refill, then a short one, leaves the long fill's
+    /// tail beyond `len()`; the high-water mark still covers it, the upgrade
+    /// cleanup zeroes up to it, and a refill never reads past the window.
+    #[tokio::test]
+    async fn short_refill_after_long_one_is_covered_by_upgrade_cleanup()
+    -> Result<(), Box<dyn Error>> {
+        let long = encoded_physical_packet(&[7_u8; 40], 0)?;
+        let short = encoded_physical_packet(b"s", 1)?;
+        let mut source = ChunkedSource {
+            chunks: [long.clone(), short.clone()].into_iter().collect(),
+        };
+        let mut state = ReaderState::new();
+        state.enable_over_read();
+        for expected in [40_usize, 1] {
+            let (header, _sequence) = state.read_header(&mut source).await?;
+            let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+            state
+                .read_exact(&mut source, &mut payload, "test payload")
+                .await?;
+            assert_eq!(payload.len(), expected);
+        }
+        assert!(state.over_read.buf.len() < long.len());
+        assert_eq!(state.over_read.initialized, long.len());
+        state.over_read.clear_zero();
+        assert_eq!(state.over_read.initialized, 0);
+        assert!(state.over_read.buf.is_empty());
+
+        // A window smaller than what the transport offers is still the bound.
+        let mut bounded = ReaderState::with_stream_buffer_size(
+            NonZeroUsize::new(8).ok_or(io::Error::other("nonzero window"))?,
+        );
+        bounded.enable_over_read();
+        let mut wide = ChunkedSource {
+            chunks: [vec![1_u8; 64]].into_iter().collect(),
+        };
+        let mut byte = [0_u8; 1];
+        let served = drain_or_read(
+            &mut bounded.raw_prefix,
+            &mut bounded.raw_prefix_start,
+            &mut bounded.over_read,
+            &mut wide,
+            &mut byte,
+        )
+        .await?;
+        assert_eq!(served, 1);
+        assert!(bounded.over_read.end <= 8, "refill bounded by the window");
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct ChunkedSource {
         chunks: std::collections::VecDeque<Vec<u8>>,
