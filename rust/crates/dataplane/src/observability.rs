@@ -487,6 +487,20 @@ impl RegistryState {
         self.histograms.insert(key.clone(), entry);
     }
 
+    /// Batch twin of [`Self::add_counter`]: `updates` completions contributed
+    /// the nonzero `delta`; at the series bound every one of them is shed.
+    fn add_counter_batch(&mut self, key: &MetricKey, delta: u64, updates: u64) {
+        if let Some(value) = self.counters.get_mut(key) {
+            *value = value.saturating_add(delta);
+            return;
+        }
+        if self.series_count() >= MAX_REGISTRY_SERIES {
+            self.series_dropped = self.series_dropped.saturating_add(updates);
+            return;
+        }
+        self.counters.insert(key.clone(), delta);
+    }
+
     fn observe_histogram(&mut self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
         if let Some(entry) = self.histograms.get_mut(key) {
             entry.observe(seconds, buckets);
@@ -1488,22 +1502,42 @@ impl control_router::MigrationSink for MigrationMetrics {
 const MAX_LOCAL_COMMAND_KEYS: usize = 32;
 
 /// One session's accumulated command completions for one
-/// `(backend, command)` pair. Folding it yields the same registry, pending
-/// deltas and shed counts as folding the completions one by one: histogram
-/// buckets are kept cumulative like [`HistogramState`], invalid durations are
-/// counted so they can be shed exactly as [`Aggregator::histogram`] sheds
-/// them, and every counter remembers how many completions carried a nonzero
-/// delta, because [`Aggregator::counter`] counts an update only for those.
+/// `(backend, command)` pair. While the series bounds are not reached,
+/// folding it yields the same registry and pending deltas as folding the
+/// completions one by one: histogram buckets are kept cumulative like
+/// [`HistogramState`], invalid durations are counted so they can be shed
+/// exactly as [`Aggregator::histogram`] sheds them, every counter remembers
+/// how many completions carried a nonzero delta because
+/// [`Aggregator::counter`] counts an update only for those, and the pair's
+/// counter series are created in the order their first nonzero update
+/// arrived. At a series bound the shed counts match per completion and the
+/// pair's own series order matches, but batches change how pairs and
+/// sessions interleave, so which series of *different* pairs win the last
+/// slots can differ from the per-completion timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandBatch {
     entry: LocalCommandEntry,
 }
 
+/// Counter series of a pair beyond `query_total`, in the order the
+/// per-completion path creates them within one completion.
+const COUNTER_SERIES_IN_BYTES: u8 = 0;
+const COUNTER_SERIES_IN_PACKETS: u8 = 1;
+const COUNTER_SERIES_OUT_BYTES: u8 = 2;
+const COUNTER_SERIES_OUT_PACKETS: u8 = 3;
+const COUNTER_SERIES_CROSS_LOCATION: u8 = 4;
+/// The traffic series in [`CommandKeys::traffic`] order.
+const TRAFFIC_SERIES: [u8; 4] = [
+    COUNTER_SERIES_IN_BYTES,
+    COUNTER_SERIES_IN_PACKETS,
+    COUNTER_SERIES_OUT_BYTES,
+    COUNTER_SERIES_OUT_PACKETS,
+];
+
 #[derive(Debug, Clone, PartialEq)]
 struct LocalCommandEntry {
     backend: String,
     command: Command,
-    local: bool,
     /// Completions accumulated (each counts one `query_total` update).
     count: u64,
     /// Completions whose duration was not a finite non-negative number.
@@ -1518,16 +1552,21 @@ struct LocalCommandEntry {
     /// Completions with a nonzero value per traffic field, in
     /// [`CommandKeys::traffic`] order.
     traffic_updates: [u64; 4],
-    /// Completions with nonzero cross-location bytes.
+    /// Cross-location bytes of the non-local completions.
+    cross_location_bytes: u64,
+    /// Non-local completions with nonzero cross-location bytes.
     cross_location_updates: u64,
+    /// Counter series in the order their first nonzero update arrived, so
+    /// the batch creates them in the order the per-completion path would
+    /// have. `query_total` and the histograms always come first.
+    series_order: Vec<u8>,
 }
 
 impl LocalCommandEntry {
-    fn new(backend: String, command: Command, local: bool) -> Self {
+    fn new(backend: String, command: Command) -> Self {
         Self {
             backend,
             command,
-            local,
             count: 0,
             duration_invalid: 0,
             duration_sum: 0.0,
@@ -1537,11 +1576,19 @@ impl LocalCommandEntry {
             since_buckets: vec![0; QUERY_AGE_BUCKETS.len()],
             traffic: BackendTraffic::default(),
             traffic_updates: [0; 4],
+            cross_location_bytes: 0,
             cross_location_updates: 0,
+            series_order: Vec::new(),
         }
     }
 
-    fn accumulate(&mut self, duration: f64, since_connection: f64, traffic: BackendTraffic) {
+    fn accumulate(
+        &mut self,
+        duration: f64,
+        since_connection: f64,
+        traffic: BackendTraffic,
+        local: bool,
+    ) {
         self.count = self.count.saturating_add(1);
         accumulate_histogram(
             duration,
@@ -1563,8 +1610,14 @@ impl LocalCommandEntry {
             traffic.outbound_bytes,
             traffic.outbound_packets,
         ];
-        for (updates, value) in self.traffic_updates.iter_mut().zip(fields) {
+        for (series, (updates, value)) in TRAFFIC_SERIES
+            .into_iter()
+            .zip(self.traffic_updates.iter_mut().zip(fields))
+        {
             if value != 0 {
+                if *updates == 0 {
+                    self.series_order.push(series);
+                }
                 *updates = updates.saturating_add(1);
             }
         }
@@ -1584,7 +1637,12 @@ impl LocalCommandEntry {
             .traffic
             .outbound_packets
             .saturating_add(traffic.outbound_packets);
-        if !self.local && traffic.inbound_bytes.saturating_add(traffic.outbound_bytes) != 0 {
+        let cross_location = traffic.inbound_bytes.saturating_add(traffic.outbound_bytes);
+        if !local && cross_location != 0 {
+            if self.cross_location_updates == 0 {
+                self.series_order.push(COUNTER_SERIES_CROSS_LOCATION);
+            }
+            self.cross_location_bytes = self.cross_location_bytes.saturating_add(cross_location);
             self.cross_location_updates = self.cross_location_updates.saturating_add(1);
         }
     }
@@ -1640,11 +1698,11 @@ impl LocalCommandStats {
                 return false;
             }
             self.entries
-                .push(LocalCommandEntry::new(backend.to_owned(), command, local));
+                .push(LocalCommandEntry::new(backend.to_owned(), command));
             let last = self.entries.len() - 1;
             &mut self.entries[last]
         };
-        entry.accumulate(duration, since_connection, traffic);
+        entry.accumulate(duration, since_connection, traffic, local);
         true
     }
 
@@ -2029,7 +2087,7 @@ impl Aggregator {
                     .insert(key.clone(), PendingMetric::Counter(delta));
             }
         }
-        registry.add_counter(key, delta);
+        registry.add_counter_batch(key, delta, updates);
     }
 
     /// Batch twin of [`Self::histogram`]: `count` valid observations with
@@ -2106,19 +2164,22 @@ impl Aggregator {
             entry.since_sum,
             &entry.since_buckets,
         );
-        for ((key, field), updates) in keys.traffic.iter().zip(entry.traffic_updates) {
-            self.counter_batch(registry, key, field.pick(entry.traffic), updates);
-        }
-        if !entry.local {
-            self.counter_batch(
-                registry,
-                &keys.cross_location_bytes,
-                entry
-                    .traffic
-                    .inbound_bytes
-                    .saturating_add(entry.traffic.outbound_bytes),
-                entry.cross_location_updates,
-            );
+        for series in &entry.series_order {
+            if *series == COUNTER_SERIES_CROSS_LOCATION {
+                self.counter_batch(
+                    registry,
+                    &keys.cross_location_bytes,
+                    entry.cross_location_bytes,
+                    entry.cross_location_updates,
+                );
+            } else if let Some((key, field)) = keys.traffic.get(usize::from(*series)) {
+                self.counter_batch(
+                    registry,
+                    key,
+                    field.pick(entry.traffic),
+                    entry.traffic_updates[usize::from(*series)],
+                );
+            }
         }
     }
 
@@ -2566,7 +2627,8 @@ impl ExportTotals {
 
 /// Folds every live session accumulator and prunes closed ones. The list
 /// lock is held only to copy the live handles; a session mid-accumulation
-/// (its own lock busy) is skipped until the next tick.
+/// (its own lock busy) is skipped until the next tick, which adds one tick
+/// to that session's lag.
 fn sweep_accumulators(accumulators: &Accumulators, aggregator: &mut Aggregator) {
     let live: Vec<Arc<Mutex<LocalCommandStats>>> = {
         let mut list = lock_recovering(accumulators);
@@ -3985,6 +4047,16 @@ mod tests {
         }
         let entries = stats.take();
         assert_eq!(entries.len(), 4, "four (backend, command) pairs");
+        assert_eq!(
+            entries[2].series_order,
+            vec![
+                COUNTER_SERIES_IN_BYTES,
+                COUNTER_SERIES_IN_PACKETS,
+                COUNTER_SERIES_OUT_BYTES,
+                COUNTER_SERIES_OUT_PACKETS,
+                COUNTER_SERIES_CROSS_LOCATION,
+            ]
+        );
         for entry in entries {
             batched.observe(Observation::CommandBatch(CommandBatch { entry }));
         }
@@ -4001,9 +4073,9 @@ mod tests {
     /// path sheds it: one shed count, the other series still fold.
     #[test]
     fn command_batch_sheds_invalid_durations_like_the_histogram_path() {
-        let mut entry = LocalCommandEntry::new("10.0.0.1:4000".to_owned(), Command::Query, true);
-        entry.accumulate(f64::NAN, 1.0, BackendTraffic::default());
-        entry.accumulate(0.5, -1.0, BackendTraffic::default());
+        let mut entry = LocalCommandEntry::new("10.0.0.1:4000".to_owned(), Command::Query);
+        entry.accumulate(f64::NAN, 1.0, BackendTraffic::default(), true);
+        entry.accumulate(0.5, -1.0, BackendTraffic::default(), true);
         assert_eq!(
             (entry.count, entry.duration_invalid, entry.since_invalid),
             (2, 1, 1)
@@ -4175,5 +4247,166 @@ mod tests {
             "a second sweep with nothing new changes nothing"
         );
         drop(first);
+    }
+    /// A pair whose completions flip locality counts cross-location bytes for
+    /// the non-local completions only, like the per-completion path.
+    #[test]
+    fn command_batch_counts_cross_location_per_completion() {
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: 1,
+            outbound_bytes: outbound,
+            outbound_packets: 1,
+        };
+        let script = [
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(100, 200), true),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(30, 40), false),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(5, 6), true),
+        ];
+        let mut one_by_one = Aggregator::default();
+        let mut stats = LocalCommandStats::default();
+        for observation in script {
+            one_by_one.observe(observation.clone());
+            let Observation::CommandCompleted {
+                backend,
+                command,
+                duration,
+                since_connection,
+                traffic,
+                local,
+            } = observation
+            else {
+                unreachable!()
+            };
+            assert!(stats.accumulate(
+                &backend,
+                command,
+                local,
+                duration.as_secs_f64(),
+                since_connection.as_secs_f64(),
+                traffic,
+            ));
+        }
+        let mut batched = Aggregator::default();
+        for entry in stats.take() {
+            assert_eq!(
+                (entry.cross_location_bytes, entry.cross_location_updates),
+                (70, 1)
+            );
+            batched.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+        let text = batched.registry.render_prometheus_text();
+        assert!(
+            text.contains("tiproxy_traffic_cross_location_bytes 70\n"),
+            "{text}"
+        );
+        assert_eq!(text, one_by_one.registry.render_prometheus_text());
+    }
+
+    /// The reviewer's capacity counterexample: with four pending slots left, a
+    /// completion carrying only outbound bytes then one carrying only inbound
+    /// bytes must leave the same surviving series as folding them one by one
+    /// (outbound wins the last slot, inbound is shed), so the batch creates
+    /// the pair's series in first-appearance order.
+    #[test]
+    fn command_batch_creates_series_in_first_appearance_order_at_the_bound() {
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: 0,
+            outbound_bytes: outbound,
+            outbound_packets: 0,
+        };
+        let script = [
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(0, 1), true),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(1, 0), true),
+        ];
+        let prefill = |aggregator: &mut Aggregator| {
+            for index in 0..MAX_PENDING_SERIES - 4 {
+                aggregator.counter_once(
+                    &MetricKey::new(
+                        "tiproxy_backend_dial_backend_fail",
+                        vec![("backend", format!("filler-{index}"))],
+                    ),
+                    1,
+                );
+            }
+        };
+        let mut one_by_one = Aggregator::default();
+        prefill(&mut one_by_one);
+        let mut stats = LocalCommandStats::default();
+        for observation in script {
+            one_by_one.observe(observation.clone());
+            let Observation::CommandCompleted {
+                backend,
+                command,
+                duration,
+                since_connection,
+                traffic,
+                local,
+            } = observation
+            else {
+                unreachable!()
+            };
+            assert!(stats.accumulate(
+                &backend,
+                command,
+                local,
+                duration.as_secs_f64(),
+                since_connection.as_secs_f64(),
+                traffic,
+            ));
+        }
+        let mut batched = Aggregator::default();
+        prefill(&mut batched);
+        for entry in stats.take() {
+            assert_eq!(
+                entry.series_order,
+                vec![COUNTER_SERIES_OUT_BYTES, COUNTER_SERIES_IN_BYTES]
+            );
+            batched.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+        assert_eq!(batched.wire_metrics(&[]), one_by_one.wire_metrics(&[]));
+        assert_eq!(
+            batched.registry.render_prometheus_text(),
+            one_by_one.registry.render_prometheus_text()
+        );
+        assert_eq!(batched.overflow_dropped, one_by_one.overflow_dropped);
+        assert_eq!(
+            batched.overflow_dropped, 1,
+            "the inbound update is shed once"
+        );
+    }
+
+    /// At the registry series bound a shed counter batch counts every
+    /// completion that carried a nonzero delta, like shedding them one by one.
+    #[test]
+    fn registry_counter_batch_sheds_per_update_at_the_series_bound() {
+        let registry = MetricsRegistry::new();
+        {
+            let mut state = registry.lock();
+            for index in 0..MAX_REGISTRY_SERIES {
+                state.add_counter(
+                    &MetricKey::new(
+                        "tiproxy_backend_dial_backend_fail",
+                        vec![("backend", format!("filler-{index}"))],
+                    ),
+                    1,
+                );
+            }
+            assert_eq!(state.series_count(), MAX_REGISTRY_SERIES);
+            let key = MetricKey::new(
+                "tiproxy_session_query_total",
+                vec![("backend", "x".to_owned())],
+            );
+            state.add_counter_batch(&key, 7, 3);
+            assert_eq!(state.series_dropped, 3);
+            for _ in 0..3 {
+                state.add_counter(&key, 1);
+            }
+            assert_eq!(
+                state.series_dropped, 6,
+                "three per-completion sheds count the same"
+            );
+        }
     }
 }
