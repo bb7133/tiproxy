@@ -1617,7 +1617,8 @@ struct LocalCommandStats {
 }
 
 impl LocalCommandStats {
-    /// Returns false when the pair is unseen and the key bound is reached.
+    /// Returns false when the pair is unseen and the key bound is reached;
+    /// the caller then flushes the accumulator and retries once.
     fn accumulate(
         &mut self,
         backend: &str,
@@ -1701,17 +1702,7 @@ impl Drop for MetricsRecorder {
             return;
         };
         let entries = lock_recovering(local).take();
-        for entry in entries {
-            let count = entry.count;
-            let batch = Observation::CommandBatch(CommandBatch { entry });
-            if self
-                .tx
-                .as_ref()
-                .is_none_or(|tx| tx.try_send(batch).is_err())
-            {
-                self.dropped.fetch_add(count, Ordering::Relaxed);
-            }
-        }
+        self.send_batches(entries);
     }
 }
 
@@ -1752,12 +1743,33 @@ impl MetricsRecorder {
             local,
         } = observation
         {
-            let accepted = lock_recovering(self.local_stats()).accumulate(
+            let stats = self.local_stats();
+            let duration = duration.as_secs_f64();
+            let since_connection = since_connection.as_secs_f64();
+            let mut guard = lock_recovering(stats);
+            if guard.accumulate(
                 &backend,
                 command,
                 local,
-                duration.as_secs_f64(),
-                since_connection.as_secs_f64(),
+                duration,
+                since_connection,
+                traffic,
+            ) {
+                return true;
+            }
+            // Pair bound reached: hand the accumulated pairs to the queue as
+            // batches (a full queue sheds them, counted per completion, as
+            // it always did) and accumulate the new pair in the emptied
+            // accumulator. The only remaining loss condition is the queue.
+            let entries = guard.take();
+            drop(guard);
+            self.send_batches(entries);
+            let accepted = lock_recovering(stats).accumulate(
+                &backend,
+                command,
+                local,
+                duration,
+                since_connection,
                 traffic,
             );
             if !accepted {
@@ -1770,6 +1782,23 @@ impl MetricsRecorder {
             return false;
         }
         true
+    }
+
+    /// Hands accumulated pairs to the queue as batches without waiting. A
+    /// full or closed queue sheds a batch and counts every completion it
+    /// represented, like the per-completion path counted a full queue.
+    fn send_batches(&self, entries: Vec<LocalCommandEntry>) {
+        for entry in entries {
+            let count = entry.count;
+            let batch = Observation::CommandBatch(CommandBatch { entry });
+            if self
+                .tx
+                .as_ref()
+                .is_none_or(|tx| tx.try_send(batch).is_err())
+            {
+                self.dropped.fetch_add(count, Ordering::Relaxed);
+            }
+        }
     }
 
     /// This clone's accumulator, registered for the sweep on first use.
@@ -4035,10 +4064,12 @@ mod tests {
         );
     }
 
-    /// Past the per-session pair bound an unseen pair is shed and counted.
+    /// Past the per-session pair bound the accumulated pairs go to the queue
+    /// as batches and the unseen pair is accepted; only a full queue sheds,
+    /// counted per completion.
     #[test]
-    fn accumulator_pair_bound_sheds_and_counts() {
-        let (recorder, _rx) = MetricsRecorder::channel(8);
+    fn accumulator_pair_bound_flushes_through_the_queue() {
+        let (recorder, mut rx) = MetricsRecorder::channel(MAX_LOCAL_COMMAND_KEYS);
         for index in 0..MAX_LOCAL_COMMAND_KEYS {
             assert!(recorder.try_record(completion(
                 &format!("10.0.0.{index}:4000"),
@@ -4048,21 +4079,53 @@ mod tests {
                 true,
             )));
         }
-        assert!(!recorder.try_record(completion(
+        assert!(rx.try_recv().is_err());
+        assert!(recorder.try_record(completion(
             "10.0.1.1:4000",
             Command::Query,
             1,
             BackendTraffic::default(),
             true,
         )));
+        let mut flushed = 0;
+        while let Ok(observation) = rx.try_recv() {
+            assert!(matches!(observation, Observation::CommandBatch(_)));
+            flushed += 1;
+        }
+        assert_eq!(flushed, MAX_LOCAL_COMMAND_KEYS);
+        assert_eq!(recorder.dropped(), 0);
+        assert_eq!(
+            lock_recovering(recorder.local_stats()).entries.len(),
+            1,
+            "the new pair is accumulated in the emptied accumulator"
+        );
+
+        // A queue too small for the flush sheds the surplus, counted per
+        // completion: two completions in the shed pair.
+        let (recorder, _rx) = MetricsRecorder::channel(1);
+        for index in 0..MAX_LOCAL_COMMAND_KEYS {
+            for _ in 0..2 {
+                assert!(recorder.try_record(completion(
+                    &format!("10.0.0.{index}:4000"),
+                    Command::Query,
+                    1,
+                    BackendTraffic::default(),
+                    true,
+                )));
+            }
+        }
         assert!(recorder.try_record(completion(
-            "10.0.0.0:4000",
+            "10.0.1.1:4000",
             Command::Query,
             1,
             BackendTraffic::default(),
             true,
         )));
-        assert_eq!(recorder.dropped(), 1);
+        assert_eq!(
+            recorder.dropped(),
+            2 * (MAX_LOCAL_COMMAND_KEYS as u64 - 1),
+            "one batch fits the queue, the rest are shed per completion"
+        );
     }
 
     /// The sweep folds every live accumulator and forgets closed sessions.
