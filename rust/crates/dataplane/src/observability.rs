@@ -1482,8 +1482,9 @@ impl control_router::MigrationSink for MigrationMetrics {
 /// opt#23: distinct `(backend, command)` pairs one session accumulates before
 /// the next sweep. A session talks to one backend at a time and uses a
 /// handful of command types; a redirect leaves the old backend's pairs until
-/// the next sweep drains them. Past the bound an unseen pair is shed and
-/// counted exactly like a full queue.
+/// the next sweep drains them. Reaching the bound flushes the accumulator
+/// through the queue (see [`MetricsRecorder::try_record`]) before the unseen
+/// pair is accumulated.
 const MAX_LOCAL_COMMAND_KEYS: usize = 32;
 
 /// One session's accumulated command completions for one
