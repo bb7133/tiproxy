@@ -370,11 +370,18 @@ async fn drain_or_read(
         // window.
         if over_read.buf.capacity() < over_read.capacity {
             over_read.buf = Vec::with_capacity(over_read.capacity);
+            over_read.initialized = 0;
         }
         over_read.buf.clear();
-        // `Vec`'s spare capacity is exactly the window, so the read is bounded
-        // by it (`read_buf` fills only `chunk_mut`, the uninitialized tail).
-        let filled = inner.read_buf(&mut over_read.buf).await?;
+        // `take` bounds the read to the configured window even if the
+        // allocator granted more capacity than requested; `read_buf` fills
+        // only the uninitialized tail it is offered.
+        let window = u64::try_from(over_read.capacity).unwrap_or(u64::MAX);
+        let filled = (&mut *inner)
+            .take(window)
+            .read_buf(&mut over_read.buf)
+            .await?;
+        over_read.initialized = over_read.initialized.max(over_read.buf.len());
         if filled == 0 {
             return Ok(0);
         }
@@ -446,6 +453,11 @@ struct OverReadBuffer {
     /// Fill capacity; the backing `Vec` is allocated lazily on first fill.
     capacity: usize,
     buf: Vec<u8>,
+    /// opt#24: high-water mark of bytes ever written into the allocation.
+    /// Refills truncate `buf` to what the read delivered, so a short refill
+    /// after a long one leaves older bytes beyond `len()`; `clear_zero` zeroes
+    /// up to this mark so the freed allocation never keeps stream data.
+    initialized: usize,
     start: usize,
     end: usize,
 }
@@ -456,6 +468,7 @@ impl OverReadBuffer {
             enabled: false,
             capacity: 0,
             buf: Vec::new(),
+            initialized: 0,
             start: 0,
             end: 0,
         }
@@ -474,8 +487,14 @@ impl OverReadBuffer {
     /// bytes have been moved into the replay prefix). Preserves the enabled flag
     /// and capacity so a reused read state keeps buffering after the upgrade.
     fn clear_zero(&mut self) {
+        // Zero every byte a refill ever wrote, including a longer earlier
+        // fill that a shorter refill left beyond `len()` (opt#24).
+        if self.buf.len() < self.initialized {
+            self.buf.resize(self.initialized, 0);
+        }
         self.buf.fill(0);
         self.buf = Vec::new();
+        self.initialized = 0;
         self.start = 0;
         self.end = 0;
     }
@@ -4011,6 +4030,55 @@ mod tests {
 
     /// Serves one chunk per `poll_read`, so a test controls exactly which
     /// bytes are in the over-read window when a packet is forwarded.
+    /// opt#24 review: a long refill, then a short one, leaves the long fill's
+    /// tail beyond `len()`; the high-water mark still covers it, the upgrade
+    /// cleanup zeroes up to it, and a refill never reads past the window.
+    #[tokio::test]
+    async fn short_refill_after_long_one_is_covered_by_upgrade_cleanup()
+    -> Result<(), Box<dyn Error>> {
+        let long = encoded_physical_packet(&[7_u8; 40], 0)?;
+        let short = encoded_physical_packet(b"s", 1)?;
+        let mut source = ChunkedSource {
+            chunks: [long.clone(), short.clone()].into_iter().collect(),
+        };
+        let mut state = ReaderState::new();
+        state.enable_over_read();
+        for expected in [40_usize, 1] {
+            let (header, _sequence) = state.read_header(&mut source).await?;
+            let mut payload = vec![0_u8; usize::try_from(header.payload_length())?];
+            state
+                .read_exact(&mut source, &mut payload, "test payload")
+                .await?;
+            assert_eq!(payload.len(), expected);
+        }
+        assert!(state.over_read.buf.len() < long.len());
+        assert_eq!(state.over_read.initialized, long.len());
+        state.over_read.clear_zero();
+        assert_eq!(state.over_read.initialized, 0);
+        assert!(state.over_read.buf.is_empty());
+
+        // A window smaller than what the transport offers is still the bound.
+        let mut bounded = ReaderState::with_stream_buffer_size(
+            NonZeroUsize::new(8).ok_or(io::Error::other("nonzero window"))?,
+        );
+        bounded.enable_over_read();
+        let mut wide = ChunkedSource {
+            chunks: [vec![1_u8; 64]].into_iter().collect(),
+        };
+        let mut byte = [0_u8; 1];
+        let served = drain_or_read(
+            &mut bounded.raw_prefix,
+            &mut bounded.raw_prefix_start,
+            &mut bounded.over_read,
+            &mut wide,
+            &mut byte,
+        )
+        .await?;
+        assert_eq!(served, 1);
+        assert!(bounded.over_read.end <= 8, "refill bounded by the window");
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct ChunkedSource {
         chunks: std::collections::VecDeque<Vec<u8>>,
