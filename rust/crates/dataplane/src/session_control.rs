@@ -35,13 +35,17 @@ use crate::server::{AcceptedConnection, ConnectionFuture, ConnectionHandler};
 
 const SESSION_CONTROL_CAPACITY: usize = 8;
 const SESSION_RESPONSE_CAPACITY: usize = 1;
+// opt#24c: both per-session channels carry boxed messages. A tokio mpsc
+// channel allocates its first 32-slot block when it is created, so an
+// unboxed `ControlEnvelope` (585 B) or `SessionDirective` cost every session
+// ~18.7 KB and ~4.9 KB up front for messages most sessions never receive.
 
 /// Per-session typed CTL-06 surface and inbound channels.
 pub struct SessionControlBinding {
     dispatch: ControlDispatchHandle,
     connection_id: u64,
-    control: mpsc::Receiver<SessionDirective>,
-    responses: mpsc::Receiver<ControlEnvelope>,
+    control: mpsc::Receiver<Box<SessionDirective>>,
+    responses: mpsc::Receiver<Box<ControlEnvelope>>,
 }
 
 impl SessionControlBinding {
@@ -145,12 +149,12 @@ impl SessionControlBinding {
     /// dispatcher detached (control-v1 last-good: never a teardown
     /// reason by itself).
     pub async fn recv_control(&mut self) -> Option<SessionDirective> {
-        self.control.recv().await
+        self.control.recv().await.map(|directive| *directive)
     }
 
     /// Receives the exactly correlated handshake/route response.
     pub async fn recv_response(&mut self) -> Option<ControlEnvelope> {
-        self.responses.recv().await
+        self.responses.recv().await.map(|envelope| *envelope)
     }
 
     /// Splits the binding into its three independent halves so the
@@ -178,26 +182,26 @@ impl SessionControlBinding {
 
 /// The control-directive half of a split [`SessionControlBinding`].
 pub struct DirectiveStream {
-    control: mpsc::Receiver<SessionDirective>,
+    control: mpsc::Receiver<Box<SessionDirective>>,
 }
 
 impl DirectiveStream {
     /// Receives the next control directive; `None` means the dispatcher
     /// detached (control-v1 last-good: never a teardown reason).
     pub async fn recv(&mut self) -> Option<SessionDirective> {
-        self.control.recv().await
+        self.control.recv().await.map(|directive| *directive)
     }
 }
 
 /// The correlated-response half of a split [`SessionControlBinding`].
 pub struct ResponseStream {
-    responses: mpsc::Receiver<ControlEnvelope>,
+    responses: mpsc::Receiver<Box<ControlEnvelope>>,
 }
 
 impl ResponseStream {
     /// Receives the next exactly correlated response envelope.
     pub async fn recv(&mut self) -> Option<ControlEnvelope> {
-        self.responses.recv().await
+        self.responses.recv().await.map(|envelope| *envelope)
     }
 }
 

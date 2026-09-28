@@ -831,7 +831,7 @@ async fn run_bound_session_observed(
         loop_config,
     );
     let mut loop_task = AbortOnDrop(tokio::spawn(session_loop.run()));
-    let mut engine_task = AbortOnDrop(tokio::spawn(engine.run()));
+    let mut engine_task = AbortOnDrop(tokio::spawn(Box::new(engine).run()));
 
     // The owner: forwards directives while holding the exact command
     // tokens, consumes engine reports, and waits for the loop.
@@ -1614,7 +1614,11 @@ impl Engine {
         result
     }
 
-    async fn run(mut self) -> EngineExit {
+    /// opt#24b: runs from a box. Taking `self` by value made the task future
+    /// hold the ~6 KB engine twice (the captured argument and the moved local
+    /// the body works on); boxing keeps one heap copy and a pointer in the
+    /// future, shrinking every session's engine task by about the engine size.
+    async fn run(mut self: Box<Self>) -> EngineExit {
         let end = self.lifecycle().await;
         // A queued no-response command still unwritten at the end of the
         // wire phase leaves with this flush; its raw bytes (and any earlier
