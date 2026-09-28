@@ -1519,6 +1519,32 @@ pub struct CommandBatch {
     entry: LocalCommandEntry,
 }
 
+impl CommandBatch {
+    /// Backend address the completions were attributed to.
+    #[must_use]
+    pub fn backend(&self) -> &str {
+        &self.entry.backend
+    }
+
+    /// Command the completions belong to.
+    #[must_use]
+    pub const fn command(&self) -> Command {
+        self.entry.command
+    }
+
+    /// Number of completions in the batch.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.entry.count
+    }
+
+    /// Summed backend traffic of the completions.
+    #[must_use]
+    pub const fn traffic(&self) -> BackendTraffic {
+        self.entry.traffic
+    }
+}
+
 /// Counter series of a pair beyond `query_total`, in the order the
 /// per-completion path creates them within one completion.
 const COUNTER_SERIES_IN_BYTES: u8 = 0;
