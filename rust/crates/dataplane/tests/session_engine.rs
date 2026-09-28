@@ -3131,15 +3131,14 @@ async fn session_path_emits_query_traffic_and_exact_quit_source() {
                     assert!(traffic.outbound_bytes > 0);
                     saw_handshake = true;
                 }
-                Observation::CommandCompleted {
-                    backend,
-                    command,
-                    traffic,
-                    ..
-                } if command.name() == "Query" => {
-                    assert!(backend.ends_with(&stack.backend_port.to_string()));
-                    assert!(traffic.inbound_bytes > 0);
-                    assert!(traffic.outbound_bytes > 0);
+                // opt#23: completions arrive as the session's batch, flushed
+                // when the session's recorder drops (possibly after the
+                // close is recorded).
+                Observation::CommandBatch(batch) if batch.command().name() == "Query" => {
+                    assert!(batch.backend().ends_with(&stack.backend_port.to_string()));
+                    assert_eq!(batch.count(), 1);
+                    assert!(batch.traffic().inbound_bytes > 0);
+                    assert!(batch.traffic().outbound_bytes > 0);
                     saw_query = true;
                 }
                 Observation::SessionClosed { source, .. } => {
@@ -9701,33 +9700,39 @@ async fn deferred_close_traffic_is_attributed_once() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(client.query_ok("SELECT 1").await);
     client.quit().await;
-    let mut close_traffic = Vec::new();
+    // opt#23: the two closes and the query arrive as per-command batches
+    // when the session's recorder drops, in no fixed order relative to the
+    // settlements and the close record, so read until everything needed is in.
+    let mut close_batch = None;
     let mut settled = Vec::new();
     let mut query_after_close = None;
+    let mut session_closed = false;
     while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
     {
         match observation {
-            Observation::CommandCompleted {
-                command, traffic, ..
-            } => match command {
-                session_core::command::Command::StmtClose => close_traffic.push(traffic),
-                session_core::command::Command::Query if !close_traffic.is_empty() => {
-                    query_after_close = Some(traffic);
-                    break;
+            Observation::CommandBatch(batch) => match batch.command() {
+                session_core::command::Command::StmtClose => {
+                    close_batch = Some((batch.count(), batch.traffic()));
                 }
+                session_core::command::Command::Query => query_after_close = Some(batch.traffic()),
                 _ => {}
             },
             Observation::BackendTrafficSettled { traffic, .. } => settled.push(traffic),
+            Observation::SessionClosed { .. } => session_closed = true,
             _ => {}
         }
+        if close_batch.is_some() && query_after_close.is_some() && session_closed {
+            break;
+        }
     }
-    assert_eq!(close_traffic.len(), 2, "both closes are observed");
+    let Some((close_count, close_traffic)) = close_batch else {
+        unreachable!("the closes are observed")
+    };
+    assert_eq!(close_count, 2, "both closes are observed");
     // Bytes come from the raw counter: nothing was written when the closes
     // were recorded (their packets are framed at queue time).
-    for traffic in &close_traffic {
-        assert_eq!(traffic.outbound_bytes, 0);
-        assert_eq!(traffic.outbound_packets, 1);
-    }
+    assert_eq!(close_traffic.outbound_bytes, 0);
+    assert_eq!(close_traffic.outbound_packets, 2);
     // The idle flush(es) settle the two closes (2 x 9 raw bytes) as pure
     // traffic. Whether both closes leave in one flush or one each depends on
     // arrival timing, so only the total is fixed.
@@ -9770,22 +9775,28 @@ async fn deferred_close_bytes_settle_when_the_client_disconnects_at_once() {
     drop(client);
     let mut settled_bytes = 0;
     let mut close_observed = false;
+    let mut session_closed = false;
+    // opt#23: the close arrives as the session's batch when its recorder
+    // drops, possibly after the close record; settlements are recorded by the
+    // engine before either, so once both are in every byte has been seen.
     while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
     {
         match observation {
-            Observation::CommandCompleted {
-                command: session_core::command::Command::StmtClose,
-                traffic,
-                ..
-            } => {
+            Observation::CommandBatch(batch)
+                if batch.command() == session_core::command::Command::StmtClose =>
+            {
+                assert_eq!(batch.count(), 1);
                 close_observed = true;
-                settled_bytes += traffic.outbound_bytes;
+                settled_bytes += batch.traffic().outbound_bytes;
             }
             Observation::BackendTrafficSettled { traffic, .. } => {
                 settled_bytes += traffic.outbound_bytes;
             }
-            Observation::SessionClosed { .. } => break,
+            Observation::SessionClosed { .. } => session_closed = true,
             _ => {}
+        }
+        if close_observed && session_closed {
+            break;
         }
     }
     assert!(close_observed, "the close is observed");
@@ -9871,24 +9882,31 @@ async fn deferred_partial_drain_counts_every_byte_once() {
     let mut close_bytes = None;
     let mut long_data_bytes = None;
     let mut settled = Vec::new();
+    let mut session_closed = false;
+    // opt#23: both commands arrive as batches when the session's recorder
+    // drops, possibly after the close record; the settlements precede both.
     while let Ok(Some(observation)) = timeout(Duration::from_secs(2), stack.metrics_rx.recv()).await
     {
         match observation {
-            Observation::CommandCompleted {
-                command: session_core::command::Command::StmtClose,
-                traffic,
-                ..
-            } => close_bytes = Some(traffic.outbound_bytes),
-            Observation::CommandCompleted {
-                command: session_core::command::Command::StmtSendLongData,
-                traffic,
-                ..
-            } => long_data_bytes = Some(traffic.outbound_bytes),
+            Observation::CommandBatch(batch) => match batch.command() {
+                session_core::command::Command::StmtClose => {
+                    assert_eq!(batch.count(), 1);
+                    close_bytes = Some(batch.traffic().outbound_bytes);
+                }
+                session_core::command::Command::StmtSendLongData => {
+                    assert_eq!(batch.count(), 1);
+                    long_data_bytes = Some(batch.traffic().outbound_bytes);
+                }
+                _ => {}
+            },
             Observation::BackendTrafficSettled { traffic, .. } => {
                 settled.push(traffic.outbound_bytes);
             }
-            Observation::SessionClosed { .. } => break,
+            Observation::SessionClosed { .. } => session_closed = true,
             _ => {}
+        }
+        if close_bytes.is_some() && long_data_bytes.is_some() && session_closed {
+            break;
         }
     }
     assert_eq!(

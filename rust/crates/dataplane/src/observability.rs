@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use control_proto::control_transport::ControlClient;
@@ -461,6 +461,46 @@ impl RegistryState {
         self.counters.insert(key.clone(), delta);
     }
 
+    /// Batch twin of [`Self::observe_histogram`]: `count` observations whose
+    /// cumulative bucket counts and sum were accumulated elsewhere. Sheds all
+    /// of them at the series bound, counting each.
+    fn observe_histogram_batch(
+        &mut self,
+        key: &MetricKey,
+        count: u64,
+        sum: f64,
+        cumulative: &[u64],
+    ) {
+        if let Some(entry) = self.histograms.get_mut(key) {
+            entry.add_batch(count, sum, cumulative);
+            return;
+        }
+        if self.series_count() >= MAX_REGISTRY_SERIES {
+            self.series_dropped = self.series_dropped.saturating_add(count);
+            return;
+        }
+        let mut entry = HistogramState {
+            cumulative_buckets: vec![0; cumulative.len()],
+            ..HistogramState::default()
+        };
+        entry.add_batch(count, sum, cumulative);
+        self.histograms.insert(key.clone(), entry);
+    }
+
+    /// Batch twin of [`Self::add_counter`]: `updates` completions contributed
+    /// the nonzero `delta`; at the series bound every one of them is shed.
+    fn add_counter_batch(&mut self, key: &MetricKey, delta: u64, updates: u64) {
+        if let Some(value) = self.counters.get_mut(key) {
+            *value = value.saturating_add(delta);
+            return;
+        }
+        if self.series_count() >= MAX_REGISTRY_SERIES {
+            self.series_dropped = self.series_dropped.saturating_add(updates);
+            return;
+        }
+        self.counters.insert(key.clone(), delta);
+    }
+
     fn observe_histogram(&mut self, key: &MetricKey, seconds: f64, buckets: &[f64]) {
         if let Some(entry) = self.histograms.get_mut(key) {
             entry.observe(seconds, buckets);
@@ -480,6 +520,14 @@ impl RegistryState {
 }
 
 impl HistogramState {
+    fn add_batch(&mut self, count: u64, sum: f64, cumulative: &[u64]) {
+        self.count = self.count.saturating_add(count);
+        self.sum += sum;
+        for (bucket, add) in self.cumulative_buckets.iter_mut().zip(cumulative) {
+            *bucket = bucket.saturating_add(*add);
+        }
+    }
+
     fn observe(&mut self, seconds: f64, buckets: &[f64]) {
         self.count = self.count.saturating_add(1);
         self.sum += seconds;
@@ -1300,6 +1348,11 @@ pub enum Observation {
         /// Whether the backend is in the proxy's local location.
         local: bool,
     },
+    /// opt#23: one session's accumulated command completions for one
+    /// `(backend, command)` pair, folded as a batch. Produced only by the
+    /// recorder's own accumulator (drained on session close); the exporter's
+    /// periodic sweep folds live accumulators directly.
+    CommandBatch(CommandBatch),
     /// One accepted command reached its terminal boundary.
     CommandCompleted {
         /// Backend address (the legacy metric label).
@@ -1370,6 +1423,7 @@ impl Observation {
             | Self::HandshakeCompleted { backend, .. }
             | Self::CommandCompleted { backend, .. }
             | Self::BackendTrafficSettled { backend, .. } => backend.len() <= MAX_LABEL_BYTES,
+            Self::CommandBatch(batch) => batch.entry.backend.len() <= MAX_LABEL_BYTES,
             // Both endpoints are label values, so both are bounded.
             Self::MigrationIssued { from, to, .. } | Self::MigrationSettled { from, to, .. } => {
                 from.len() <= MAX_LABEL_BYTES && to.len() <= MAX_LABEL_BYTES
@@ -1439,11 +1493,303 @@ impl control_router::MigrationSink for MigrationMetrics {
     }
 }
 
+/// opt#23: distinct `(backend, command)` pairs one session accumulates before
+/// the next sweep. A session talks to one backend at a time and uses a
+/// handful of command types; a redirect leaves the old backend's pairs until
+/// the next sweep drains them. Reaching the bound flushes the accumulator
+/// through the queue (see [`MetricsRecorder::try_record`]) before the unseen
+/// pair is accumulated.
+const MAX_LOCAL_COMMAND_KEYS: usize = 32;
+
+/// One session's accumulated command completions for one
+/// `(backend, command)` pair. While the series bounds are not reached,
+/// folding it yields the same registry and pending deltas as folding the
+/// completions one by one: histogram buckets are kept cumulative like
+/// [`HistogramState`], invalid durations are counted so they can be shed
+/// exactly as [`Aggregator::histogram`] sheds them, every counter remembers
+/// how many completions carried a nonzero delta because
+/// [`Aggregator::counter`] counts an update only for those, and the pair's
+/// counter series are created in the order their first nonzero update
+/// arrived. At a series bound the shed counts match per completion and the
+/// pair's own series order matches, but batches change how pairs and
+/// sessions interleave, so which series of *different* pairs win the last
+/// slots can differ from the per-completion timeline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandBatch {
+    entry: LocalCommandEntry,
+}
+
+impl CommandBatch {
+    /// Backend address the completions were attributed to.
+    #[must_use]
+    pub fn backend(&self) -> &str {
+        &self.entry.backend
+    }
+
+    /// Command the completions belong to.
+    #[must_use]
+    pub const fn command(&self) -> Command {
+        self.entry.command
+    }
+
+    /// Number of completions in the batch.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.entry.count
+    }
+
+    /// Summed backend traffic of the completions.
+    #[must_use]
+    pub const fn traffic(&self) -> BackendTraffic {
+        self.entry.traffic
+    }
+}
+
+/// Counter series of a pair beyond `query_total`, in the order the
+/// per-completion path creates them within one completion.
+const COUNTER_SERIES_IN_BYTES: u8 = 0;
+const COUNTER_SERIES_IN_PACKETS: u8 = 1;
+const COUNTER_SERIES_OUT_BYTES: u8 = 2;
+const COUNTER_SERIES_OUT_PACKETS: u8 = 3;
+const COUNTER_SERIES_CROSS_LOCATION: u8 = 4;
+/// The traffic series in [`CommandKeys::traffic`] order.
+const TRAFFIC_SERIES: [u8; 4] = [
+    COUNTER_SERIES_IN_BYTES,
+    COUNTER_SERIES_IN_PACKETS,
+    COUNTER_SERIES_OUT_BYTES,
+    COUNTER_SERIES_OUT_PACKETS,
+];
+
+#[derive(Debug, Clone, PartialEq)]
+struct LocalCommandEntry {
+    backend: String,
+    command: Command,
+    /// Completions accumulated (each counts one `query_total` update).
+    count: u64,
+    /// Completions whose duration was not a finite non-negative number.
+    duration_invalid: u64,
+    duration_sum: f64,
+    duration_buckets: Vec<u64>,
+    /// Completions whose connection age was not a finite non-negative number.
+    since_invalid: u64,
+    since_sum: f64,
+    since_buckets: Vec<u64>,
+    traffic: BackendTraffic,
+    /// Completions with a nonzero value per traffic field, in
+    /// [`CommandKeys::traffic`] order.
+    traffic_updates: [u64; 4],
+    /// Cross-location bytes of the non-local completions.
+    cross_location_bytes: u64,
+    /// Non-local completions with nonzero cross-location bytes.
+    cross_location_updates: u64,
+    /// Counter series in the order their first nonzero update arrived, so
+    /// the batch creates them in the order the per-completion path would
+    /// have. `query_total` and the histograms always come first.
+    series_order: Vec<u8>,
+}
+
+impl LocalCommandEntry {
+    fn new(backend: String, command: Command) -> Self {
+        Self {
+            backend,
+            command,
+            count: 0,
+            duration_invalid: 0,
+            duration_sum: 0.0,
+            duration_buckets: vec![0; QUERY_BUCKETS.len()],
+            since_invalid: 0,
+            since_sum: 0.0,
+            since_buckets: vec![0; QUERY_AGE_BUCKETS.len()],
+            traffic: BackendTraffic::default(),
+            traffic_updates: [0; 4],
+            cross_location_bytes: 0,
+            cross_location_updates: 0,
+            series_order: Vec::new(),
+        }
+    }
+
+    fn accumulate(
+        &mut self,
+        duration: f64,
+        since_connection: f64,
+        traffic: BackendTraffic,
+        local: bool,
+    ) {
+        self.count = self.count.saturating_add(1);
+        accumulate_histogram(
+            duration,
+            &QUERY_BUCKETS,
+            &mut self.duration_invalid,
+            &mut self.duration_sum,
+            &mut self.duration_buckets,
+        );
+        accumulate_histogram(
+            since_connection,
+            &QUERY_AGE_BUCKETS,
+            &mut self.since_invalid,
+            &mut self.since_sum,
+            &mut self.since_buckets,
+        );
+        let fields = [
+            traffic.inbound_bytes,
+            traffic.inbound_packets,
+            traffic.outbound_bytes,
+            traffic.outbound_packets,
+        ];
+        for (series, (updates, value)) in TRAFFIC_SERIES
+            .into_iter()
+            .zip(self.traffic_updates.iter_mut().zip(fields))
+        {
+            if value != 0 {
+                if *updates == 0 {
+                    self.series_order.push(series);
+                }
+                *updates = updates.saturating_add(1);
+            }
+        }
+        self.traffic.inbound_bytes = self
+            .traffic
+            .inbound_bytes
+            .saturating_add(traffic.inbound_bytes);
+        self.traffic.inbound_packets = self
+            .traffic
+            .inbound_packets
+            .saturating_add(traffic.inbound_packets);
+        self.traffic.outbound_bytes = self
+            .traffic
+            .outbound_bytes
+            .saturating_add(traffic.outbound_bytes);
+        self.traffic.outbound_packets = self
+            .traffic
+            .outbound_packets
+            .saturating_add(traffic.outbound_packets);
+        let cross_location = traffic.inbound_bytes.saturating_add(traffic.outbound_bytes);
+        if !local && cross_location != 0 {
+            if self.cross_location_updates == 0 {
+                self.series_order.push(COUNTER_SERIES_CROSS_LOCATION);
+            }
+            self.cross_location_bytes = self.cross_location_bytes.saturating_add(cross_location);
+            self.cross_location_updates = self.cross_location_updates.saturating_add(1);
+        }
+    }
+}
+
+/// Mirrors [`Aggregator::histogram`]'s accept/shed split at accumulation time.
+fn accumulate_histogram(
+    seconds: f64,
+    buckets: &[f64],
+    invalid: &mut u64,
+    sum: &mut f64,
+    cumulative: &mut [u64],
+) {
+    if !seconds.is_finite() || seconds < 0.0 {
+        *invalid = invalid.saturating_add(1);
+        return;
+    }
+    *sum += seconds;
+    for (upper, bucket) in buckets.iter().zip(cumulative.iter_mut()) {
+        if seconds <= *upper {
+            *bucket = bucket.saturating_add(1);
+        }
+    }
+}
+
+/// One session's command accumulator: written only by that session's task,
+/// drained by the exporter's sweep and on session close.
+#[derive(Debug, Default)]
+struct LocalCommandStats {
+    entries: Vec<LocalCommandEntry>,
+}
+
+impl LocalCommandStats {
+    /// Returns false when the pair is unseen and the key bound is reached;
+    /// the caller then flushes the accumulator and retries once.
+    fn accumulate(
+        &mut self,
+        backend: &str,
+        command: Command,
+        local: bool,
+        duration: f64,
+        since_connection: f64,
+        traffic: BackendTraffic,
+    ) -> bool {
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| entry.command == command && entry.backend == backend);
+        let entry = if let Some(position) = position {
+            &mut self.entries[position]
+        } else {
+            if self.entries.len() >= MAX_LOCAL_COMMAND_KEYS {
+                return false;
+            }
+            self.entries
+                .push(LocalCommandEntry::new(backend.to_owned(), command));
+            let last = self.entries.len() - 1;
+            &mut self.entries[last]
+        };
+        entry.accumulate(duration, since_connection, traffic, local);
+        true
+    }
+
+    fn take(&mut self) -> Vec<LocalCommandEntry> {
+        std::mem::take(&mut self.entries)
+    }
+}
+
+/// Live accumulators the exporter sweeps once per tick.
+type Accumulators = Arc<Mutex<Vec<Weak<Mutex<LocalCommandStats>>>>>;
+
+/// Locks a session accumulator or the accumulator list; a poisoned lock is
+/// recovered because the state is only counters.
+fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Cloneable non-blocking SQL-path metrics surface.
-#[derive(Clone, Default)]
+///
+/// opt#23: command completions are accumulated in a per-clone accumulator
+/// (one per session in practice) and folded by the exporter's sweep every
+/// tick and on session close, instead of crossing the queue one by one.
+/// Recording never waits on I/O or on another session: the only lock a
+/// completion takes is this clone's own accumulator, which the sweep holds
+/// for a bounded copy. Under normal scheduling command-family series lag the
+/// live state by at most one exporter tick; scheduling delay adds to that.
+#[derive(Default)]
 pub struct MetricsRecorder {
     tx: Option<mpsc::Sender<Observation>>,
     dropped: Arc<AtomicU64>,
+    /// This clone's accumulator, created on its first command completion.
+    local: OnceLock<Arc<Mutex<LocalCommandStats>>>,
+    accumulators: Accumulators,
+}
+
+impl Clone for MetricsRecorder {
+    /// A clone starts with an empty accumulator of its own; the queue, the
+    /// drop counter and the accumulator list are shared.
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            dropped: Arc::clone(&self.dropped),
+            local: OnceLock::new(),
+            accumulators: Arc::clone(&self.accumulators),
+        }
+    }
+}
+
+impl Drop for MetricsRecorder {
+    /// Session close: whatever the sweep has not taken yet is submitted to
+    /// the queue as batches, best-effort; a batch the queue cannot take is
+    /// shed and counted per completion.
+    fn drop(&mut self) {
+        let Some(local) = self.local.get() else {
+            return;
+        };
+        let entries = lock_recovering(local).take();
+        self.send_batches(entries);
+    }
 }
 
 impl MetricsRecorder {
@@ -1456,6 +1802,8 @@ impl MetricsRecorder {
             Self {
                 tx: Some(tx),
                 dropped: Arc::new(AtomicU64::new(0)),
+                local: OnceLock::new(),
+                accumulators: Arc::default(),
             },
             rx,
         )
@@ -1468,11 +1816,88 @@ impl MetricsRecorder {
         let Some(tx) = &self.tx else {
             return false;
         };
-        if !observation.labels_are_bounded() || tx.try_send(observation).is_err() {
+        if !observation.labels_are_bounded() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if let Observation::CommandCompleted {
+            backend,
+            command,
+            duration,
+            since_connection,
+            traffic,
+            local,
+        } = observation
+        {
+            let stats = self.local_stats();
+            let duration = duration.as_secs_f64();
+            let since_connection = since_connection.as_secs_f64();
+            let mut guard = lock_recovering(stats);
+            if guard.accumulate(
+                &backend,
+                command,
+                local,
+                duration,
+                since_connection,
+                traffic,
+            ) {
+                return true;
+            }
+            // Pair bound reached: hand the accumulated pairs to the queue as
+            // batches (a full queue sheds them, counted per completion, as
+            // it always did) and accumulate the new pair in the emptied
+            // accumulator. The only remaining loss condition is the queue.
+            let entries = guard.take();
+            drop(guard);
+            self.send_batches(entries);
+            let accepted = lock_recovering(stats).accumulate(
+                &backend,
+                command,
+                local,
+                duration,
+                since_connection,
+                traffic,
+            );
+            if !accepted {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            return accepted;
+        }
+        if tx.try_send(observation).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         true
+    }
+
+    /// Hands accumulated pairs to the queue as batches without waiting. A
+    /// full or closed queue sheds a batch and counts every completion it
+    /// represented, like the per-completion path counted a full queue.
+    fn send_batches(&self, entries: Vec<LocalCommandEntry>) {
+        for entry in entries {
+            let count = entry.count;
+            let batch = Observation::CommandBatch(CommandBatch { entry });
+            if self
+                .tx
+                .as_ref()
+                .is_none_or(|tx| tx.try_send(batch).is_err())
+            {
+                self.dropped.fetch_add(count, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// This clone's accumulator, registered for the sweep on first use.
+    fn local_stats(&self) -> &Arc<Mutex<LocalCommandStats>> {
+        self.local.get_or_init(|| {
+            let stats = Arc::new(Mutex::new(LocalCommandStats::default()));
+            lock_recovering(&self.accumulators).push(Arc::downgrade(&stats));
+            stats
+        })
+    }
+
+    fn accumulators(&self) -> Accumulators {
+        Arc::clone(&self.accumulators)
     }
 
     /// Current number of intentionally shed SQL-path observations.
@@ -1662,6 +2087,129 @@ impl Aggregator {
     /// Shed rule is unchanged: a series already in `pending` is always
     /// accepted; a new one is accepted only below `MAX_PENDING_SERIES`, and a
     /// shed update reaches neither `pending` nor the registry.
+    /// Batch twin of [`Self::counter`]: `updates` completions contributed the
+    /// nonzero `delta`. Shed accounting counts each of those updates, exactly
+    /// as the per-completion path would have.
+    fn counter_batch(
+        &mut self,
+        registry: &mut RegistryState,
+        key: &MetricKey,
+        delta: u64,
+        updates: u64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        match self.pending.get_mut(key) {
+            Some(PendingMetric::Counter(value)) => *value = value.saturating_add(delta),
+            Some(PendingMetric::Histogram { .. }) => {
+                self.overflow_dropped = self.overflow_dropped.saturating_add(updates);
+            }
+            None => {
+                if self.pending.len() >= MAX_PENDING_SERIES {
+                    self.overflow_dropped = self.overflow_dropped.saturating_add(updates);
+                    return;
+                }
+                self.pending
+                    .insert(key.clone(), PendingMetric::Counter(delta));
+            }
+        }
+        registry.add_counter_batch(key, delta, updates);
+    }
+
+    /// Batch twin of [`Self::histogram`]: `count` valid observations with
+    /// their accumulated `sum` and cumulative bucket counts; `invalid`
+    /// observations are shed one each, before any series bound, as the
+    /// per-observation path sheds a non-finite or negative value.
+    fn histogram_batch(
+        &mut self,
+        registry: &mut RegistryState,
+        key: &MetricKey,
+        count: u64,
+        invalid: u64,
+        sum: f64,
+        cumulative: &[u64],
+    ) {
+        self.overflow_dropped = self.overflow_dropped.saturating_add(invalid);
+        if count == 0 {
+            return;
+        }
+        match self.pending.get_mut(key) {
+            Some(PendingMetric::Histogram {
+                count: pending_count,
+                sum: pending_sum,
+                cumulative_buckets,
+            }) => {
+                *pending_count = pending_count.saturating_add(count);
+                *pending_sum += sum;
+                for (bucket, add) in cumulative_buckets.iter_mut().zip(cumulative) {
+                    *bucket = bucket.saturating_add(*add);
+                }
+            }
+            Some(PendingMetric::Counter(_)) => {
+                self.overflow_dropped = self.overflow_dropped.saturating_add(count);
+            }
+            None => {
+                if self.pending.len() >= MAX_PENDING_SERIES {
+                    // Two per observation, as the per-observation path.
+                    self.overflow_dropped = self
+                        .overflow_dropped
+                        .saturating_add(count.saturating_mul(2));
+                    return;
+                }
+                self.pending.insert(
+                    key.clone(),
+                    PendingMetric::Histogram {
+                        count,
+                        sum,
+                        cumulative_buckets: cumulative.to_vec(),
+                    },
+                );
+            }
+        }
+        registry.observe_histogram_batch(key, count, sum, cumulative);
+    }
+
+    /// Folds one session's accumulated completions for one pair in the same
+    /// series order as `CommandCompleted`.
+    fn command_batch(&mut self, registry: &mut RegistryState, entry: LocalCommandEntry) {
+        let keys = self.command_keys_for(entry.backend, entry.command.name());
+        self.counter_batch(registry, &keys.query_total, entry.count, entry.count);
+        self.histogram_batch(
+            registry,
+            &keys.query_duration,
+            entry.count.saturating_sub(entry.duration_invalid),
+            entry.duration_invalid,
+            entry.duration_sum,
+            &entry.duration_buckets,
+        );
+        self.histogram_batch(
+            registry,
+            &keys.since_connection,
+            entry.count.saturating_sub(entry.since_invalid),
+            entry.since_invalid,
+            entry.since_sum,
+            &entry.since_buckets,
+        );
+        for series in &entry.series_order {
+            if *series == COUNTER_SERIES_CROSS_LOCATION {
+                self.counter_batch(
+                    registry,
+                    &keys.cross_location_bytes,
+                    entry.cross_location_bytes,
+                    entry.cross_location_updates,
+                );
+            } else if let Some((key, field)) = keys.traffic.get(usize::from(*series)) {
+                self.counter_batch(
+                    registry,
+                    key,
+                    field.pick(entry.traffic),
+                    entry.traffic_updates[usize::from(*series)],
+                );
+            }
+        }
+    }
+
     fn counter(&mut self, registry: &mut RegistryState, key: &MetricKey, delta: u64) {
         if delta == 0 {
             return;
@@ -1792,6 +2340,7 @@ impl Aggregator {
                 );
                 self.traffic(registry, &backend, traffic, local);
             }
+            Observation::CommandBatch(batch) => self.command_batch(registry, batch.entry),
             Observation::CommandCompleted {
                 backend,
                 command,
@@ -2103,6 +2652,28 @@ impl ExportTotals {
     }
 }
 
+/// Folds every live session accumulator and prunes closed ones. The list
+/// lock is held only to copy the live handles; a session mid-accumulation
+/// (its own lock busy) is skipped, which defers its fold at least to the
+/// next attempt (every consecutive miss defers it again).
+fn sweep_accumulators(accumulators: &Accumulators, aggregator: &mut Aggregator) {
+    let live: Vec<Arc<Mutex<LocalCommandStats>>> = {
+        let mut list = lock_recovering(accumulators);
+        list.retain(|weak| weak.strong_count() > 0);
+        list.iter().filter_map(Weak::upgrade).collect()
+    };
+    for stats in live {
+        let entries = match stats.try_lock() {
+            Ok(mut stats) => stats.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        for entry in entries {
+            aggregator.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+    }
+}
+
 /// Running exporter task. Metrics failure never owns SQL or control-plane
 /// liveness; shutdown and join are explicit so no task is detached.
 pub struct MetricsExporter {
@@ -2135,6 +2706,7 @@ pub fn spawn_metrics_exporter(
 ) -> MetricsExporter {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let dropped = recorder.dropped_counter();
+    let accumulators = recorder.accumulators();
     let task = tokio::spawn(run_exporter(
         client,
         serving,
@@ -2144,6 +2716,7 @@ pub fn spawn_metrics_exporter(
         shutdown_rx,
         interval,
         registry,
+        accumulators,
     ));
     MetricsExporter { shutdown, task }
 }
@@ -2158,6 +2731,7 @@ async fn run_exporter(
     mut shutdown: watch::Receiver<bool>,
     interval: Duration,
     registry: Arc<MetricsRegistry>,
+    accumulators: Accumulators,
 ) {
     let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(10)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2176,6 +2750,7 @@ async fn run_exporter(
                 }
             }
             _ = ticker.tick() => {
+                sweep_accumulators(&accumulators, &mut aggregator);
                 let server = serving.metrics().await;
                 // Every shed observation is one external signal: the SQL-path
                 // queue, the per-batch series bound, the registry's cumulative
@@ -2319,7 +2894,7 @@ pub struct SessionLogContext {
     pub generation: u64,
 }
 
-static SESSION_LOG_WRITER: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+static SESSION_LOG_WRITER: OnceLock<fn(&str)> = OnceLock::new();
 
 /// Installs the process log writer used by [`log_session`]. The binary
 /// installs the shared rotating-file output once at startup; until then (and
@@ -3414,5 +3989,451 @@ mod tests {
         let state = aggregator.registry.lock();
         assert_eq!(state.counters.get(&query_total("backend-c")), Some(&2));
         assert_eq!(state.counters.get(&query_total("backend-a")), Some(&2));
+    }
+    fn completion(
+        backend: &str,
+        command: Command,
+        micros: u64,
+        traffic: BackendTraffic,
+        local: bool,
+    ) -> Observation {
+        Observation::CommandCompleted {
+            backend: backend.to_owned(),
+            command,
+            duration: Duration::from_micros(micros),
+            since_connection: Duration::from_millis(micros * 7),
+            traffic,
+            local,
+        }
+    }
+
+    fn mixed_completions() -> Vec<Observation> {
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: inbound / 50,
+            outbound_bytes: outbound,
+            outbound_packets: outbound / 50,
+        };
+        vec![
+            completion(
+                "10.0.0.1:4000",
+                Command::Query,
+                300,
+                traffic(100, 2_000),
+                true,
+            ),
+            completion("10.0.0.1:4000", Command::Query, 12_000, traffic(0, 0), true),
+            completion(
+                "10.0.0.1:4000",
+                Command::StmtExecute,
+                45,
+                traffic(60, 0),
+                true,
+            ),
+            completion(
+                "10.0.0.2:4000",
+                Command::Query,
+                900,
+                traffic(100, 100),
+                false,
+            ),
+            completion("10.0.0.2:4000", Command::Query, 1, traffic(0, 40), false),
+            completion("10.0.0.2:4000", Command::Ping, 3, traffic(0, 0), false),
+        ]
+    }
+
+    /// opt#23: a session's accumulated batch folds to exactly what the same
+    /// completions fold to one by one — registry, pending deltas and shed
+    /// counts alike.
+    #[test]
+    fn command_batches_fold_identically_to_per_completion() {
+        let mut one_by_one = Aggregator::default();
+        let mut batched = Aggregator::default();
+        let mut stats = LocalCommandStats::default();
+        for observation in mixed_completions() {
+            one_by_one.observe(observation.clone());
+            let Observation::CommandCompleted {
+                backend,
+                command,
+                duration,
+                since_connection,
+                traffic,
+                local,
+            } = observation
+            else {
+                unreachable!("fixture only builds completions");
+            };
+            assert!(stats.accumulate(
+                &backend,
+                command,
+                local,
+                duration.as_secs_f64(),
+                since_connection.as_secs_f64(),
+                traffic,
+            ));
+        }
+        let entries = stats.take();
+        assert_eq!(entries.len(), 4, "four (backend, command) pairs");
+        assert_eq!(
+            entries[2].series_order,
+            vec![
+                COUNTER_SERIES_IN_BYTES,
+                COUNTER_SERIES_IN_PACKETS,
+                COUNTER_SERIES_OUT_BYTES,
+                COUNTER_SERIES_OUT_PACKETS,
+                COUNTER_SERIES_CROSS_LOCATION,
+            ]
+        );
+        for entry in entries {
+            batched.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+        assert_eq!(
+            batched.registry.render_prometheus_text(),
+            one_by_one.registry.render_prometheus_text()
+        );
+        assert_eq!(batched.wire_metrics(&[]), one_by_one.wire_metrics(&[]));
+        assert_eq!(batched.overflow_dropped, one_by_one.overflow_dropped);
+        assert!(stats.take().is_empty(), "take drains the accumulator");
+    }
+
+    /// An invalid duration is shed exactly as the per-observation histogram
+    /// path sheds it: one shed count, the other series still fold.
+    #[test]
+    fn command_batch_sheds_invalid_durations_like_the_histogram_path() {
+        let mut entry = LocalCommandEntry::new("10.0.0.1:4000".to_owned(), Command::Query);
+        entry.accumulate(f64::NAN, 1.0, BackendTraffic::default(), true);
+        entry.accumulate(0.5, -1.0, BackendTraffic::default(), true);
+        assert_eq!(
+            (entry.count, entry.duration_invalid, entry.since_invalid),
+            (2, 1, 1)
+        );
+        let mut aggregator = Aggregator::default();
+        aggregator.observe(Observation::CommandBatch(CommandBatch { entry }));
+        assert_eq!(aggregator.overflow_dropped, 2);
+        let text = aggregator.registry.render_prometheus_text();
+        assert!(text.contains(
+            "tiproxy_session_query_total{backend=\"10.0.0.1:4000\",cmd_type=\"Query\"} 2\n"
+        ));
+        assert!(text.contains(
+            "tiproxy_session_query_duration_seconds_count{backend=\"10.0.0.1:4000\",cmd_type=\"Query\"} 1\n"
+        ));
+    }
+
+    /// Completions stay in the recorder's accumulator (nothing crosses the
+    /// queue) until the recorder drops, which flushes one batch per pair.
+    #[test]
+    fn recorder_accumulates_completions_and_flushes_batches_on_drop() {
+        let (recorder, mut rx) = MetricsRecorder::channel(8);
+        let session = recorder.clone();
+        for observation in mixed_completions() {
+            assert!(session.try_record(observation));
+        }
+        assert!(rx.try_recv().is_err(), "completions never cross the queue");
+        assert!(session.try_record(Observation::GetBackend {
+            duration: Duration::from_millis(1),
+            succeeded: true,
+        }));
+        assert!(matches!(rx.try_recv(), Ok(Observation::GetBackend { .. })));
+        drop(session);
+        let mut counts = Vec::new();
+        while let Ok(observation) = rx.try_recv() {
+            let Observation::CommandBatch(batch) = observation else {
+                unreachable!("only batches remain");
+            };
+            counts.push((
+                batch.entry.backend.clone(),
+                batch.entry.command.name(),
+                batch.entry.count,
+            ));
+        }
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![
+                ("10.0.0.1:4000".to_owned(), Command::Query.name(), 2),
+                ("10.0.0.1:4000".to_owned(), Command::StmtExecute.name(), 1),
+                ("10.0.0.2:4000".to_owned(), Command::Ping.name(), 1),
+                ("10.0.0.2:4000".to_owned(), Command::Query.name(), 2),
+            ]
+        );
+        assert_eq!(recorder.dropped(), 0);
+        drop(recorder);
+        assert!(
+            rx.try_recv().is_err(),
+            "a recorder that never accumulated flushes nothing"
+        );
+    }
+
+    /// Past the per-session pair bound the accumulated pairs go to the queue
+    /// as batches and the unseen pair is accepted; only a full queue sheds,
+    /// counted per completion.
+    #[test]
+    fn accumulator_pair_bound_flushes_through_the_queue() {
+        let (recorder, mut rx) = MetricsRecorder::channel(MAX_LOCAL_COMMAND_KEYS);
+        for index in 0..MAX_LOCAL_COMMAND_KEYS {
+            assert!(recorder.try_record(completion(
+                &format!("10.0.0.{index}:4000"),
+                Command::Query,
+                1,
+                BackendTraffic::default(),
+                true,
+            )));
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(recorder.try_record(completion(
+            "10.0.1.1:4000",
+            Command::Query,
+            1,
+            BackendTraffic::default(),
+            true,
+        )));
+        let mut flushed = 0;
+        while let Ok(observation) = rx.try_recv() {
+            assert!(matches!(observation, Observation::CommandBatch(_)));
+            flushed += 1;
+        }
+        assert_eq!(flushed, MAX_LOCAL_COMMAND_KEYS);
+        assert_eq!(recorder.dropped(), 0);
+        assert_eq!(
+            lock_recovering(recorder.local_stats()).entries.len(),
+            1,
+            "the new pair is accumulated in the emptied accumulator"
+        );
+
+        // A queue too small for the flush sheds the surplus, counted per
+        // completion: two completions in the shed pair.
+        let (recorder, _rx) = MetricsRecorder::channel(1);
+        for index in 0..MAX_LOCAL_COMMAND_KEYS {
+            for _ in 0..2 {
+                assert!(recorder.try_record(completion(
+                    &format!("10.0.0.{index}:4000"),
+                    Command::Query,
+                    1,
+                    BackendTraffic::default(),
+                    true,
+                )));
+            }
+        }
+        assert!(recorder.try_record(completion(
+            "10.0.1.1:4000",
+            Command::Query,
+            1,
+            BackendTraffic::default(),
+            true,
+        )));
+        assert_eq!(
+            recorder.dropped(),
+            2 * (MAX_LOCAL_COMMAND_KEYS as u64 - 1),
+            "one batch fits the queue, the rest are shed per completion"
+        );
+    }
+
+    /// The sweep folds every live accumulator and forgets closed sessions.
+    #[test]
+    fn sweep_folds_live_accumulators_and_prunes_closed_ones() {
+        let (recorder, _rx) = MetricsRecorder::channel(8);
+        let first = recorder.clone();
+        let second = recorder.clone();
+        let idle = recorder.clone();
+        for observation in mixed_completions() {
+            assert!(first.try_record(observation));
+        }
+        assert!(second.try_record(completion(
+            "10.0.0.9:4000",
+            Command::Query,
+            5,
+            BackendTraffic::default(),
+            true,
+        )));
+        let accumulators = recorder.accumulators();
+        assert_eq!(
+            lock_recovering(&accumulators).len(),
+            2,
+            "idle clones never register"
+        );
+        let mut aggregator = Aggregator::default();
+        sweep_accumulators(&accumulators, &mut aggregator);
+        let text = aggregator.registry.render_prometheus_text();
+        assert!(text.contains(
+            "tiproxy_session_query_total{backend=\"10.0.0.1:4000\",cmd_type=\"Query\"} 2\n"
+        ));
+        assert!(text.contains(
+            "tiproxy_session_query_total{backend=\"10.0.0.9:4000\",cmd_type=\"Query\"} 1\n"
+        ));
+        drop(second);
+        drop(idle);
+        sweep_accumulators(&accumulators, &mut aggregator);
+        assert_eq!(
+            lock_recovering(&accumulators).len(),
+            1,
+            "closed sessions are pruned"
+        );
+        assert_eq!(
+            aggregator.registry.render_prometheus_text(),
+            text,
+            "a second sweep with nothing new changes nothing"
+        );
+        drop(first);
+    }
+    /// A pair whose completions flip locality counts cross-location bytes for
+    /// the non-local completions only, like the per-completion path.
+    #[test]
+    fn command_batch_counts_cross_location_per_completion() {
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: 1,
+            outbound_bytes: outbound,
+            outbound_packets: 1,
+        };
+        let script = [
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(100, 200), true),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(30, 40), false),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(5, 6), true),
+        ];
+        let mut one_by_one = Aggregator::default();
+        let mut stats = LocalCommandStats::default();
+        for observation in script {
+            one_by_one.observe(observation.clone());
+            let Observation::CommandCompleted {
+                backend,
+                command,
+                duration,
+                since_connection,
+                traffic,
+                local,
+            } = observation
+            else {
+                unreachable!()
+            };
+            assert!(stats.accumulate(
+                &backend,
+                command,
+                local,
+                duration.as_secs_f64(),
+                since_connection.as_secs_f64(),
+                traffic,
+            ));
+        }
+        let mut batched = Aggregator::default();
+        for entry in stats.take() {
+            assert_eq!(
+                (entry.cross_location_bytes, entry.cross_location_updates),
+                (70, 1)
+            );
+            batched.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+        let text = batched.registry.render_prometheus_text();
+        assert!(
+            text.contains("tiproxy_traffic_cross_location_bytes 70\n"),
+            "{text}"
+        );
+        assert_eq!(text, one_by_one.registry.render_prometheus_text());
+    }
+
+    /// The reviewer's capacity counterexample: with four pending slots left, a
+    /// completion carrying only outbound bytes then one carrying only inbound
+    /// bytes must leave the same surviving series as folding them one by one
+    /// (outbound wins the last slot, inbound is shed), so the batch creates
+    /// the pair's series in first-appearance order.
+    #[test]
+    fn command_batch_creates_series_in_first_appearance_order_at_the_bound() {
+        let traffic = |inbound: u64, outbound: u64| BackendTraffic {
+            inbound_bytes: inbound,
+            inbound_packets: 0,
+            outbound_bytes: outbound,
+            outbound_packets: 0,
+        };
+        let script = [
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(0, 1), true),
+            completion("10.0.0.1:4000", Command::Query, 10, traffic(1, 0), true),
+        ];
+        let prefill = |aggregator: &mut Aggregator| {
+            for index in 0..MAX_PENDING_SERIES - 4 {
+                aggregator.counter_once(
+                    &MetricKey::new(
+                        "tiproxy_backend_dial_backend_fail",
+                        vec![("backend", format!("filler-{index}"))],
+                    ),
+                    1,
+                );
+            }
+        };
+        let mut one_by_one = Aggregator::default();
+        prefill(&mut one_by_one);
+        let mut stats = LocalCommandStats::default();
+        for observation in script {
+            one_by_one.observe(observation.clone());
+            let Observation::CommandCompleted {
+                backend,
+                command,
+                duration,
+                since_connection,
+                traffic,
+                local,
+            } = observation
+            else {
+                unreachable!()
+            };
+            assert!(stats.accumulate(
+                &backend,
+                command,
+                local,
+                duration.as_secs_f64(),
+                since_connection.as_secs_f64(),
+                traffic,
+            ));
+        }
+        let mut batched = Aggregator::default();
+        prefill(&mut batched);
+        for entry in stats.take() {
+            assert_eq!(
+                entry.series_order,
+                vec![COUNTER_SERIES_OUT_BYTES, COUNTER_SERIES_IN_BYTES]
+            );
+            batched.observe(Observation::CommandBatch(CommandBatch { entry }));
+        }
+        assert_eq!(batched.wire_metrics(&[]), one_by_one.wire_metrics(&[]));
+        assert_eq!(
+            batched.registry.render_prometheus_text(),
+            one_by_one.registry.render_prometheus_text()
+        );
+        assert_eq!(batched.overflow_dropped, one_by_one.overflow_dropped);
+        assert_eq!(
+            batched.overflow_dropped, 1,
+            "the inbound update is shed once"
+        );
+    }
+
+    /// At the registry series bound a shed counter batch counts every
+    /// completion that carried a nonzero delta, like shedding them one by one.
+    #[test]
+    fn registry_counter_batch_sheds_per_update_at_the_series_bound() {
+        let registry = MetricsRegistry::new();
+        {
+            let mut state = registry.lock();
+            for index in 0..MAX_REGISTRY_SERIES {
+                state.add_counter(
+                    &MetricKey::new(
+                        "tiproxy_backend_dial_backend_fail",
+                        vec![("backend", format!("filler-{index}"))],
+                    ),
+                    1,
+                );
+            }
+            assert_eq!(state.series_count(), MAX_REGISTRY_SERIES);
+            let key = MetricKey::new(
+                "tiproxy_session_query_total",
+                vec![("backend", "x".to_owned())],
+            );
+            state.add_counter_batch(&key, 7, 3);
+            assert_eq!(state.series_dropped, 3);
+            for _ in 0..3 {
+                state.add_counter(&key, 1);
+            }
+            assert_eq!(
+                state.series_dropped, 6,
+                "three per-completion sheds count the same"
+            );
+        }
     }
 }
