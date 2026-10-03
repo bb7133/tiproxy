@@ -71,6 +71,7 @@
 //! aligned old backend; an old-backend disconnect or incomplete snapshot
 //! response closes the poisoned session.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -764,13 +765,23 @@ async fn run_bound_session_observed(
     // framing/TLS/compression layer; the handle survives in-place upgrades.
     let client_socket = CountedIo::new(stream);
     let client_counters = client_socket.counters();
+    // `proxy.conn-buffer-size` is Dynamic: size the two per-connection reader
+    // buffers (client and backend over-read window + forward scratch) from the
+    // same committed generation this connection was admitted under, so they
+    // always match the `conn-buffer-size * 2` admission reservation. A reload
+    // takes effect on the next admitted session; existing sessions keep the
+    // value captured in their immutable seat snapshot.
+    let stream_buffer_size = crate::server::reader_stream_buffer_size(seat.snapshot());
     let snapshot_updates = seat.subscribe_snapshot_updates();
     let engine = Engine {
         connection_id: identity.connection_id,
         endpoints,
         inbound_proxy_header: None,
         proxy_client_source: Arc::clone(&proxy_client_source),
-        client_io: PacketIo::new(ClientTransport::Plain(client_socket)),
+        client_io: PacketIo::with_read_stream_buffer_size(
+            ClientTransport::Plain(client_socket),
+            stream_buffer_size,
+        ),
         client_counters,
         backend: None,
         candidate: None,
@@ -811,6 +822,7 @@ async fn run_bound_session_observed(
         wire_failed: false,
         accepted_at,
         handshake_deadline: loop_config.handshake_deadline,
+        stream_buffer_size,
         frontend_tls_active: false,
         metrics: metrics.clone(),
         log_context: log_context.clone(),
@@ -1432,6 +1444,9 @@ struct Engine {
     /// rather than a fresh timer, so the whole handshake — plaintext greeting,
     /// `SSLRequest`, TLS, auth — shares one deadline.
     handshake_deadline: Duration,
+    /// Per-connection read-buffer size (`proxy.conn-buffer-size`, 32 KiB
+    /// default); sizes the client and backend reader buffers only.
+    stream_buffer_size: NonZeroUsize,
     /// Whether the client upgraded this connection to TLS via `SSLRequest`.
     /// Drives the greeting-response `tls` metadata and capability trust.
     frontend_tls_active: bool,
@@ -2171,7 +2186,10 @@ impl Engine {
             return Some(source);
         }
         let mut backend = BackendIo {
-            backend_io: PacketIo::new(BackendTransport::Plain(backend_socket)),
+            backend_io: PacketIo::with_read_stream_buffer_size(
+                BackendTransport::Plain(backend_socket),
+                self.stream_buffer_size,
+            ),
             counters: backend_counters,
             id: backend_id.clone(),
             address: backend_address,
@@ -4299,7 +4317,10 @@ impl Engine {
             .map_err(|_| CandidateFailure::Dial)?;
         }
         let mut candidate = BackendIo {
-            backend_io: PacketIo::new(BackendTransport::Plain(backend_socket)),
+            backend_io: PacketIo::with_read_stream_buffer_size(
+                BackendTransport::Plain(backend_socket),
+                self.stream_buffer_size,
+            ),
             counters,
             id: target.backend_id.clone(),
             address: target.backend_address.clone(),
