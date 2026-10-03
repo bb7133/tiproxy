@@ -639,6 +639,31 @@ fn snapshot_config(snapshot: &ValidatedSnapshot) -> Result<&ConfigSnapshot, Serv
         .ok_or(ServerError::MissingConfig)
 }
 
+/// Default per-connection reader buffer when a snapshot carries no config
+/// (mirrors `proxy-io`'s 32-KiB `DEFAULT_STREAM_BUFFER_SIZE`).
+const DEFAULT_READER_STREAM_BUFFER: std::num::NonZeroUsize =
+    match std::num::NonZeroUsize::new(32 * 1024) {
+        Some(value) => value,
+        None => std::num::NonZeroUsize::MIN,
+    };
+
+/// The per-connection reader buffer size for a session admitted under
+/// `snapshot`.
+///
+/// Read from the same committed generation that admission used for the
+/// `connection_buffer_bytes * 2` reservation, so the two session reader buffers
+/// (the over-read prefetch window and the forward scratch) always match the
+/// reserved budget. Because each session captures an immutable seat snapshot,
+/// a config reload takes effect on the next admitted session while existing
+/// sessions keep their captured size.
+#[must_use]
+pub(crate) fn reader_stream_buffer_size(snapshot: &ValidatedSnapshot) -> std::num::NonZeroUsize {
+    snapshot_config(snapshot)
+        .ok()
+        .and_then(|config| std::num::NonZeroUsize::new(config.connection_buffer_bytes as usize))
+        .unwrap_or(DEFAULT_READER_STREAM_BUFFER)
+}
+
 /// Converts a snapshot keepalive policy into the socket layer's.
 #[must_use]
 pub fn snapshot_keepalive(policy: &SnapshotKeepalive) -> KeepalivePolicy {
@@ -1515,16 +1540,29 @@ mod tests {
         let owner = tokio::spawn(server.run(move |connection: AcceptedConnection| {
             let tx = tx.clone();
             async move {
-                let _ = tx.send(connection.metadata().reserved_buffer_bytes);
+                // Report both the reservation and the reader-buffer size derived
+                // from the same admission snapshot; they must stay in lockstep
+                // (reservation = reader size * 2).
+                let reader = reader_stream_buffer_size(connection.snapshot()).get();
+                let _ = tx.send((reader, connection.metadata().reserved_buffer_bytes));
                 std::future::pending::<()>().await;
             }
         }));
 
         let _first = TcpStream::connect(actual).await?;
-        let first = timeout(TokioDuration::from_secs(2), rx.recv())
+        let (first_reader, first) = timeout(TokioDuration::from_secs(2), rx.recv())
             .await?
             .ok_or("first handler did not report")?;
         assert_eq!(first, 8192, "4 KiB buffer reserves double");
+        assert_eq!(
+            first_reader, 4096,
+            "the two reader buffers use the admitted generation's size"
+        );
+        assert_eq!(
+            first_reader as u64 * 2,
+            first,
+            "reader size and reservation agree"
+        );
         assert_eq!(handle.metrics().connection_buffer_bytes, 8192);
 
         handle.update_snapshot(snapshot_with(2, one_listener(), |config| {
@@ -1532,10 +1570,19 @@ mod tests {
         })?)?;
 
         let _second = TcpStream::connect(actual).await?;
-        let second = timeout(TokioDuration::from_secs(2), rx.recv())
+        let (second_reader, second) = timeout(TokioDuration::from_secs(2), rx.recv())
             .await?
             .ok_or("second handler did not report")?;
         assert_eq!(second, 32768, "the reload reached the new admission");
+        assert_eq!(
+            second_reader, 16384,
+            "the next session's readers use the reloaded size"
+        );
+        assert_eq!(
+            second_reader as u64 * 2,
+            second,
+            "reader size and reservation agree after reload"
+        );
         assert_eq!(
             handle.metrics().connection_buffer_bytes,
             8192 + 32768,

@@ -1960,11 +1960,35 @@ impl<T> PacketIo<T> {
         }
     }
 
+    /// Creates a duplex endpoint whose **read** path uses a caller-selected
+    /// buffer size while the write path keeps the 32-KiB default.
+    ///
+    /// The read buffer size drives the two per-connection reader allocations
+    /// (the over-read prefetch window and the forward scratch); admission
+    /// reserves `conn-buffer-size * 2` for exactly those two reader buffers.
+    /// Sizing only the reader keeps that reservation contract intact and leaves
+    /// the write path unchanged.
+    #[must_use]
+    pub fn with_read_stream_buffer_size(inner: T, stream_buffer_size: NonZeroUsize) -> Self {
+        Self {
+            inner,
+            read: ReaderState::with_stream_buffer_size(stream_buffer_size),
+            write: WriterState::new(),
+        }
+    }
+
     /// Enables read-side over-read buffering on this endpoint (backend readers
     /// only). One transport read then fills a bounded window and later physical
     /// packets are served from it, cutting `recvfrom` on multi-packet responses.
     pub fn enable_read_buffering(&mut self) {
         self.read.enable_over_read();
+    }
+
+    /// The read-side stream buffer size (bytes) — the `conn-buffer-size`-derived
+    /// capacity of the two reader buffers. Exposed for diagnostics.
+    #[must_use]
+    pub const fn read_stream_buffer_size(&self) -> usize {
+        self.read.stream_buffer_size.get()
     }
 
     /// Whether any peeked-but-unconsumed bytes remain above the transport (read
@@ -3725,6 +3749,38 @@ mod tests {
         assert_eq!(state.read.prefetch_start, 0);
         assert_eq!(state.read.prefetch_end, 0);
         Ok(())
+    }
+
+    #[test]
+    fn with_read_stream_buffer_size_sizes_reader_only() {
+        // Reader uses the caller size (driving both the over-read window and
+        // the forward scratch); the writer keeps the 32-KiB default so the
+        // conn-buffer-size reservation contract (2x for the two reader buffers)
+        // is unaffected.
+        let Some(size) = NonZeroUsize::new(16 * 1024) else {
+            unreachable!("16 KiB is nonzero")
+        };
+        let mut io = PacketIo::with_read_stream_buffer_size(Cursor::new(Vec::<u8>::new()), size);
+        assert_eq!(io.read.stream_buffer_size, size);
+        assert_eq!(
+            io.write.stream_buffer_size.get(),
+            DEFAULT_STREAM_BUFFER_SIZE
+        );
+        // The reader stream buffer size drives both reader allocations: the
+        // over-read prefetch window capacity and (via `stream_buffer_size`) the
+        // forward scratch read bound.
+        io.enable_read_buffering();
+        assert_eq!(io.read.over_read.capacity, size.get());
+        // Default constructor leaves both at the 32-KiB default.
+        let def = PacketIo::new(Cursor::new(Vec::<u8>::new()));
+        assert_eq!(
+            def.read.stream_buffer_size.get(),
+            DEFAULT_STREAM_BUFFER_SIZE
+        );
+        assert_eq!(
+            def.write.stream_buffer_size.get(),
+            DEFAULT_STREAM_BUFFER_SIZE
+        );
     }
 
     #[tokio::test]
