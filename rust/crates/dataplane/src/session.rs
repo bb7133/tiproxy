@@ -612,14 +612,19 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     if let Some(probe) = next_probe.as_mut() {
                         *probe = Instant::now() + self.config.backend_check_interval;
                     }
-                    // Snapshot the state out of the lock *before* the await: a
-                    // `self.core.state_snapshot()` sub-expression would otherwise
-                    // keep the guard alive across `backend_active().await`.
-                    // S2b: this read must be re-snapshotted after the await
-                    // before acting, once the engine can commit concurrently —
-                    // it is not commit authority.
-                    let probe_state = self.core.state_snapshot();
-                    if probe_safe(probe_state) && !self.handler.backend_active().await {
+                    // Admit the probe atomically with the core: only probe when
+                    // it is quiescent (open, probe-safe state, `pending == 0`),
+                    // and hold the returned operation permit across the await.
+                    // While it is held `pending >= 1`, so the engine fast path
+                    // falls back and cannot turn `Ready -> Command` mid-probe —
+                    // a stale `inactive` result can no longer tear down a command
+                    // the fast path committed during the probe. If the core is
+                    // not quiescent the probe is skipped this round. The permit
+                    // binding stays in scope across the `&&` await and the body,
+                    // so it is held for the whole probe and dropped afterwards.
+                    if let Some(_probe_permit) = self.core.try_quiescent_operation(probe_safe)
+                        && !self.handler.backend_active().await
+                    {
                         self.apply(
                             SessionEvent::BackendIoError,
                             &mut armed_deadline,

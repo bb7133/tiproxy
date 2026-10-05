@@ -170,6 +170,28 @@ impl Gate {
         }
     }
 
+    /// Admits a quiescent loop-side operation (currently the backend probe)
+    /// atomically with the core: only when the core is `open`, `pending == 0`,
+    /// and `state_ok` holds for the current FSM state does it register an
+    /// operation [`GatePermit`] and return it. Holding that permit across the
+    /// operation's `.await` keeps `pending >= 1`, so the engine fast path falls
+    /// back for the duration — the operation cannot race a concurrent inline
+    /// commit (e.g. a probe's stale `inactive` result tearing down a command
+    /// the fast path committed mid-probe). Returns `None` (skip) otherwise.
+    pub(crate) fn try_quiescent_operation<F>(&self, state_ok: F) -> Option<GatePermit>
+    where
+        F: FnOnce(SessionState) -> bool,
+    {
+        let mut inner = lock(&self.inner);
+        if !inner.open || inner.pending != 0 || !state_ok(inner.fsm.state()) {
+            return None;
+        }
+        inner.pending += 1;
+        Some(GatePermit {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
     /// Count of inline fast-path commits. Test/diagnostic only.
     #[cfg(test)]
     pub(crate) fn fast_transitions(&self) -> u64 {
@@ -582,6 +604,71 @@ mod tests {
         assert_eq!(core.fast_transitions(), 0);
         assert_eq!(core.pending(), 0);
         assert_eq!(core.state_snapshot(), SessionState::Ready);
+    }
+
+    #[test]
+    fn probe_permit_is_quiescent_and_blocks_the_fast_path_across_its_await() {
+        let (_tx, shutdown) = watch::channel(false);
+        let only_ready = |state| state == SessionState::Ready;
+
+        // Not probe-safe: a fresh core in Accept yields no permit.
+        assert!(
+            Gate::new().try_quiescent_operation(only_ready).is_none(),
+            "a non-probe-safe state is not admitted"
+        );
+
+        // Sealed: no probe once terminating.
+        let sealed = core_in_ready();
+        sealed.seal_closed();
+        assert!(
+            sealed.try_quiescent_operation(only_ready).is_none(),
+            "a sealed core admits no probe"
+        );
+
+        // Already busy: pending != 0 yields no permit.
+        let busy = core_in_ready();
+        let op = busy.operation_permit();
+        assert!(
+            busy.try_quiescent_operation(only_ready).is_none(),
+            "a non-quiescent core (pending != 0) admits no probe"
+        );
+        drop(op);
+
+        // Quiescent: a permit is granted, and WHILE it is held (modeling the
+        // probe's `backend_active().await`) the engine fast path falls back —
+        // so no concurrent inline commit can turn Ready -> Command mid-probe.
+        let core = core_in_ready();
+        let Some(probe_permit) = core.try_quiescent_operation(only_ready) else {
+            unreachable!("a quiescent probe-safe core admits the probe");
+        };
+        assert_eq!(core.pending(), 1, "the probe permit holds the floor");
+        assert!(
+            matches!(
+                core.try_commit_steady(
+                    SessionEvent::ClientCommand,
+                    SessionEffect::ForwardCommandToBackend,
+                    &shutdown,
+                ),
+                FastPath::Fallback
+            ),
+            "the fast path falls back while the probe permit is held"
+        );
+        assert_eq!(
+            core.fast_transitions(),
+            0,
+            "no commit happened during the probe"
+        );
+        assert_eq!(
+            core.state_snapshot(),
+            SessionState::Ready,
+            "FSM untouched during the probe"
+        );
+        drop(probe_permit);
+        assert_eq!(
+            core.pending(),
+            0,
+            "dropping the probe permit frees the floor"
+        );
     }
 
     #[tokio::test]
