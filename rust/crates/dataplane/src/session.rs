@@ -304,8 +304,15 @@ impl LoopEventRx {
 /// Parks on the shared shutdown `watch` once and fires `fired` when the
 /// signal becomes `true` or its sender is dropped. Ignores changes back to
 /// `false`, which the loop treated as a no-op wake.
-async fn shutdown_relay(mut shutdown: watch::Receiver<bool>, fired: oneshot::Sender<()>) {
+async fn shutdown_relay(
+    mut shutdown: watch::Receiver<bool>,
+    core: crate::gate::Gate,
+    fired: oneshot::Sender<()>,
+) {
     loop {
+        // `borrow_and_update` reads the current value (so a shutdown that
+        // predates this task is seen on the first poll); a dropped sender is a
+        // shutdown too.
         if *shutdown.borrow_and_update() {
             break;
         }
@@ -313,6 +320,12 @@ async fn shutdown_relay(mut shutdown: watch::Receiver<bool>, fired: oneshot::Sen
             break;
         }
     }
+    // Seal the core *before* waking the loop, so `open == false` is published
+    // under the core lock strictly before the loop can act on the oneshot. This
+    // makes the relay the single shutdown-admission linearization point: the
+    // engine's fast path (reads `open`) and the loop's gated apply (reads
+    // `open`) both refuse once this seal lands, regardless of oneshot latency.
+    core.seal_closed();
     let _ = fired.send(());
 }
 
@@ -458,6 +471,9 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         end
     }
 
+    // One cohesive select/dispatch loop; splitting the arms out would scatter
+    // the shared deadline/probe/queued-command state and obscure the ordering.
+    #[allow(clippy::too_many_lines)]
     async fn event_loop(&mut self, events: &mut LoopEventRx) -> LoopEnd {
         let handshake_deadline = Instant::now() + self.config.handshake_deadline;
         let mut armed_deadline: Option<(Instant, SessionEvent)> =
@@ -479,15 +495,21 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // session. Awaiting `changed()` inside the select registered this
         // task on the channel's waiter list and unlinked it again on every
         // iteration, serializing all sessions on that list's mutex. Instead a
-        // per-session relay task parks on the shared channel once and fires a
-        // private oneshot; the loop polls the oneshot (no shared state) and
-        // keeps an exact lock-free precheck via `has_changed`.
-        // `mark_changed` makes the first precheck read the current value, so
-        // a shutdown that predates the loop is still seen before any select.
-        self.shutdown.mark_changed();
+        // per-session relay task parks on the shared channel once, seals the
+        // core, and fires a private oneshot; the loop polls the oneshot (no
+        // shared state).
+        //
+        // S2b: the relay is the loop's SOLE shutdown-observation path — the
+        // loop no longer runs its own `has_changed` precheck. The relay seals
+        // the core (under its lock) before firing, so `open == false` is the
+        // single admission authority and the engine's fast path cannot commit a
+        // command that this loop would have dropped at shutdown. The relay's
+        // first `borrow_and_update` sees a pre-existing shutdown, so no
+        // `mark_changed` precheck is needed.
         let (relay_tx, mut shutdown_fired) = oneshot::channel::<()>();
         let _relay = AbortOnDrop(tokio::spawn(shutdown_relay(
             self.shutdown.clone(),
+            self.core.clone(),
             relay_tx,
         )));
 
@@ -505,8 +527,13 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 // the children drain in the terminal cleanup, under the
                 // single absolute budget, after the pump releases the
                 // transport.
-                self.apply(SessionEvent::TeardownComplete, &mut armed_deadline, None)
-                    .await;
+                self.apply(
+                    SessionEvent::TeardownComplete,
+                    &mut armed_deadline,
+                    None,
+                    false,
+                )
+                .await;
                 continue;
             }
             // Sync the persistent timers to the current deadlines; reset only
@@ -552,13 +579,18 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     // it is not commit authority.
                     let probe_state = self.core.state_snapshot();
                     if probe_safe(probe_state) && !self.handler.backend_active().await {
-                        self.apply(SessionEvent::BackendIoError, &mut armed_deadline, None)
-                            .await;
+                        self.apply(
+                            SessionEvent::BackendIoError,
+                            &mut armed_deadline,
+                            None,
+                            false,
+                        )
+                        .await;
                     }
                 }
                 LoopAction::Deadline(event) => {
                     armed_deadline = None;
-                    self.apply(event, &mut armed_deadline, None).await;
+                    self.apply(event, &mut armed_deadline, None, false).await;
                 }
                 LoopAction::Event(event, permit) => {
                     if self.core.state_snapshot() == SessionState::RedirectPending
@@ -575,7 +607,10 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                         // stays non-empty until it is finally applied.
                         queued_command = Some((event, permit));
                     } else {
-                        self.apply(event, &mut armed_deadline, None).await;
+                        // Ordinary engine event: gated, so a post-seal command
+                        // is dropped under the lock (shutdown-admission refusal),
+                        // matching the fast path refusing to commit once sealed.
+                        self.apply(event, &mut armed_deadline, None, true).await;
                         drop(permit);
                     }
                 }
@@ -584,8 +619,13 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                         SessionControl::GracefulCloseAfter(deadline) => Some(deadline),
                         _ => None,
                     };
-                    self.apply(command.session_event(), &mut armed_deadline, drain_deadline)
-                        .await;
+                    self.apply(
+                        command.session_event(),
+                        &mut armed_deadline,
+                        drain_deadline,
+                        false,
+                    )
+                    .await;
                     // Permit drops here, after the control's effects are applied
                     // (any effect it spawned already holds its own cmd permit).
                 }
@@ -596,7 +636,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 // apply() enqueues all terminal redirect effects first, so the
                 // backend swap (or failure retaining the old backend) precedes
                 // this command's forwarding ACK. Closing instead drops the slot.
-                self.apply(event, &mut armed_deadline, None).await;
+                self.apply(event, &mut armed_deadline, None, true).await;
                 drop(permit);
             }
         }
@@ -611,19 +651,12 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         armed_deadline: Option<(Instant, SessionEvent)>,
         next_probe: Option<Instant>,
     ) -> LoopAction {
-        // A shutdown that predates this call (including one set before the
-        // loop started) must not be lost to the relay's scheduling. The
-        // version check is a lock-free atomic load; the value is read only
-        // when the version moved. A dropped sender is a shutdown, as before.
-        match self.shutdown.has_changed() {
-            Err(_) => return LoopAction::ServerShutdown,
-            Ok(true) => {
-                if *self.shutdown.borrow_and_update() {
-                    return LoopAction::ServerShutdown;
-                }
-            }
-            Ok(false) => {}
-        }
+        // S2b: no direct `has_changed` precheck here — the relay is the sole
+        // shutdown-observation path (it seals the core and fires `shutdown_fired`
+        // below). A shutdown that predates this call reaches us through the
+        // oneshot (the relay's first `borrow_and_update` sees it), and a
+        // command that races the seal is refused by the gated `apply` under the
+        // core lock.
         // opt#6: poll the caller's persistent timers instead of building a
         // fresh `sleep_until` here. A new timer per call armed and (on the
         // untaken branch) dropped a tokio timer-wheel entry on every packet,
@@ -661,11 +694,18 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         event: SessionEvent,
         armed_deadline: &mut Option<(Instant, SessionEvent)>,
         drain_deadline: Option<Duration>,
+        gated: bool,
     ) {
         // The transition runs under the core lock and returns owned effects plus
         // the post-transition state; the effects then execute *outside* the lock
-        // (the std mutex guards only pure computation).
-        let (result, post_state) = self.core.apply_slow(event);
+        // (the std mutex guards only pure computation). A gated ordinary event
+        // that arrives after the core is sealed closed is dropped here — the
+        // shutdown-admission refusal that mirrors the fast path refusing to
+        // commit once sealed.
+        let (result, post_state) = match self.core.apply_slow(event, gated) {
+            crate::gate::SlowOutcome::Applied { result, post_state } => (result, post_state),
+            crate::gate::SlowOutcome::DroppedClosed => return,
+        };
         match result {
             Ok(effects) => {
                 for effect in effects {
@@ -706,11 +746,13 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // Reached only from the terminal path in `run`, after the core is
         // sealed closed; the loop is the sole writer here.
         let mut deadline = None;
+        // Terminal events are ungated: the core is already sealed closed, so
+        // gating would drop them and the FSM could never reach `Closed`.
         if self.core.state_snapshot() != SessionState::Closed {
-            self.apply(close_event, &mut deadline, None).await;
+            self.apply(close_event, &mut deadline, None, false).await;
         }
         if self.core.state_snapshot() != SessionState::Closed {
-            self.apply(SessionEvent::TeardownComplete, &mut deadline, None)
+            self.apply(SessionEvent::TeardownComplete, &mut deadline, None, false)
                 .await;
         }
     }
@@ -775,4 +817,39 @@ enum LoopEnd {
     FsmClosed,
     Shutdown,
     SourceExhausted,
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::shutdown_relay;
+    use crate::gate::Gate;
+    use tokio::sync::{oneshot, watch};
+
+    /// The shutdown relay must seal the core *before* firing the loop oneshot,
+    /// so `open == false` is published under the core lock strictly before the
+    /// loop (or the engine's fast path) can observe the wake — the single
+    /// shutdown-admission linearization point.
+    #[tokio::test]
+    async fn relay_seals_core_before_firing_on_a_true_signal() {
+        let (_tx, rx) = watch::channel(true);
+        let core = Gate::new();
+        assert!(core.is_open());
+        let (fired_tx, fired_rx) = oneshot::channel::<()>();
+        shutdown_relay(rx, core.clone(), fired_tx).await;
+        assert!(!core.is_open(), "relay sealed the core on a true signal");
+        assert!(fired_rx.await.is_ok(), "relay fired the loop oneshot");
+    }
+
+    /// A dropped shutdown sender is a shutdown too: the relay still seals and
+    /// fires (so a torn-down runtime never leaves the core admitting).
+    #[tokio::test]
+    async fn relay_seals_core_when_sender_is_dropped() {
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        let core = Gate::new();
+        let (fired_tx, fired_rx) = oneshot::channel::<()>();
+        shutdown_relay(rx, core.clone(), fired_tx).await;
+        assert!(!core.is_open(), "sender-closed is observed as shutdown");
+        assert!(fired_rx.await.is_ok());
+    }
 }
