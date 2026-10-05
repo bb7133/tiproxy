@@ -307,16 +307,33 @@ impl LoopEventRx {
 async fn shutdown_relay(
     mut shutdown: watch::Receiver<bool>,
     core: crate::gate::Gate,
+    started: oneshot::Sender<()>,
     fired: oneshot::Sender<()>,
 ) {
+    // First observation, made before the loop is allowed to touch input: a
+    // shutdown that already holds (value `true`) or a sender already dropped is
+    // sealed here, and `started` acks that the relay has observed the initial
+    // state. The loop awaits `started` before its first select, so a
+    // pre-existing shutdown is sealed strictly before any event can be
+    // dispatched — restoring the synchronous precheck guarantee without the
+    // loop reading the watch directly.
+    let down_at_start = shutdown
+        .has_changed()
+        .map_or(true, |_| *shutdown.borrow_and_update());
+    if down_at_start {
+        core.seal_closed();
+    }
+    let _ = started.send(());
+    if down_at_start {
+        let _ = fired.send(());
+        return;
+    }
+    // Otherwise park until the signal flips to `true` or the sender drops.
     loop {
-        // `borrow_and_update` reads the current value (so a shutdown that
-        // predates this task is seen on the first poll); a dropped sender is a
-        // shutdown too.
-        if *shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
             break;
         }
-        if shutdown.changed().await.is_err() {
+        if *shutdown.borrow_and_update() {
             break;
         }
     }
@@ -503,15 +520,25 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // loop no longer runs its own `has_changed` precheck. The relay seals
         // the core (under its lock) before firing, so `open == false` is the
         // single admission authority and the engine's fast path cannot commit a
-        // command that this loop would have dropped at shutdown. The relay's
-        // first `borrow_and_update` sees a pre-existing shutdown, so no
-        // `mark_changed` precheck is needed.
+        // command that this loop would have dropped at shutdown.
+        //
+        // The relay acks via `started` once it has made its first observation
+        // (and sealed, if a shutdown already held); the loop awaits that ack
+        // before touching any input, so a pre-existing shutdown is sealed
+        // strictly before the first select — the loop's `open` fence below then
+        // refuses the first event. This restores the synchronous-precheck
+        // guarantee the direct `has_changed` read used to provide.
+        let (started_tx, started_rx) = oneshot::channel::<()>();
         let (relay_tx, mut shutdown_fired) = oneshot::channel::<()>();
         let _relay = AbortOnDrop(tokio::spawn(shutdown_relay(
             self.shutdown.clone(),
             self.core.clone(),
+            started_tx,
             relay_tx,
         )));
+        // The relay cannot outlive this await without having observed the
+        // initial state; a dropped ack (relay aborted) is treated as observed.
+        let _ = started_rx.await;
 
         // The wire engine has at most one unacknowledged command. Its payload
         // stays in the engine; retain only the classified event while a
@@ -557,6 +584,20 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     next_probe,
                 )
                 .await;
+            // Shutdown fence: the relay may have sealed the core during the
+            // select above (its `seal_closed` is published before the oneshot
+            // it also fires). Once sealed, refuse to dispatch *any* action —
+            // this closes the seal->fire window where a `gated = false` branch
+            // (Deadline / BackendProbe / Control) could otherwise transition
+            // before the `ServerShutdown` oneshot is observed. The dequeued
+            // action is dropped here (its permit, if any, is returned);
+            // terminal close in `run` is reached through this `Shutdown` end and
+            // runs ungated. Only the relay seals `open` mid-loop (`seal_and_end`
+            // seals and returns in the same step), so `!open` here means
+            // shutdown.
+            if !self.core.is_open() {
+                return LoopEnd::Shutdown;
+            }
             match action {
                 LoopAction::ServerShutdown => return self.seal_and_end(LoopEnd::Shutdown),
                 LoopAction::SourceExhausted => return self.seal_and_end(LoopEnd::SourceExhausted),
@@ -825,31 +866,71 @@ mod relay_tests {
     use crate::gate::Gate;
     use tokio::sync::{oneshot, watch};
 
-    /// The shutdown relay must seal the core *before* firing the loop oneshot,
-    /// so `open == false` is published under the core lock strictly before the
-    /// loop (or the engine's fast path) can observe the wake — the single
-    /// shutdown-admission linearization point.
+    /// A shutdown that already holds at startup is sealed and acked before the
+    /// loop is released: `started` fires, the core is sealed, and the loop
+    /// oneshot fires — all before the relay returns. The seal is published
+    /// strictly before the wake, the single shutdown-admission linearization
+    /// point.
     #[tokio::test]
-    async fn relay_seals_core_before_firing_on_a_true_signal() {
+    async fn relay_seals_and_acks_a_preexisting_true_signal() {
         let (_tx, rx) = watch::channel(true);
         let core = Gate::new();
         assert!(core.is_open());
+        let (started_tx, started_rx) = oneshot::channel::<()>();
         let (fired_tx, fired_rx) = oneshot::channel::<()>();
-        shutdown_relay(rx, core.clone(), fired_tx).await;
-        assert!(!core.is_open(), "relay sealed the core on a true signal");
+        shutdown_relay(rx, core.clone(), started_tx, fired_tx).await;
+        assert!(
+            started_rx.await.is_ok(),
+            "relay acked its first observation"
+        );
+        assert!(
+            !core.is_open(),
+            "a pre-existing shutdown is sealed at startup"
+        );
         assert!(fired_rx.await.is_ok(), "relay fired the loop oneshot");
     }
 
-    /// A dropped shutdown sender is a shutdown too: the relay still seals and
-    /// fires (so a torn-down runtime never leaves the core admitting).
+    /// A sender already dropped at startup is a shutdown too, sealed and acked
+    /// before the loop runs (so a torn-down runtime never leaves the core
+    /// admitting).
     #[tokio::test]
-    async fn relay_seals_core_when_sender_is_dropped() {
+    async fn relay_seals_and_acks_a_preclosed_sender() {
         let (tx, rx) = watch::channel(false);
         drop(tx);
         let core = Gate::new();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
         let (fired_tx, fired_rx) = oneshot::channel::<()>();
-        shutdown_relay(rx, core.clone(), fired_tx).await;
-        assert!(!core.is_open(), "sender-closed is observed as shutdown");
+        shutdown_relay(rx, core.clone(), started_tx, fired_tx).await;
+        assert!(started_rx.await.is_ok());
+        assert!(
+            !core.is_open(),
+            "a pre-closed sender is observed as shutdown"
+        );
         assert!(fired_rx.await.is_ok());
+    }
+
+    /// When no shutdown holds at startup, the relay acks but leaves the core
+    /// open, then seals and fires only once the signal later flips to `true`.
+    #[tokio::test]
+    async fn relay_acks_open_then_seals_on_a_later_signal() {
+        let (tx, rx) = watch::channel(false);
+        let core = Gate::new();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (fired_tx, fired_rx) = oneshot::channel::<()>();
+        let relay = tokio::spawn(shutdown_relay(rx, core.clone(), started_tx, fired_tx));
+        // The startup ack lands while the core is still open.
+        assert!(
+            started_rx.await.is_ok(),
+            "relay acked its first observation"
+        );
+        assert!(
+            core.is_open(),
+            "no shutdown held at startup, so the core stays open"
+        );
+        // A later shutdown seals and fires.
+        assert!(tx.send(true).is_ok(), "receiver still alive");
+        assert!(fired_rx.await.is_ok(), "relay fired once shutdown arrived");
+        assert!(!core.is_open(), "the later shutdown sealed the core");
+        assert!(relay.await.is_ok(), "relay task joins");
     }
 }

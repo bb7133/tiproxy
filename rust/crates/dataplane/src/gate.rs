@@ -113,10 +113,9 @@ impl Gate {
     }
 
     /// Whether the core is still open (loop running, not terminating). The
-    /// production admission paths read `open` inline under the lock
-    /// ([`Gate::apply_slow`], [`Gate::try_commit_steady`]); this accessor is for
-    /// tests/diagnostics.
-    #[cfg(test)]
+    /// loop reads this as its per-iteration shutdown fence; the admission paths
+    /// ([`Gate::apply_slow`], [`Gate::try_commit_steady`]) also read `open`
+    /// inline under the lock.
     pub(crate) fn is_open(&self) -> bool {
         lock(&self.inner).open
     }
