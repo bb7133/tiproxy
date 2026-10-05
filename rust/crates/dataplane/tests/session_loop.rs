@@ -276,12 +276,12 @@ impl EffectHandler for SpinUntilDropHandler {
 }
 
 fn channels() -> (
-    mpsc::Sender<SessionControl>,
-    mpsc::Receiver<SessionControl>,
+    dataplane::gate::GatedSender<SessionControl>,
+    dataplane::gate::GatedReceiver<SessionControl>,
     watch::Sender<bool>,
     watch::Receiver<bool>,
 ) {
-    let (control_tx, control_rx) = mpsc::channel(8);
+    let (control_tx, control_rx) = dataplane::gate::channel_with_new_gate(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     (control_tx, control_rx, shutdown_tx, shutdown_rx)
 }

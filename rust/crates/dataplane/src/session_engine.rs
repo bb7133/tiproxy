@@ -420,15 +420,17 @@ struct EngineExit {
 /// The event-source half: the loop's pump polls this; the engine feeds
 /// it through a one-slot channel.
 struct EventRx {
-    events: mpsc::Receiver<SessionEvent>,
+    events: crate::gate::GatedReceiver<SessionEvent>,
 }
 
 impl SessionEventSource for EventRx {
     async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events.recv().await
+        // Only reached if the gated hand-off is bypassed (it is not for the
+        // engine path); drop the permit since the pump path is ungated.
+        self.events.recv().await.map(|(event, _permit)| event)
     }
 
-    fn into_event_channel(self) -> Result<mpsc::Receiver<SessionEvent>, Self> {
+    fn into_gated_event_channel(self) -> Result<crate::gate::GatedReceiver<SessionEvent>, Self> {
         Ok(self.events)
     }
 }
@@ -437,7 +439,7 @@ impl SessionEventSource for EventRx {
 /// FIFO and runs the idle-safe probe through the engine (the socket
 /// owner).
 struct CmdTx {
-    cmds: mpsc::Sender<EngineCmd>,
+    cmds: crate::gate::GatedSender<EngineCmd>,
 }
 
 impl EffectHandler for CmdTx {
@@ -755,10 +757,14 @@ async fn run_bound_session_observed(
 
     let (mut directives, responses, commander) = binding.split();
 
-    let (event_tx, event_rx) = mpsc::channel(1);
-    let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_CMD_CAPACITY);
+    // The admission gate counts in-flight messages across the engine↔loop and
+    // owner→loop channels. S1 wires the cmd channel through it (events/control
+    // follow in later slices); the counter is maintained but not yet read.
+    let gate = crate::gate::Gate::new();
+    let (event_tx, event_rx) = crate::gate::channel::<SessionEvent>(gate.clone(), 1);
+    let (cmd_tx, cmd_rx) = crate::gate::channel::<EngineCmd>(gate.clone(), ENGINE_CMD_CAPACITY);
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
-    let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
+    let (control_tx, control_rx) = crate::gate::channel::<SessionControl>(gate.clone(), 8);
     let session_metering = metering.clone();
 
     // Wrap the raw client socket in the innermost byte counter before any
@@ -912,6 +918,16 @@ async fn run_bound_session_observed(
                     }
                     None => {}
                 }
+                // Redirect is an atomic pair (PrepareRedirect + the control):
+                // hold one operation permit across both sends so `pending`
+                // cannot drop to zero between the engine consuming the first
+                // message and the second being registered. Dropped at the end
+                // of this arm (after the control send registered its permit) and
+                // on every early exit.
+                let _redirect_op = directive
+                    .redirect_target
+                    .as_ref()
+                    .map(|_| gate.operation_permit());
                 if let Some(target) = directive.redirect_target {
                     let _ = cmd_tx.send(EngineCmd::PrepareRedirect(target)).await;
                 }
@@ -969,6 +985,11 @@ async fn run_bound_session_observed(
                             deadline_unix_millis: deadline,
                         };
                         local_redirect = Some(envelope);
+                        // Atomic redirect pair: one operation permit spans both
+                        // sends so the gate never transiently empties between
+                        // them; it drops after the control send (which has
+                        // registered its own permit) and on the failure path.
+                        let _redirect_op = gate.operation_permit();
                         if (cmd_tx.send(EngineCmd::PrepareRedirect(target)).await.is_err()
                             || control_tx.send(SessionControl::Redirect).await.is_err())
                             && let Some(envelope) = local_redirect.take()
@@ -1385,8 +1406,8 @@ struct Engine {
     snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     /// Process-wide registry; absent only in legacy/unit compositions.
     metering: Option<MeteringSourceRegistry>,
-    events: mpsc::Sender<SessionEvent>,
-    cmds: mpsc::Receiver<EngineCmd>,
+    events: crate::gate::GatedSender<SessionEvent>,
+    cmds: crate::gate::GatedReceiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
     route: Option<RouteSeed>,
     /// Process-local selector/router incarnation retained until the session
@@ -1460,6 +1481,17 @@ enum Awaited {
     /// The expected effect arrived (any others were handled inline).
     Got,
     /// Teardown began (or the loop is gone); abandon the wire phase.
+    Closing,
+}
+
+/// Result of [`Engine::await_effect`]. On `Got` it carries the expected
+/// effect's admission permit: the actual I/O for that effect (write greeting,
+/// forward command/response, …) runs in the caller *after* `await_effect`
+/// returns, so the caller holds the permit across that work and drops it only
+/// once the effect's observable action is done — keeping the gate non-empty
+/// until then.
+enum EffectAck {
+    Got(crate::gate::GatePermit),
     Closing,
 }
 
@@ -1648,10 +1680,11 @@ impl Engine {
         }
         // Drain remaining effects so teardown commands (close/classify)
         // execute even after a wire failure ended the lifecycle early.
-        while let Some(cmd) = self.cmds.recv().await {
+        while let Some((cmd, _permit)) = self.cmds.recv().await {
             if matches!(self.handle_cmd(cmd).await, Awaited::Closing) && self.closing {
                 // Keep draining: ClassifySessionEnd may still follow.
             }
+            // Permit drops here, after the effect is handled.
         }
         self.shutdown_io().await;
         // One exact final load feeds BOTH metering and CLOSED aggregation.
@@ -1717,14 +1750,15 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::SendProxyGreeting).await,
-            Awaited::Got
-        ) {
-            return None;
-        }
-        if let Err(source) = self.send_greeting().await {
-            return Some(source);
+        // Scope the permit to exactly the greeting I/O so it is released before
+        // the rest of the handshake — it must never leak into the command phase.
+        match self.await_effect(SessionEffect::SendProxyGreeting).await {
+            EffectAck::Closing => return None,
+            EffectAck::Got(_greeting_permit) => {
+                if let Err(source) = self.send_greeting().await {
+                    return Some(source);
+                }
+            }
         }
 
         // PROXY protocol v2 inbound (WIRE-activation B): once the greeting is
@@ -1799,14 +1833,13 @@ impl Engine {
             {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ActivateFrontendTls).await,
-                Awaited::Got
-            ) {
-                return None;
-            }
-            if let Err(source) = self.activate_frontend_tls().await {
-                return Some(source);
+            match self.await_effect(SessionEffect::ActivateFrontendTls).await {
+                EffectAck::Closing => return None,
+                EffectAck::Got(_tls_permit) => {
+                    if let Err(source) = self.activate_frontend_tls().await {
+                        return Some(source);
+                    }
+                }
             }
             // FSM: SslRequest --TlsActivated--> Greeting (no effect). The real
             // handshake response arrives inside TLS; its MySQL sequence
@@ -1908,12 +1941,10 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::DialBackend).await,
-            Awaited::Got
-        ) {
-            return None;
-        }
+        let dial_permit = match self.await_effect(SessionEffect::DialBackend).await {
+            EffectAck::Got(permit) => permit,
+            EffectAck::Closing => return None,
+        };
 
         // Route + dial + backend greeting + verification + plan.
         let Some(mut seed) = self.route.take() else {
@@ -2303,13 +2334,17 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::ForwardHandshakeToBackend)
-                .await,
-            Awaited::Got
-        ) {
-            return None;
-        }
+        // The dial's processing (route + connect + backend greeting/verify)
+        // ends here, where the next handshake effect begins; release its permit
+        // so it never spans into the command phase.
+        drop(dial_permit);
+        let fwd_handshake_permit = match self
+            .await_effect(SessionEffect::ForwardHandshakeToBackend)
+            .await
+        {
+            EffectAck::Got(permit) => permit,
+            EffectAck::Closing => return None,
+        };
         // Go's `handshakeFirstTime` rewrite: forward the client's
         // response under the planned capability mask with the plugin
         // replaced by `auth_unknown_plugin` and the original auth data
@@ -2376,6 +2411,10 @@ impl Engine {
                 return Some(source);
             }
         }
+
+        // The handshake forward is done; release its permit before the auth
+        // relay so it does not span into the command phase.
+        drop(fwd_handshake_permit);
 
         // Engine-internal authentication relay; the FSM sees only the
         // terminal outcome.
@@ -2460,12 +2499,10 @@ impl Engine {
                 if self.events.send(SessionEvent::BackendAuthOk).await.is_err() {
                     return Some(WireErrorSource::Proxy);
                 }
-                if !matches!(
-                    self.await_effect(SessionEffect::AttachBackend).await,
-                    Awaited::Got
-                ) {
-                    return None;
-                }
+                let _attach_permit = match self.await_effect(SessionEffect::AttachBackend).await {
+                    EffectAck::Got(permit) => permit,
+                    EffectAck::Closing => return None,
+                };
                 // The source becomes billable only after the initial backend
                 // is fully authenticated and the FSM attaches it. The same
                 // Arc counters have covered dial → preamble/TLS → auth.
@@ -2475,13 +2512,13 @@ impl Engine {
                     return Some(WireErrorSource::Proxy);
                 }
                 let _ = commander.set_backend(backend_id.clone()).await;
-                if !matches!(
-                    self.await_effect(SessionEffect::ForwardAuthResultToClient)
-                        .await,
-                    Awaited::Got
-                ) {
-                    return None;
-                }
+                let _fwd_auth_permit = match self
+                    .await_effect(SessionEffect::ForwardAuthResultToClient)
+                    .await
+                {
+                    EffectAck::Got(permit) => permit,
+                    EffectAck::Closing => return None,
+                };
                 let current = self.backend_traffic();
                 self.metrics.try_record(Observation::HandshakeCompleted {
                     backend: self
@@ -2674,7 +2711,7 @@ impl Engine {
                     continue;
                 }
                 cmd = self.cmds.recv() => {
-                    let cmd = cmd?;
+                    let (cmd, _permit) = cmd?;
                     match self.handle_cmd(cmd).await {
                         Awaited::Closing => return None,
                         // Control/probe served — not a new command boundary, so
@@ -2792,13 +2829,13 @@ impl Engine {
                 }
                 return None;
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ForwardCommandToBackend)
-                    .await,
-                Awaited::Got
-            ) {
-                return None;
-            }
+            let _fwd_cmd_permit = match self
+                .await_effect(SessionEffect::ForwardCommandToBackend)
+                .await
+            {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             let Some(mut pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
@@ -2843,14 +2880,16 @@ impl Engine {
                             self.record_command(&pending);
                             return Some(WireErrorSource::Proxy);
                         }
-                        if !matches!(
-                            self.await_effect(SessionEffect::ForwardCommandToBackend)
-                                .await,
-                            Awaited::Got
-                        ) {
-                            self.record_command(&pending);
-                            return None;
-                        }
+                        let _fwd_cmd_permit = match self
+                            .await_effect(SessionEffect::ForwardCommandToBackend)
+                            .await
+                        {
+                            EffectAck::Got(permit) => permit,
+                            EffectAck::Closing => {
+                                self.record_command(&pending);
+                                return None;
+                            }
+                        };
                     }
                 }
             }
@@ -3053,9 +3092,16 @@ impl Engine {
         if self.events.send(event).await.is_err() {
             return Err(WireErrorSource::Proxy);
         }
-        let _ = self
+        // Hold the forward ack's permit to the end of this change-user round
+        // (teardown still finishes the round); do not gate on it, matching the
+        // prior behavior.
+        let _round_permit = match self
             .await_effect(SessionEffect::ForwardResponseToClient)
-            .await;
+            .await
+        {
+            EffectAck::Got(permit) => Some(permit),
+            EffectAck::Closing => None,
+        };
         Ok(ChangeUserRoundProgress::Finished)
     }
 
@@ -3315,7 +3361,7 @@ impl Engine {
         self.held = Some(held);
         self.hold_replay_ready = false;
         let flow = loop {
-            let Some(cmd) = self.cmds.recv().await else {
+            let Some((cmd, _permit)) = self.cmds.recv().await else {
                 break HoldFlow::Fatal(WireErrorSource::Proxy);
             };
             if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
@@ -3589,9 +3635,10 @@ impl Engine {
                 ResponseDisposition::LocalInfile => SessionEffect::RequestLocalInfileFromClient,
                 _ => SessionEffect::ForwardResponseToClient,
             };
-            if !matches!(self.await_effect(expected_ack).await, Awaited::Got) {
-                return None;
-            }
+            let _resp_ack_permit = match self.await_effect(expected_ack).await {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             match effect.disposition {
                 ResponseDisposition::Continue | ResponseDisposition::MoreResults => {}
                 ResponseDisposition::LocalInfile => {
@@ -3736,13 +3783,13 @@ impl Engine {
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ForwardResponseToClient)
-                    .await,
-                Awaited::Got
-            ) {
-                return None;
-            }
+            let _fwd_resp_permit = match self
+                .await_effect(SessionEffect::ForwardResponseToClient)
+                .await
+            {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             match effect.disposition {
                 PrepareDisposition::Continue => {}
                 PrepareDisposition::CompleteSuccess(_)
@@ -3804,9 +3851,10 @@ impl Engine {
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(self.await_effect(ack).await, Awaited::Got) {
-                return None;
-            }
+            let _ack_permit = match self.await_effect(ack).await {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             let Some(backend) = self.backend.as_mut() else {
                 return Some(WireErrorSource::Proxy);
             };
@@ -3833,16 +3881,22 @@ impl Engine {
 
     /// Waits for one specific effect, handling every other command
     /// inline; teardown-class effects switch the engine into closing.
-    async fn await_effect(&mut self, expected: SessionEffect) -> Awaited {
+    async fn await_effect(&mut self, expected: SessionEffect) -> EffectAck {
         loop {
-            let Some(cmd) = self.cmds.recv().await else {
-                return Awaited::Closing;
+            let Some((cmd, permit)) = self.cmds.recv().await else {
+                return EffectAck::Closing;
             };
             match cmd {
-                EngineCmd::Effect(effect) if effect == expected => return Awaited::Got,
+                // Hand the permit to the caller: the effect's I/O runs after we
+                // return, and the gate must stay non-empty until it completes.
+                EngineCmd::Effect(effect) if effect == expected => {
+                    return EffectAck::Got(permit);
+                }
                 other => {
+                    // A non-expected cmd is fully handled here; its permit drops
+                    // at the end of this iteration, after handle_cmd.
                     if matches!(self.handle_cmd(other).await, Awaited::Closing) {
-                        return Awaited::Closing;
+                        return EffectAck::Closing;
                     }
                 }
             }
@@ -3865,7 +3919,7 @@ impl Engine {
     async fn drain_control_pending(&mut self) -> Awaited {
         for _ in 0..ENGINE_CMD_CAPACITY {
             match self.cmds.try_recv() {
-                Ok(cmd) => {
+                Ok((cmd, _permit)) => {
                     if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
                         return Awaited::Closing;
                     }
@@ -5417,6 +5471,39 @@ fn fill_salt(salt: &mut [u8; 20]) {
                 *byte = 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gated_event_routing_tests {
+    use super::{EventRx, SessionEvent, SessionEventSource};
+
+    /// The engine's `EventRx` hands its gated channel to the loop, so events
+    /// arrive with admission permits (the only fast-path-eligible path).
+    #[test]
+    fn engine_event_source_routes_to_the_gated_entry() {
+        let (_tx, rx) = crate::gate::channel::<SessionEvent>(crate::gate::Gate::new(), 1);
+        let source = EventRx { events: rx };
+        assert!(
+            source.into_gated_event_channel().is_ok(),
+            "EventRx must expose a gated channel"
+        );
+    }
+
+    /// A generic source keeps the default `Err(self)`, so the loop reads it
+    /// ungated (pump/plain) and the fast path cannot engage on it.
+    #[test]
+    fn generic_source_stays_ungated() {
+        struct Generic;
+        impl SessionEventSource for Generic {
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+        }
+        assert!(
+            Generic.into_gated_event_channel().is_err(),
+            "a generic source must not expose a gated channel"
+        );
     }
 }
 
