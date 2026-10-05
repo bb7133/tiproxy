@@ -5428,6 +5428,39 @@ fn fill_salt(salt: &mut [u8; 20]) {
 }
 
 #[cfg(test)]
+mod gated_event_routing_tests {
+    use super::{EventRx, SessionEvent, SessionEventSource};
+
+    /// The engine's `EventRx` hands its gated channel to the loop, so events
+    /// arrive with admission permits (the only fast-path-eligible path).
+    #[test]
+    fn engine_event_source_routes_to_the_gated_entry() {
+        let (_tx, rx) = crate::gate::channel::<SessionEvent>(crate::gate::Gate::new(), 1);
+        let source = EventRx { events: rx };
+        assert!(
+            source.into_gated_event_channel().is_ok(),
+            "EventRx must expose a gated channel"
+        );
+    }
+
+    /// A generic source keeps the default `Err(self)`, so the loop reads it
+    /// ungated (pump/plain) and the fast path cannot engage on it.
+    #[test]
+    fn generic_source_stays_ungated() {
+        struct Generic;
+        impl SessionEventSource for Generic {
+            async fn next_event(&mut self) -> Option<SessionEvent> {
+                None
+            }
+        }
+        assert!(
+            Generic.into_gated_event_channel().is_err(),
+            "a generic source must not expose a gated channel"
+        );
+    }
+}
+
+#[cfg(test)]
 mod error_classification_tests {
     use super::{
         DisconnectState, IoSide, PacketIoError, QuitSource, SideMarker, WireErrorSource,
