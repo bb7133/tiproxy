@@ -703,6 +703,22 @@ pub async fn run_bound_session(
     .await;
 }
 
+/// Whether the v5 steady-state fast path is enabled, read once from the
+/// `TIPROXY_FSM_FASTPATH` environment variable. Default off: only the exact
+/// values `1`/`true`/`on` (case-insensitive) enable it, so the gate plumbing is
+/// behaviourally inert unless deliberately switched on for same-binary A/B.
+fn fast_path_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TIPROXY_FSM_FASTPATH").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on"
+            )
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_bound_session_observed(
     connection: AcceptedConnection,
@@ -833,6 +849,9 @@ async fn run_bound_session_observed(
         metrics: metrics.clone(),
         log_context: log_context.clone(),
         seat,
+        core: gate.clone(),
+        shutdown: shutdown.clone(),
+        fast_path_enabled: fast_path_enabled(),
     };
 
     // The owner watches the same shutdown signal the loop consumes, so
@@ -1475,6 +1494,17 @@ struct Engine {
     metrics: MetricsRecorder,
     log_context: SessionLogContext,
     seat: SessionSeat,
+    /// Shared session core (FSM + admission gate). S2b: the engine may commit a
+    /// whitelisted steady transition inline via [`crate::gate::Gate::try_commit_steady`]
+    /// instead of the `events`→loop→`cmd` round-trip.
+    core: crate::gate::Gate,
+    /// Engine-side view of the server shutdown signal, read under the core lock
+    /// by the fast-path predicate so shutdown is linearized with the commit.
+    shutdown: watch::Receiver<bool>,
+    /// Whether the steady-state fast path is enabled (`TIPROXY_FSM_FASTPATH`).
+    /// Default off: when false the engine always takes the slow path, so the
+    /// gate plumbing is behaviourally inert.
+    fast_path_enabled: bool,
 }
 
 /// Outcome of waiting for one specific FSM effect.
@@ -2819,23 +2849,55 @@ impl Engine {
                 since_connection: command_started.saturating_duration_since(self.accepted_at),
                 traffic_before: self.backend_traffic(),
             });
-            if self.events.send(event).await.is_err() {
-                return Some(WireErrorSource::Proxy);
-            }
-            if event == SessionEvent::ClientCommandQuit {
-                // Quit tears down: the FSM goes straight to Closing and
-                // the teardown effects arrive; drain them here.
-                if let Some(pending) = self.pending_command.take() {
-                    self.record_command(&pending);
-                }
-                return None;
-            }
-            let _fwd_cmd_permit = match self
-                .await_effect(SessionEffect::ForwardCommandToBackend)
-                .await
+            // S2b steady-state fast path: for a plain `ClientCommand` with the
+            // gate quiescent (`open && !shutdown && pending == 0` and the FSM in
+            // `Ready`), commit the `Ready -> Ready` transition inline under the
+            // core lock and hold its in-flight permit across the forward,
+            // skipping the `events` -> loop -> `cmd` round-trip. Default-off;
+            // `Quit` and every non-whitelisted event always take the slow path.
+            // The permit (fast) or the awaited effect's permit (slow) is held to
+            // the end of this iteration, keeping `pending >= 1` across the
+            // forward exactly as the slow path does.
+            let _fwd_cmd_permit = if self.fast_path_enabled && event == SessionEvent::ClientCommand
             {
-                EffectAck::Got(permit) => permit,
-                EffectAck::Closing => return None,
+                match self.core.try_commit_steady(
+                    SessionEvent::ClientCommand,
+                    SessionEffect::ForwardCommandToBackend,
+                    &self.shutdown,
+                ) {
+                    crate::gate::FastPath::Committed(permit) => permit,
+                    crate::gate::FastPath::Fallback => {
+                        if self.events.send(event).await.is_err() {
+                            return Some(WireErrorSource::Proxy);
+                        }
+                        match self
+                            .await_effect(SessionEffect::ForwardCommandToBackend)
+                            .await
+                        {
+                            EffectAck::Got(permit) => permit,
+                            EffectAck::Closing => return None,
+                        }
+                    }
+                }
+            } else {
+                if self.events.send(event).await.is_err() {
+                    return Some(WireErrorSource::Proxy);
+                }
+                if event == SessionEvent::ClientCommandQuit {
+                    // Quit tears down: the FSM goes straight to Closing and
+                    // the teardown effects arrive; drain them here.
+                    if let Some(pending) = self.pending_command.take() {
+                        self.record_command(&pending);
+                    }
+                    return None;
+                }
+                match self
+                    .await_effect(SessionEffect::ForwardCommandToBackend)
+                    .await
+                {
+                    EffectAck::Got(permit) => permit,
+                    EffectAck::Closing => return None,
+                }
             };
             let Some(mut pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);

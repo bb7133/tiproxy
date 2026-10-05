@@ -3205,6 +3205,86 @@ async fn multi_result_command_forwards_every_set_and_keeps_the_session_synchroni
     stack.dispatch_task.abort();
 }
 
+/// Wire-trace dump for the fast-path on/off A/B (see
+/// `scripts/fastpath-trace-ab.sh`). Runs a fixed steady-state command scenario
+/// against the real engine + fake backend and prints, between markers, the
+/// ordered command-phase wire trace: each command forwarded to the backend
+/// (its bytes) and the client-visible OK/err outcome, in order. The handshake
+/// (random salt / connection id) is excluded by snapshotting the backend
+/// transcript after login, so the trace is deterministic across runs.
+///
+/// The outer script runs this twice — `TIPROXY_FSM_FASTPATH` unset (slow path)
+/// and set (fast path) — and diffs the two traces; byte-identical traces prove
+/// the steady-state fast path preserves the observable action sequence. With
+/// the flag set, the steady `SELECT`/`UPDATE` commands here commit on the fast
+/// path (a quiescent `Ready` `ClientCommand`), the exact case the gate unit
+/// tests prove commits; with it unset they take the slow path.
+#[tokio::test]
+async fn dump_fastpath_wire_trace() {
+    use std::fmt::Write as _;
+    let fast = std::env::var("TIPROXY_FSM_FASTPATH").unwrap_or_default();
+    let stack = spawn_stack().await;
+    spawn_route_answer(&stack, 1, 2);
+    let Some(mut client) = timeout(Duration::from_secs(5), MysqlClient::connect(stack.sql_port))
+        .await
+        .ok()
+        .flatten()
+    else {
+        unreachable!("session established")
+    };
+
+    // Baseline: everything forwarded so far is the handshake/auth relay
+    // (nondeterministic salt), which the trace must exclude.
+    let forwarded_before = stack
+        .backend_transcript
+        .lock()
+        .map_or(0, |transcript| transcript.len());
+
+    // Fixed steady-state command scenario: each is a quiescent `Ready`
+    // `ClientCommand` the fast path is eligible to commit.
+    let scenario = ["SELECT 1", "SELECT 2", "UPDATE t SET a = 1", "SELECT 3"];
+    let mut outcomes = Vec::new();
+    for sql in scenario {
+        let ok = timeout(Duration::from_secs(5), client.query_ok(sql))
+            .await
+            .unwrap_or(false);
+        outcomes.push(ok);
+    }
+
+    let forwarded: Vec<Vec<u8>> = {
+        let transcript = stack
+            .backend_transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        transcript[forwarded_before..].to_vec()
+    };
+
+    println!("WIRE_TRACE_BEGIN fast_env={fast:?}");
+    for (index, bytes) in forwarded.iter().enumerate() {
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        println!("FWD {index} {hex}");
+    }
+    for (index, ok) in outcomes.iter().enumerate() {
+        println!("RSP {index} ok={ok}");
+    }
+    println!("WIRE_TRACE_END");
+
+    // The scenario itself must have run end to end (every command answered),
+    // independent of which path served it.
+    assert!(outcomes.iter().all(|ok| *ok), "every command answered OK");
+    assert_eq!(
+        forwarded.len(),
+        scenario.len(),
+        "each command forwarded once"
+    );
+
+    client.quit().await;
+    stack.dispatch_task.abort();
+}
+
 /// A complete topology generation re-applies the admission snapshot's
 /// health-specific policy to an already authenticated socket, without
 /// replacing its protocol config or disturbing the next command boundary.

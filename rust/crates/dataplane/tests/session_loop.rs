@@ -900,6 +900,45 @@ async fn preexisting_shutdown_is_not_missed() {
     assert_eq!(count(&recorded, SessionEffect::ClassifySessionEnd), 1);
 }
 
+/// S2b startup-race guard: a shutdown that already holds is sealed (via the
+/// relay startup ack) before the loop admits any input, so nothing is admitted
+/// from a fresh (Accept) session — not even the first queued handshake event.
+/// The loop awaits the ack, then its post-select `open` fence drops the first
+/// action and terminates. This is the startup guarantee the removed direct
+/// precheck gave; the Ready-state fence case is covered deterministically by
+/// `session::fence_tests` (which has in-crate core access).
+#[tokio::test(start_paused = true)]
+async fn preexisting_shutdown_before_handshake_admits_nothing() {
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let _ = shutdown_tx.send(true);
+    let mut events = HANDSHAKE.to_vec();
+    events.push(SessionEvent::ClientCommand);
+    let handler = Recorder::default();
+    let effects = handler.effects();
+    let summary = SessionLoop::new(
+        fsm_core,
+        FakeSource::scripted(&events),
+        handler,
+        control_rx,
+        shutdown_rx,
+        SessionLoopConfig::default(),
+    )
+    .run()
+    .await;
+    assert_eq!(summary.end, SessionEnd::ServerShutdown);
+    let recorded = locked(&effects);
+    assert_eq!(
+        count(&recorded, SessionEffect::ForwardCommandToBackend),
+        0,
+        "a ready command is never forwarded under a pre-existing shutdown"
+    );
+    assert_eq!(
+        count(&recorded, SessionEffect::SendProxyGreeting),
+        0,
+        "nothing is admitted once shutdown is sealed at startup"
+    );
+}
+
 /// The handshake deadline fires for a stalled pre-auth session; after the
 /// `BackendAuthOk` **transition itself** it is disarmed — an authenticated
 /// session that then goes fully idle (probe disabled, no further events)
