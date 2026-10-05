@@ -61,7 +61,7 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use session_core::fsm::{SessionEffect, SessionEvent, SessionFsm, SessionState, TransitionError};
+use session_core::fsm::{SessionEffect, SessionEvent, SessionState, TransitionError};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
@@ -248,7 +248,11 @@ const EVENT_PUMP_CAPACITY: usize = 1;
 
 /// The single owner of one session's mutable state.
 pub struct SessionLoop<S, E> {
-    fsm: SessionFsm,
+    /// The shared session core (FSM + admission gate). The loop is the FSM's
+    /// only writer on the slow path, via [`crate::gate::Gate::apply_slow`]; a
+    /// later slice lets the engine commit whitelisted steady transitions under
+    /// the same lock.
+    core: crate::gate::Gate,
     source: Option<S>,
     handler: E,
     control: crate::gate::GatedReceiver<SessionControl>,
@@ -322,9 +326,12 @@ impl Drop for AbortOnDrop {
 }
 
 impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
-    /// Creates a session loop; the FSM starts at `Accept`.
+    /// Creates a session loop over the shared `core` (which carries the FSM,
+    /// starting at `Accept`). The loop is the FSM's only writer on the slow
+    /// path.
     #[must_use]
     pub fn new(
+        core: crate::gate::Gate,
         source: S,
         handler: E,
         control: crate::gate::GatedReceiver<SessionControl>,
@@ -332,7 +339,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         config: SessionLoopConfig,
     ) -> Self {
         Self {
-            fsm: SessionFsm::new(),
+            core,
             source: Some(source),
             handler,
             control,
@@ -434,12 +441,21 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         let cleanup = self.cleanup_within(cleanup_by).await;
         SessionSummary {
             end,
-            final_state: self.fsm.state(),
+            final_state: self.core.state_snapshot(),
             effects_executed: self.effects_executed,
             rejected_events: self.rejected_events,
             control_detached: self.control_detached,
             cleanup,
         }
+    }
+
+    /// Terminal fence: seals the core closed — so a later slice's engine fast
+    /// path refuses to commit once the loop is terminating — then returns the
+    /// loop's end reason. Called at every path that leaves the steady loop,
+    /// before the FSM is still `Ready` but the session is tearing down.
+    fn seal_and_end(&self, end: LoopEnd) -> LoopEnd {
+        self.core.seal_closed();
+        end
     }
 
     async fn event_loop(&mut self, events: &mut LoopEventRx) -> LoopEnd {
@@ -480,10 +496,10 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // redirect owns the command boundary (Go's processLock).
         let mut queued_command = None;
         loop {
-            if self.fsm.state() == SessionState::Closed {
-                return LoopEnd::FsmClosed;
+            if self.core.state_snapshot() == SessionState::Closed {
+                return self.seal_and_end(LoopEnd::FsmClosed);
             }
-            if self.fsm.state() == SessionState::Closing {
+            if self.core.state_snapshot() == SessionState::Closing {
                 // The loop is the runtime: teardown effects have executed
                 // and their children are tracked, so seal the FSM now;
                 // the children drain in the terminal cleanup, under the
@@ -515,8 +531,8 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 )
                 .await;
             match action {
-                LoopAction::ServerShutdown => return LoopEnd::Shutdown,
-                LoopAction::SourceExhausted => return LoopEnd::SourceExhausted,
+                LoopAction::ServerShutdown => return self.seal_and_end(LoopEnd::Shutdown),
+                LoopAction::SourceExhausted => return self.seal_and_end(LoopEnd::SourceExhausted),
                 LoopAction::ControlDetached => {
                     // Control-v1 last-good: losing the control channel never
                     // tears down an established session. Redirect/drain
@@ -528,7 +544,14 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     if let Some(probe) = next_probe.as_mut() {
                         *probe = Instant::now() + self.config.backend_check_interval;
                     }
-                    if probe_safe(self.fsm.state()) && !self.handler.backend_active().await {
+                    // Snapshot the state out of the lock *before* the await: a
+                    // `self.core.state_snapshot()` sub-expression would otherwise
+                    // keep the guard alive across `backend_active().await`.
+                    // S2b: this read must be re-snapshotted after the await
+                    // before acting, once the engine can commit concurrently —
+                    // it is not commit authority.
+                    let probe_state = self.core.state_snapshot();
+                    if probe_safe(probe_state) && !self.handler.backend_active().await {
                         self.apply(SessionEvent::BackendIoError, &mut armed_deadline, None)
                             .await;
                     }
@@ -538,7 +561,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     self.apply(event, &mut armed_deadline, None).await;
                 }
                 LoopAction::Event(event, permit) => {
-                    if self.fsm.state() == SessionState::RedirectPending
+                    if self.core.state_snapshot() == SessionState::RedirectPending
                         && matches!(
                             event,
                             SessionEvent::ClientCommand | SessionEvent::ClientCommandQuit
@@ -567,7 +590,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     // (any effect it spawned already holds its own cmd permit).
                 }
             }
-            if self.fsm.state() == SessionState::Ready
+            if self.core.state_snapshot() == SessionState::Ready
                 && let Some((event, permit)) = queued_command.take()
             {
                 // apply() enqueues all terminal redirect effects first, so the
@@ -639,7 +662,11 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         armed_deadline: &mut Option<(Instant, SessionEvent)>,
         drain_deadline: Option<Duration>,
     ) {
-        match self.fsm.on_event(event) {
+        // The transition runs under the core lock and returns owned effects plus
+        // the post-transition state; the effects then execute *outside* the lock
+        // (the std mutex guards only pure computation).
+        let (result, post_state) = self.core.apply_slow(event);
+        match result {
             Ok(effects) => {
                 for effect in effects {
                     if effect == SessionEffect::BeginDrainTimer {
@@ -654,10 +681,12 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 // The handshake deadline is judged on the post-transition
                 // state: the very transition into an authenticated state
                 // (`BackendAuthOk`) disarms it, with no dependency on any
-                // later event arriving.
+                // later event arriving. The post-state captured with the
+                // transition is authoritative here (the loop is the only
+                // writer of these non-steady transitions).
                 if let Some((_, pending)) = *armed_deadline
                     && pending == SessionEvent::HandshakeTimerExpired
-                    && authenticated_phase(self.fsm.state())
+                    && authenticated_phase(post_state)
                 {
                     *armed_deadline = None;
                 }
@@ -674,11 +703,13 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     /// the machine. Rejections are tolerated (the FSM may already be
     /// closing or closed).
     async fn close_via_fsm(&mut self, close_event: SessionEvent) {
+        // Reached only from the terminal path in `run`, after the core is
+        // sealed closed; the loop is the sole writer here.
         let mut deadline = None;
-        if self.fsm.state() != SessionState::Closed {
+        if self.core.state_snapshot() != SessionState::Closed {
             self.apply(close_event, &mut deadline, None).await;
         }
-        if self.fsm.state() != SessionState::Closed {
+        if self.core.state_snapshot() != SessionState::Closed {
             self.apply(SessionEvent::TeardownComplete, &mut deadline, None)
                 .await;
         }

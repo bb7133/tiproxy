@@ -1,12 +1,15 @@
-//! Fast-path admission gate (v5, slice S1 — plumbing only, no fast path yet).
+//! Shared session core + fast-path admission gate (v5, slices S1–S2a — no fast
+//! path yet).
 //!
 //! Every message that can change how the *next* client command is handled —
 //! engine→loop [`SessionEvent`]s, loop/owner→engine [`EngineCmd`]s, and
 //! owner→loop [`SessionControl`]s — is registered in a shared counter before it
 //! is enqueued and deregistered only after it (and every effect it spawns) has
-//! been fully processed. A later slice reads `pending == 0 && open` to decide
-//! whether the engine may inline a steady transition; S1 only installs the
-//! counter and routes all three channels through it, with no behavior change.
+//! been fully processed (S1). S2a folds the session FSM into that same locked
+//! core, so a later slice can read `pending == 0 && open` together with a
+//! speculative transition to decide whether the engine may inline a steady
+//! transition. Through S2a the loop is still the FSM's only writer (via
+//! [`Gate::apply_slow`]) and there is no behavior change.
 //!
 //! Registration is a RAII [`GatePermit`] carried alongside the message in the
 //! channel (`mpsc::Sender<(T, GatePermit)>`). The permit's `Drop` decrements
@@ -18,24 +21,33 @@
 
 use std::sync::{Arc, Mutex};
 
+use session_core::fsm::{Effects, SessionEvent, SessionFsm, SessionState, TransitionError};
 use tokio::sync::mpsc;
 
-/// Shared gate state. The mutex guards only the small counters; no `.await`,
-/// send, or effect runs while it is held.
+/// Shared session core: the session FSM together with the admission counters,
+/// behind one std `Mutex` so a later slice can evaluate the fast-path predicate
+/// (`open && pending == 0` with a speculative transition) atomically. The mutex
+/// guards only pure computation — FSM transitions and counter arithmetic —
+/// never an `.await`, channel send, or effect execution.
 #[derive(Debug)]
-struct GateInner {
+struct FsmCore {
+    /// The session state machine. In S2a the loop is still its only writer (via
+    /// [`Gate::apply_slow`]); a later slice lets the engine commit whitelisted
+    /// steady transitions under this same lock.
+    fsm: SessionFsm,
     /// Registered-but-not-yet-processed messages across all producers/channels.
     pending: u32,
-    /// Loop is running and has not entered terminal handling. (S1: always true
-    /// and not yet read; the terminal gate consumes it in a later slice.)
+    /// Loop is running and has not entered terminal handling. Sealed to `false`
+    /// under the lock before the loop takes any terminal path; once false it
+    /// never reopens. (S2a maintains it; a later slice's predicate reads it.)
     #[allow(dead_code)]
     open: bool,
 }
 
-/// Handle to the shared admission gate for one session.
+/// Handle to the shared session core (FSM + admission gate) for one session.
 #[derive(Clone, Debug)]
 pub struct Gate {
-    inner: Arc<Mutex<GateInner>>,
+    inner: Arc<Mutex<FsmCore>>,
 }
 
 impl Default for Gate {
@@ -45,15 +57,44 @@ impl Default for Gate {
 }
 
 impl Gate {
-    /// Creates a gate with zero in-flight messages and `open == true`.
+    /// Creates a core with a fresh FSM (starting at `Accept`), zero in-flight
+    /// messages, and `open == true`.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(GateInner {
+            inner: Arc::new(Mutex::new(FsmCore {
+                fsm: SessionFsm::new(),
                 pending: 0,
                 open: true,
             })),
         }
+    }
+
+    /// Reads the current FSM state (a `Copy` value) under the lock and releases
+    /// immediately. Never exposes the guard.
+    pub(crate) fn state_snapshot(&self) -> SessionState {
+        lock(&self.inner).fsm.state()
+    }
+
+    /// Applies one event to the FSM on the slow path, under the lock, returning
+    /// the owned effects (or the rejection) together with the post-transition
+    /// state. The caller executes the effects *outside* the lock. The lock holds
+    /// only the pure `on_event` computation; no guard escapes.
+    pub(crate) fn apply_slow(
+        &self,
+        event: SessionEvent,
+    ) -> (Result<Effects, TransitionError>, SessionState) {
+        let mut inner = lock(&self.inner);
+        let result = inner.fsm.on_event(event);
+        let post_state = inner.fsm.state();
+        (result, post_state)
+    }
+
+    /// Seals the loop closed under the lock before it takes a terminal path.
+    /// Idempotent; once closed it never reopens. A later slice's fast-path
+    /// predicate reads `open` to refuse committing once the loop is terminating.
+    pub(crate) fn seal_closed(&self) {
+        lock(&self.inner).open = false;
     }
 
     /// Registers a standalone "operation" permit not tied to a single message.
@@ -102,7 +143,7 @@ impl Gate {
 #[derive(Debug)]
 #[must_use = "a GatePermit must travel with its message; dropping it early frees the gate slot"]
 pub struct GatePermit {
-    inner: Arc<Mutex<GateInner>>,
+    inner: Arc<Mutex<FsmCore>>,
 }
 
 impl Drop for GatePermit {
@@ -210,6 +251,54 @@ mod tests {
     use super::*;
 
     type R = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn apply_slow_and_state_snapshot_drive_the_fsm_like_a_standalone() {
+        // The relocated FSM, driven through the core, must transition and emit
+        // effects identically to a standalone `SessionFsm` on the same events.
+        let core = Gate::new();
+        let mut reference = SessionFsm::new();
+        assert_eq!(core.state_snapshot(), reference.state());
+
+        let script = [
+            SessionEvent::ConnectionAccepted,
+            SessionEvent::ClientHandshakeResponse,
+            SessionEvent::BackendGreetingReceived,
+            SessionEvent::BackendAuthOk,
+            SessionEvent::ClientCommand,
+            SessionEvent::BackendResponseTxnDone,
+        ];
+        for event in script {
+            let (result, post_state) = core.apply_slow(event);
+            let expected = reference.on_event(event);
+            assert_eq!(
+                result, expected,
+                "core effects/rejection match the standalone FSM for {event:?}"
+            );
+            assert_eq!(
+                post_state,
+                reference.state(),
+                "core post-state matches the standalone FSM for {event:?}"
+            );
+            assert_eq!(
+                core.state_snapshot(),
+                reference.state(),
+                "a later snapshot still matches for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seal_closed_is_sticky_and_idempotent() {
+        let core = Gate::new();
+        assert!(core.is_open(), "a fresh core is open");
+        core.seal_closed();
+        assert!(!core.is_open(), "seal_closed closes the core");
+        // The loop may reach several terminal checks; sealing again is a no-op
+        // and never reopens.
+        core.seal_closed();
+        assert!(!core.is_open(), "once closed the core never reopens");
+    }
 
     #[tokio::test]
     async fn pending_visible_before_apply_and_cleared_after_drop() -> R {

@@ -276,14 +276,19 @@ impl EffectHandler for SpinUntilDropHandler {
 }
 
 fn channels() -> (
+    dataplane::gate::Gate,
     dataplane::gate::GatedSender<SessionControl>,
     dataplane::gate::GatedReceiver<SessionControl>,
     watch::Sender<bool>,
     watch::Receiver<bool>,
 ) {
-    let (control_tx, control_rx) = dataplane::gate::channel_with_new_gate(8);
+    // One shared core per session, as production wires it: the control channel
+    // and the loop's FSM core are the same `Gate`, so control messages register
+    // on the core the engine's fast path reads.
+    let gate = dataplane::gate::Gate::new();
+    let (control_tx, control_rx) = dataplane::gate::channel(gate.clone(), 8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    (control_tx, control_rx, shutdown_tx, shutdown_rx)
+    (gate, control_tx, control_rx, shutdown_tx, shutdown_rx)
 }
 
 const HANDSHAKE: [SessionEvent; 4] = [
@@ -318,10 +323,11 @@ async fn scripted_lifecycle_completes_cleanly() {
         SessionEvent::ClientCommandQuit,
         SessionEvent::TeardownComplete,
     ]);
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     let effects = handler.effects();
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::scripted(&events),
         handler,
         control_rx,
@@ -361,13 +367,14 @@ async fn scripted_lifecycle_completes_cleanly() {
 /// default.
 #[tokio::test(start_paused = true)]
 async fn coordinated_drain_uses_latest_deadline_override() {
-    let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let mut events = HANDSHAKE.to_vec();
     events.extend([
         SessionEvent::ClientCommand,
         SessionEvent::BackendResponseTxnOpen,
     ]);
     let looped = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&events),
         Recorder::default(),
         control_rx,
@@ -405,12 +412,13 @@ async fn eof_aborts_stuck_children_after_drain_window() {
     let mut events = HANDSHAKE.to_vec();
     events.push(SessionEvent::ClientCommand);
     // Transport ends abruptly afterwards (client vanished).
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder {
         spawn_stuck_child_on_forward: true,
         ..Recorder::default()
     };
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::scripted(&events),
         handler,
         control_rx,
@@ -438,13 +446,14 @@ async fn teardown_children_drain_to_completion() {
     events.push(SessionEvent::ClientCommandQuit);
     events.push(SessionEvent::TeardownComplete);
     let finished = Arc::new(AtomicBool::new(false));
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder {
         // Inside the 5s cleanup deadline, but requires real draining.
         spawn_slow_teardown_child: Some((Duration::from_secs(2), Arc::clone(&finished))),
         ..Recorder::default()
     };
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::scripted(&events),
         handler,
         control_rx,
@@ -489,10 +498,11 @@ async fn redirect_command_shutdown_interleavings_never_deadlock() {
     ];
     for permutation in permutations {
         let (event_tx, source) = ChannelSource::new();
-        let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+        let (fsm_core, control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
         let handler = Recorder::default();
         let effects = handler.effects();
         let looped = SessionLoop::new(
+            fsm_core,
             source,
             handler,
             control_rx,
@@ -557,7 +567,7 @@ async fn redirect_command_shutdown_interleavings_never_deadlock() {
 #[tokio::test(start_paused = true)]
 async fn pending_stimuli_shutdown_precheck_dominates() {
     let (event_tx, reads, source) = CountingSource::new();
-    let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler = Recorder {
         forward_gate: Some(Arc::clone(&gate)),
@@ -565,6 +575,7 @@ async fn pending_stimuli_shutdown_precheck_dominates() {
     };
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -616,7 +627,7 @@ async fn pending_stimuli_shutdown_precheck_dominates() {
 #[tokio::test(start_paused = true)]
 async fn three_select_arms_race_cleanly() {
     let (event_tx, reads, source) = CountingSource::new();
-    let (control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let child_done = Arc::new(AtomicBool::new(false));
     let handler = Recorder {
@@ -626,6 +637,7 @@ async fn three_select_arms_race_cleanly() {
     };
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -695,7 +707,7 @@ async fn three_select_arms_race_cleanly() {
 #[tokio::test(start_paused = true)]
 async fn classifier_reads_at_most_one_ahead() {
     let (event_tx, reads, source) = CountingSource::new();
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler = Recorder {
         forward_gate: Some(Arc::clone(&gate)),
@@ -703,6 +715,7 @@ async fn classifier_reads_at_most_one_ahead() {
     };
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -771,7 +784,7 @@ async fn terminal_cleanup_budget_and_source_release_order() {
         inner: FakeSource::parking(&events),
         dropped: Arc::clone(&source_dropped),
     };
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = SpinUntilDropHandler {
         inner: Recorder::default(),
         source_dropped: Arc::clone(&source_dropped),
@@ -779,6 +792,7 @@ async fn terminal_cleanup_budget_and_source_release_order() {
     };
     let start = tokio::time::Instant::now();
     let summary = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -805,13 +819,14 @@ async fn terminal_cleanup_budget_and_source_release_order() {
     // cleanup_deadline.
     let mut events = HANDSHAKE.to_vec();
     events.push(SessionEvent::ClientCommand);
-    let (_control_tx2, control_rx, _shutdown_tx2, shutdown_rx) = channels();
+    let (fsm_core, _control_tx2, control_rx, _shutdown_tx2, shutdown_rx) = channels();
     let handler = Recorder {
         spawn_stuck_child_on_forward: true,
         ..Recorder::default()
     };
     let start = tokio::time::Instant::now();
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::scripted(&events),
         handler,
         control_rx,
@@ -833,10 +848,11 @@ async fn terminal_cleanup_budget_and_source_release_order() {
 /// seals the FSM.
 #[tokio::test(start_paused = true)]
 async fn server_shutdown_closes_idle_session() {
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&HANDSHAKE),
         handler,
         control_rx,
@@ -863,11 +879,12 @@ async fn server_shutdown_closes_idle_session() {
 /// comes.
 #[tokio::test(start_paused = true)]
 async fn preexisting_shutdown_is_not_missed() {
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let _ = shutdown_tx.send(true);
     let handler = Recorder::default();
     let effects = handler.effects();
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&[]),
         handler,
         control_rx,
@@ -890,8 +907,9 @@ async fn preexisting_shutdown_is_not_missed() {
 #[tokio::test(start_paused = true)]
 async fn handshake_deadline_only_before_authentication() {
     // Stalled pre-auth session: the deadline closes it.
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&[SessionEvent::ConnectionAccepted]),
         Recorder::default(),
         control_rx,
@@ -910,8 +928,9 @@ async fn handshake_deadline_only_before_authentication() {
         backend_check_interval: Duration::ZERO,
         ..SessionLoopConfig::default()
     };
-    let (_control_tx2, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx2, control_rx, shutdown_tx, shutdown_rx) = channels();
     let looped = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&HANDSHAKE),
         Recorder::default(),
         control_rx,
@@ -936,7 +955,7 @@ async fn handshake_deadline_only_before_authentication() {
 /// down through the FSM.
 #[tokio::test(start_paused = true)]
 async fn dead_backend_probe_closes_session() {
-    let (_control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     match handler.backend_alive.lock() {
         Ok(mut alive) => {
@@ -951,6 +970,7 @@ async fn dead_backend_probe_closes_session() {
     }
     let effects = handler.effects();
     let summary = SessionLoop::new(
+        fsm_core,
         FakeSource::parking(&HANDSHAKE),
         handler,
         control_rx,
@@ -975,14 +995,14 @@ async fn dead_backend_probe_closes_session() {
 #[tokio::test(start_paused = true)]
 async fn probe_skips_in_flight_commands() {
     let (event_tx, source) = ChannelSource::new();
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     let probes = Arc::clone(&handler.probe_calls);
     let config = SessionLoopConfig {
         backend_check_interval: Duration::from_secs(1),
         ..SessionLoopConfig::default()
     };
-    let looped = SessionLoop::new(source, handler, control_rx, shutdown_rx, config);
+    let looped = SessionLoop::new(fsm_core, source, handler, control_rx, shutdown_rx, config);
     let run = tokio::spawn(looped.run());
     for event in HANDSHAKE {
         let _ = event_tx.send(event).await;
@@ -1030,10 +1050,11 @@ async fn probe_skips_in_flight_commands() {
 #[tokio::test(start_paused = true)]
 async fn control_detach_keeps_session_serving() {
     let (event_tx, source) = ChannelSource::new();
-    let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -1085,10 +1106,11 @@ async fn multi_await_classifier_survives_select_noise() {
         halves,
         completed: Arc::clone(&completed),
     };
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let handler = Recorder::default();
     let effects = handler.effects();
     let looped = SessionLoop::new(
+        fsm_core,
         source,
         handler,
         control_rx,
@@ -1153,11 +1175,12 @@ async fn next_command_waits_for_redirect_after_commit() {
             SessionEvent::ControlCloseImmediate,
         ] {
             let (event_tx, source) = ChannelSource::new();
-            let (control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
+            let (fsm_core, control_tx, control_rx, _shutdown_tx, shutdown_rx) = channels();
             let handler = Recorder::default();
             let effects = handler.effects();
             let run = tokio::spawn(
                 SessionLoop::new(
+                    fsm_core,
                     source,
                     handler,
                     control_rx,
@@ -1314,7 +1337,7 @@ impl EffectHandler for OrderRecorder {
 #[tokio::test(start_paused = true)]
 async fn due_probe_is_selected_before_a_queued_command_on_the_direct_channel() {
     let (event_tx, source) = DirectChannelSource::new();
-    let (_control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
+    let (fsm_core, _control_tx, control_rx, shutdown_tx, shutdown_rx) = channels();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler = OrderRecorder {
         marks: Arc::new(Mutex::new(Vec::new())),
@@ -1326,8 +1349,9 @@ async fn due_probe_is_selected_before_a_queued_command_on_the_direct_channel() {
         backend_check_interval: Duration::from_secs(1),
         ..SessionLoopConfig::default()
     };
-    let run =
-        tokio::spawn(SessionLoop::new(source, handler, control_rx, shutdown_rx, config).run());
+    let run = tokio::spawn(
+        SessionLoop::new(fsm_core, source, handler, control_rx, shutdown_rx, config).run(),
+    );
     for event in HANDSHAKE {
         let _ = event_tx.send(event).await;
     }
