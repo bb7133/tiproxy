@@ -56,6 +56,16 @@ impl Gate {
         }
     }
 
+    /// Registers a standalone "operation" permit not tied to a single message.
+    /// Used to bridge a multi-message atomic operation (e.g. the redirect pair
+    /// `PrepareRedirect` + `Redirect`): held across both sends so `pending`
+    /// cannot transiently reach zero between the first message being consumed
+    /// and the second being registered. Dropped on every exit path.
+    #[must_use = "hold the operation permit across the whole atomic operation"]
+    pub fn operation_permit(&self) -> GatePermit {
+        self.register()
+    }
+
     /// Registers one in-flight message, returning its permit. The critical
     /// section only bumps the counter; the caller sends (and later the consumer
     /// drops the permit) outside the lock.
@@ -243,6 +253,34 @@ mod tests {
         );
         let (_m2, derived) = rx.recv().await.ok_or("recv derived")?;
         drop(derived);
+        assert_eq!(gate.pending(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operation_permit_holds_the_floor_across_a_consumed_first_message() -> R {
+        // Models the redirect pair: an operation permit spans two sends. The
+        // first message is consumed and its permit dropped before the second is
+        // registered; pending must never reach 0 in that window.
+        let gate = Gate::new();
+        let (tx, mut rx) = channel::<u8>(gate.clone(), 4);
+        let op = gate.operation_permit();
+        assert_eq!(gate.pending(), 1, "operation permit registered");
+        // First message of the pair.
+        tx.send(1).await?;
+        assert_eq!(gate.pending(), 2);
+        // Engine consumes and drops the first permit before the second send.
+        let (_m, first) = rx.recv().await.ok_or("recv first")?;
+        drop(first);
+        assert_eq!(gate.pending(), 1, "operation permit still holds the floor");
+        // Second message of the pair.
+        tx.send(2).await?;
+        assert_eq!(gate.pending(), 2);
+        // Operation permit released only after the second is registered.
+        drop(op);
+        assert_eq!(gate.pending(), 1, "second message still in flight");
+        let (_m2, second) = rx.recv().await.ok_or("recv second")?;
+        drop(second);
         assert_eq!(gate.pending(), 0);
         Ok(())
     }

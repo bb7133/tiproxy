@@ -918,6 +918,16 @@ async fn run_bound_session_observed(
                     }
                     None => {}
                 }
+                // Redirect is an atomic pair (PrepareRedirect + the control):
+                // hold one operation permit across both sends so `pending`
+                // cannot drop to zero between the engine consuming the first
+                // message and the second being registered. Dropped at the end
+                // of this arm (after the control send registered its permit) and
+                // on every early exit.
+                let _redirect_op = directive
+                    .redirect_target
+                    .as_ref()
+                    .map(|_| gate.operation_permit());
                 if let Some(target) = directive.redirect_target {
                     let _ = cmd_tx.send(EngineCmd::PrepareRedirect(target)).await;
                 }
@@ -975,6 +985,11 @@ async fn run_bound_session_observed(
                             deadline_unix_millis: deadline,
                         };
                         local_redirect = Some(envelope);
+                        // Atomic redirect pair: one operation permit spans both
+                        // sends so the gate never transiently empties between
+                        // them; it drops after the control send (which has
+                        // registered its own permit) and on the failure path.
+                        let _redirect_op = gate.operation_permit();
                         if (cmd_tx.send(EngineCmd::PrepareRedirect(target)).await.is_err()
                             || control_tx.send(SessionControl::Redirect).await.is_err())
                             && let Some(envelope) = local_redirect.take()
