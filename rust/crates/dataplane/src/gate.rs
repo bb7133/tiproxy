@@ -143,6 +143,13 @@ impl<T> GatedReceiver<T> {
     pub(crate) async fn recv(&mut self) -> Option<(T, GatePermit)> {
         self.rx.recv().await
     }
+
+    /// Non-blocking receive, mirroring [`mpsc::Receiver::try_recv`]. The permit
+    /// rides with the message; the caller drops it after processing (not while
+    /// holding the gate lock).
+    pub(crate) fn try_recv(&mut self) -> Result<(T, GatePermit), mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 
 /// Builds a gated channel bound to `gate` with the given capacity.

@@ -437,7 +437,7 @@ impl SessionEventSource for EventRx {
 /// FIFO and runs the idle-safe probe through the engine (the socket
 /// owner).
 struct CmdTx {
-    cmds: mpsc::Sender<EngineCmd>,
+    cmds: crate::gate::GatedSender<EngineCmd>,
 }
 
 impl EffectHandler for CmdTx {
@@ -755,8 +755,12 @@ async fn run_bound_session_observed(
 
     let (mut directives, responses, commander) = binding.split();
 
+    // The admission gate counts in-flight messages across the engine↔loop and
+    // owner→loop channels. S1 wires the cmd channel through it (events/control
+    // follow in later slices); the counter is maintained but not yet read.
+    let gate = crate::gate::Gate::new();
     let (event_tx, event_rx) = mpsc::channel(1);
-    let (cmd_tx, cmd_rx) = mpsc::channel(ENGINE_CMD_CAPACITY);
+    let (cmd_tx, cmd_rx) = crate::gate::channel::<EngineCmd>(gate.clone(), ENGINE_CMD_CAPACITY);
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
     let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
     let session_metering = metering.clone();
@@ -1386,7 +1390,7 @@ struct Engine {
     /// Process-wide registry; absent only in legacy/unit compositions.
     metering: Option<MeteringSourceRegistry>,
     events: mpsc::Sender<SessionEvent>,
-    cmds: mpsc::Receiver<EngineCmd>,
+    cmds: crate::gate::GatedReceiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
     route: Option<RouteSeed>,
     /// Process-local selector/router incarnation retained until the session
@@ -1648,10 +1652,11 @@ impl Engine {
         }
         // Drain remaining effects so teardown commands (close/classify)
         // execute even after a wire failure ended the lifecycle early.
-        while let Some(cmd) = self.cmds.recv().await {
+        while let Some((cmd, _permit)) = self.cmds.recv().await {
             if matches!(self.handle_cmd(cmd).await, Awaited::Closing) && self.closing {
                 // Keep draining: ClassifySessionEnd may still follow.
             }
+            // Permit drops here, after the effect is handled.
         }
         self.shutdown_io().await;
         // One exact final load feeds BOTH metering and CLOSED aggregation.
@@ -2674,7 +2679,7 @@ impl Engine {
                     continue;
                 }
                 cmd = self.cmds.recv() => {
-                    let cmd = cmd?;
+                    let (cmd, _permit) = cmd?;
                     match self.handle_cmd(cmd).await {
                         Awaited::Closing => return None,
                         // Control/probe served — not a new command boundary, so
@@ -3315,7 +3320,7 @@ impl Engine {
         self.held = Some(held);
         self.hold_replay_ready = false;
         let flow = loop {
-            let Some(cmd) = self.cmds.recv().await else {
+            let Some((cmd, _permit)) = self.cmds.recv().await else {
                 break HoldFlow::Fatal(WireErrorSource::Proxy);
             };
             if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
@@ -3835,7 +3840,7 @@ impl Engine {
     /// inline; teardown-class effects switch the engine into closing.
     async fn await_effect(&mut self, expected: SessionEffect) -> Awaited {
         loop {
-            let Some(cmd) = self.cmds.recv().await else {
+            let Some((cmd, _permit)) = self.cmds.recv().await else {
                 return Awaited::Closing;
             };
             match cmd {
@@ -3865,7 +3870,7 @@ impl Engine {
     async fn drain_control_pending(&mut self) -> Awaited {
         for _ in 0..ENGINE_CMD_CAPACITY {
             match self.cmds.try_recv() {
-                Ok(cmd) => {
+                Ok((cmd, _permit)) => {
                     if matches!(self.handle_cmd(cmd).await, Awaited::Closing) {
                         return Awaited::Closing;
                     }
