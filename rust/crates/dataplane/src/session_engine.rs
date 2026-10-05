@@ -1484,6 +1484,17 @@ enum Awaited {
     Closing,
 }
 
+/// Result of [`Engine::await_effect`]. On `Got` it carries the expected
+/// effect's admission permit: the actual I/O for that effect (write greeting,
+/// forward command/response, …) runs in the caller *after* `await_effect`
+/// returns, so the caller holds the permit across that work and drops it only
+/// once the effect's observable action is done — keeping the gate non-empty
+/// until then.
+enum EffectAck {
+    Got(crate::gate::GatePermit),
+    Closing,
+}
+
 /// Resolution of a SES-07/MIG-005 pending-redirect `BEGIN` hold.
 enum HoldFlow {
     /// The redirect/commit phase resolved and the held request must replay
@@ -1739,12 +1750,10 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::SendProxyGreeting).await,
-            Awaited::Got
-        ) {
-            return None;
-        }
+        let _greeting_permit = match self.await_effect(SessionEffect::SendProxyGreeting).await {
+            EffectAck::Got(permit) => permit,
+            EffectAck::Closing => return None,
+        };
         if let Err(source) = self.send_greeting().await {
             return Some(source);
         }
@@ -1821,12 +1830,10 @@ impl Engine {
             {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ActivateFrontendTls).await,
-                Awaited::Got
-            ) {
-                return None;
-            }
+            let _tls_permit = match self.await_effect(SessionEffect::ActivateFrontendTls).await {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             if let Err(source) = self.activate_frontend_tls().await {
                 return Some(source);
             }
@@ -1930,12 +1937,10 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::DialBackend).await,
-            Awaited::Got
-        ) {
-            return None;
-        }
+        let _dial_permit = match self.await_effect(SessionEffect::DialBackend).await {
+            EffectAck::Got(permit) => permit,
+            EffectAck::Closing => return None,
+        };
 
         // Route + dial + backend greeting + verification + plan.
         let Some(mut seed) = self.route.take() else {
@@ -2325,13 +2330,13 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        if !matches!(
-            self.await_effect(SessionEffect::ForwardHandshakeToBackend)
-                .await,
-            Awaited::Got
-        ) {
-            return None;
-        }
+        let _fwd_handshake_permit = match self
+            .await_effect(SessionEffect::ForwardHandshakeToBackend)
+            .await
+        {
+            EffectAck::Got(permit) => permit,
+            EffectAck::Closing => return None,
+        };
         // Go's `handshakeFirstTime` rewrite: forward the client's
         // response under the planned capability mask with the plugin
         // replaced by `auth_unknown_plugin` and the original auth data
@@ -2482,12 +2487,10 @@ impl Engine {
                 if self.events.send(SessionEvent::BackendAuthOk).await.is_err() {
                     return Some(WireErrorSource::Proxy);
                 }
-                if !matches!(
-                    self.await_effect(SessionEffect::AttachBackend).await,
-                    Awaited::Got
-                ) {
-                    return None;
-                }
+                let _attach_permit = match self.await_effect(SessionEffect::AttachBackend).await {
+                    EffectAck::Got(permit) => permit,
+                    EffectAck::Closing => return None,
+                };
                 // The source becomes billable only after the initial backend
                 // is fully authenticated and the FSM attaches it. The same
                 // Arc counters have covered dial → preamble/TLS → auth.
@@ -2497,13 +2500,13 @@ impl Engine {
                     return Some(WireErrorSource::Proxy);
                 }
                 let _ = commander.set_backend(backend_id.clone()).await;
-                if !matches!(
-                    self.await_effect(SessionEffect::ForwardAuthResultToClient)
-                        .await,
-                    Awaited::Got
-                ) {
-                    return None;
-                }
+                let _fwd_auth_permit = match self
+                    .await_effect(SessionEffect::ForwardAuthResultToClient)
+                    .await
+                {
+                    EffectAck::Got(permit) => permit,
+                    EffectAck::Closing => return None,
+                };
                 let current = self.backend_traffic();
                 self.metrics.try_record(Observation::HandshakeCompleted {
                     backend: self
@@ -2814,13 +2817,13 @@ impl Engine {
                 }
                 return None;
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ForwardCommandToBackend)
-                    .await,
-                Awaited::Got
-            ) {
-                return None;
-            }
+            let _fwd_cmd_permit = match self
+                .await_effect(SessionEffect::ForwardCommandToBackend)
+                .await
+            {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             let Some(mut pending) = self.pending_command.take() else {
                 return Some(WireErrorSource::Proxy);
             };
@@ -2865,14 +2868,16 @@ impl Engine {
                             self.record_command(&pending);
                             return Some(WireErrorSource::Proxy);
                         }
-                        if !matches!(
-                            self.await_effect(SessionEffect::ForwardCommandToBackend)
-                                .await,
-                            Awaited::Got
-                        ) {
-                            self.record_command(&pending);
-                            return None;
-                        }
+                        let _fwd_cmd_permit = match self
+                            .await_effect(SessionEffect::ForwardCommandToBackend)
+                            .await
+                        {
+                            EffectAck::Got(permit) => permit,
+                            EffectAck::Closing => {
+                                self.record_command(&pending);
+                                return None;
+                            }
+                        };
                     }
                 }
             }
@@ -3611,9 +3616,10 @@ impl Engine {
                 ResponseDisposition::LocalInfile => SessionEffect::RequestLocalInfileFromClient,
                 _ => SessionEffect::ForwardResponseToClient,
             };
-            if !matches!(self.await_effect(expected_ack).await, Awaited::Got) {
-                return None;
-            }
+            let _resp_ack_permit = match self.await_effect(expected_ack).await {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             match effect.disposition {
                 ResponseDisposition::Continue | ResponseDisposition::MoreResults => {}
                 ResponseDisposition::LocalInfile => {
@@ -3758,13 +3764,13 @@ impl Engine {
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(
-                self.await_effect(SessionEffect::ForwardResponseToClient)
-                    .await,
-                Awaited::Got
-            ) {
-                return None;
-            }
+            let _fwd_resp_permit = match self
+                .await_effect(SessionEffect::ForwardResponseToClient)
+                .await
+            {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             match effect.disposition {
                 PrepareDisposition::Continue => {}
                 PrepareDisposition::CompleteSuccess(_)
@@ -3826,9 +3832,10 @@ impl Engine {
             if self.events.send(event).await.is_err() {
                 return Some(WireErrorSource::Proxy);
             }
-            if !matches!(self.await_effect(ack).await, Awaited::Got) {
-                return None;
-            }
+            let _ack_permit = match self.await_effect(ack).await {
+                EffectAck::Got(permit) => permit,
+                EffectAck::Closing => return None,
+            };
             let Some(backend) = self.backend.as_mut() else {
                 return Some(WireErrorSource::Proxy);
             };
@@ -3855,16 +3862,22 @@ impl Engine {
 
     /// Waits for one specific effect, handling every other command
     /// inline; teardown-class effects switch the engine into closing.
-    async fn await_effect(&mut self, expected: SessionEffect) -> Awaited {
+    async fn await_effect(&mut self, expected: SessionEffect) -> EffectAck {
         loop {
-            let Some((cmd, _permit)) = self.cmds.recv().await else {
-                return Awaited::Closing;
+            let Some((cmd, permit)) = self.cmds.recv().await else {
+                return EffectAck::Closing;
             };
             match cmd {
-                EngineCmd::Effect(effect) if effect == expected => return Awaited::Got,
+                // Hand the permit to the caller: the effect's I/O runs after we
+                // return, and the gate must stay non-empty until it completes.
+                EngineCmd::Effect(effect) if effect == expected => {
+                    return EffectAck::Got(permit);
+                }
                 other => {
+                    // A non-expected cmd is fully handled here; its permit drops
+                    // at the end of this iteration, after handle_cmd.
                     if matches!(self.handle_cmd(other).await, Awaited::Closing) {
-                        return Awaited::Closing;
+                        return EffectAck::Closing;
                     }
                 }
             }
