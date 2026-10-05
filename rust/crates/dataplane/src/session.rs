@@ -939,3 +939,126 @@ mod relay_tests {
         assert!(relay.await.is_ok(), "relay task joins");
     }
 }
+
+#[cfg(test)]
+mod fence_tests {
+    use super::{
+        EffectHandler, SessionControl, SessionEnd, SessionEventSource, SessionLoop,
+        SessionLoopConfig,
+    };
+    use crate::gate::{Gate, GatedReceiver, SlowOutcome};
+    use session_core::fsm::{SessionEffect, SessionEvent, SessionState};
+    use std::sync::{Arc, Mutex};
+    use tokio::task::JoinSet;
+
+    /// A source that hands the loop a pre-built gated channel (the engine's
+    /// path), so events arrive with their admission permits and the fast path
+    /// is eligible. `next_event` is never reached on this path.
+    struct GatedSource {
+        rx: Option<GatedReceiver<SessionEvent>>,
+    }
+
+    impl SessionEventSource for GatedSource {
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            std::future::pending().await
+        }
+        fn into_gated_event_channel(self) -> Result<GatedReceiver<SessionEvent>, Self> {
+            match self.rx {
+                Some(rx) => Ok(rx),
+                None => Err(self),
+            }
+        }
+    }
+
+    /// Records the effects the loop executes.
+    struct RecordingHandler {
+        effects: Arc<Mutex<Vec<SessionEffect>>>,
+    }
+
+    impl EffectHandler for RecordingHandler {
+        async fn execute(&mut self, effect: SessionEffect, _children: &mut JoinSet<()>) {
+            if let Ok(mut effects) = self.effects.lock() {
+                effects.push(effect);
+            }
+        }
+    }
+
+    /// Drives a fresh core through the handshake to `Ready` without a handler
+    /// (the transitions' effects are computed and discarded).
+    fn core_in_ready() -> Gate {
+        let core = Gate::new();
+        for event in [
+            SessionEvent::ConnectionAccepted,
+            SessionEvent::ClientHandshakeResponse,
+            SessionEvent::BackendGreetingReceived,
+            SessionEvent::BackendAuthOk,
+        ] {
+            assert!(matches!(
+                core.apply_slow(event, true),
+                SlowOutcome::Applied { .. }
+            ));
+        }
+        assert_eq!(core.state_snapshot(), SessionState::Ready);
+        core
+    }
+
+    /// The post-select `open` fence drops a *ready* `ClientCommand` once the
+    /// core is sealed, even though the shutdown oneshot has not fired. Sealing
+    /// the core directly (rather than via the relay) reproduces exactly that
+    /// window deterministically: the loop is still in its select, picks the
+    /// already-queued gated command, and the fence refuses it before any match
+    /// or effect. The command is never forwarded and its admission permit is
+    /// returned.
+    #[tokio::test(start_paused = true)]
+    async fn post_select_fence_drops_a_ready_command_on_a_sealed_ready_core() {
+        let core = core_in_ready();
+
+        // A gated command is in flight (permit registered)...
+        let (tx, rx) = crate::gate::channel::<SessionEvent>(core.clone(), 4);
+        assert!(tx.send(SessionEvent::ClientCommand).await.is_ok());
+        assert_eq!(core.pending(), 1, "the command's permit is registered");
+
+        // ...and the core is sealed with the oneshot not yet fired.
+        core.seal_closed();
+
+        let effects = Arc::new(Mutex::new(Vec::new()));
+        let handler = RecordingHandler {
+            effects: Arc::clone(&effects),
+        };
+        let (_control_tx, control_rx) = crate::gate::channel::<SessionControl>(core.clone(), 8);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let summary = SessionLoop::new(
+            core.clone(),
+            GatedSource { rx: Some(rx) },
+            handler,
+            control_rx,
+            shutdown_rx,
+            SessionLoopConfig::default(),
+        )
+        .run()
+        .await;
+
+        assert_eq!(
+            summary.end,
+            SessionEnd::ServerShutdown,
+            "the fence ends the loop as a shutdown"
+        );
+        let recorded = effects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|effect| **effect == SessionEffect::ForwardCommandToBackend)
+                .count(),
+            0,
+            "a command dropped by the fence is never forwarded"
+        );
+        assert_eq!(
+            core.pending(),
+            0,
+            "the dropped command's admission permit is returned"
+        );
+    }
+}
