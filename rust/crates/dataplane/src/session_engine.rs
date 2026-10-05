@@ -762,7 +762,7 @@ async fn run_bound_session_observed(
     let (event_tx, event_rx) = mpsc::channel(1);
     let (cmd_tx, cmd_rx) = crate::gate::channel::<EngineCmd>(gate.clone(), ENGINE_CMD_CAPACITY);
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
-    let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
+    let (control_tx, control_rx) = crate::gate::channel::<SessionControl>(gate.clone(), 8);
     let session_metering = metering.clone();
 
     // Wrap the raw client socket in the innermost byte counter before any

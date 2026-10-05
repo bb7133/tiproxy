@@ -26,19 +26,28 @@ use tokio::sync::mpsc;
 struct GateInner {
     /// Registered-but-not-yet-processed messages across all producers/channels.
     pending: u32,
-    /// Loop is running and has not entered terminal handling. (S1: always true;
-    /// the terminal gate is wired in a later slice.)
+    /// Loop is running and has not entered terminal handling. (S1: always true
+    /// and not yet read; the terminal gate consumes it in a later slice.)
+    #[allow(dead_code)]
     open: bool,
 }
 
 /// Handle to the shared admission gate for one session.
 #[derive(Clone, Debug)]
-pub(crate) struct Gate {
+pub struct Gate {
     inner: Arc<Mutex<GateInner>>,
 }
 
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Gate {
-    pub(crate) fn new() -> Self {
+    /// Creates a gate with zero in-flight messages and `open == true`.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(GateInner {
                 pending: 0,
@@ -69,6 +78,7 @@ impl Gate {
     /// Whether the loop is still open. Test/diagnostic only until the terminal
     /// gate consumes it.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn is_open(&self) -> bool {
         lock(&self.inner).open
     }
@@ -81,7 +91,7 @@ impl Gate {
 /// Not `Clone`: exactly one permit exists per registered message.
 #[derive(Debug)]
 #[must_use = "a GatePermit must travel with its message; dropping it early frees the gate slot"]
-pub(crate) struct GatePermit {
+pub struct GatePermit {
     inner: Arc<Mutex<GateInner>>,
 }
 
@@ -100,7 +110,7 @@ impl Drop for GatePermit {
 /// preserving tokio's error semantics, and the permit is freed outside the lock
 /// as the rejected `(T, GatePermit)` tuple is dropped.
 #[derive(Debug)]
-pub(crate) struct GatedSender<T> {
+pub struct GatedSender<T> {
     tx: mpsc::Sender<(T, GatePermit)>,
     gate: Gate,
 }
@@ -119,7 +129,12 @@ impl<T> GatedSender<T> {
     /// the whole time. On a closed channel the permit rides back on the
     /// rejected tuple and is dropped here (outside the gate lock), and the
     /// original message is returned verbatim.
-    pub(crate) async fn send(&self, msg: T) -> Result<(), mpsc::error::SendError<T>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::error::SendError`] with the original message when the
+    /// receiver has been dropped, matching [`mpsc::Sender::send`].
+    pub async fn send(&self, msg: T) -> Result<(), mpsc::error::SendError<T>> {
         let permit = self.gate.register();
         match self.tx.send((msg, permit)).await {
             Ok(()) => Ok(()),
@@ -135,27 +150,45 @@ impl<T> GatedSender<T> {
 /// until the message and its derived effects are processed, then drops it —
 /// never while holding the gate lock.
 #[derive(Debug)]
-pub(crate) struct GatedReceiver<T> {
+pub struct GatedReceiver<T> {
     rx: mpsc::Receiver<(T, GatePermit)>,
 }
 
 impl<T> GatedReceiver<T> {
-    pub(crate) async fn recv(&mut self) -> Option<(T, GatePermit)> {
+    /// Receives the next `(message, permit)`. The caller holds the permit until
+    /// the message and its derived effects are processed, then drops it — never
+    /// while holding the gate lock.
+    pub async fn recv(&mut self) -> Option<(T, GatePermit)> {
         self.rx.recv().await
     }
 
     /// Non-blocking receive, mirroring [`mpsc::Receiver::try_recv`]. The permit
     /// rides with the message; the caller drops it after processing (not while
     /// holding the gate lock).
-    pub(crate) fn try_recv(&mut self) -> Result<(T, GatePermit), mpsc::error::TryRecvError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::error::TryRecvError`] when the channel is empty or the
+    /// senders are all dropped, matching [`mpsc::Receiver::try_recv`].
+    #[must_use = "the returned (message, permit) must be handled; dropping the permit frees the gate slot"]
+    pub fn try_recv(&mut self) -> Result<(T, GatePermit), mpsc::error::TryRecvError> {
         self.rx.try_recv()
     }
 }
 
 /// Builds a gated channel bound to `gate` with the given capacity.
-pub(crate) fn channel<T>(gate: Gate, capacity: usize) -> (GatedSender<T>, GatedReceiver<T>) {
+#[must_use]
+pub fn channel<T>(gate: Gate, capacity: usize) -> (GatedSender<T>, GatedReceiver<T>) {
     let (tx, rx) = mpsc::channel(capacity);
     (GatedSender { tx, gate }, GatedReceiver { rx })
+}
+
+/// Builds a gated channel with a fresh private [`Gate`] — for standalone/test
+/// construction where no session-shared gate is threaded in. The returned
+/// sender still routes every message through a permit, so there is no bypass.
+#[must_use]
+pub fn channel_with_new_gate<T>(capacity: usize) -> (GatedSender<T>, GatedReceiver<T>) {
+    channel(Gate::new(), capacity)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -166,38 +199,41 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    type R = Result<(), Box<dyn std::error::Error>>;
+
     #[tokio::test]
-    async fn pending_visible_before_apply_and_cleared_after_drop() {
+    async fn pending_visible_before_apply_and_cleared_after_drop() -> R {
         let gate = Gate::new();
         let (tx, mut rx) = channel::<u8>(gate.clone(), 4);
         assert_eq!(gate.pending(), 0);
-        tx.send(7).await.expect("send");
+        tx.send(7).await?;
         // Registered and visible before the consumer applies it.
         assert_eq!(
             gate.pending(),
             1,
             "pending visible while message is in flight"
         );
-        let (msg, permit) = rx.recv().await.expect("recv");
+        let (msg, permit) = rx.recv().await.ok_or("recv")?;
         assert_eq!(msg, 7);
         // Still pending until the consumer finishes and drops the permit.
         assert_eq!(gate.pending(), 1, "pending held across apply");
         drop(permit);
         assert_eq!(gate.pending(), 0, "pending cleared after apply");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn derived_permit_acquired_before_parent_drop_leaves_no_gap() {
+    async fn derived_permit_acquired_before_parent_drop_leaves_no_gap() -> R {
         // Models loop apply: while still holding the parent message's permit,
         // register a derived effect; only then drop the parent. pending never
         // returns to 0 in between.
         let gate = Gate::new();
         let (tx, mut rx) = channel::<u8>(gate.clone(), 4);
-        tx.send(1).await.expect("send parent");
-        let (_m, parent) = rx.recv().await.expect("recv parent");
+        tx.send(1).await?;
+        let (_m, parent) = rx.recv().await.ok_or("recv parent")?;
         assert_eq!(gate.pending(), 1);
         // Derived effect enqueued before the parent permit is dropped.
-        tx.send(2).await.expect("send derived");
+        tx.send(2).await?;
         assert_eq!(gate.pending(), 2);
         drop(parent);
         assert_eq!(
@@ -205,29 +241,33 @@ mod tests {
             1,
             "no pending=0 gap: derived still in flight"
         );
-        let (_m2, derived) = rx.recv().await.expect("recv derived");
+        let (_m2, derived) = rx.recv().await.ok_or("recv derived")?;
         drop(derived);
         assert_eq!(gate.pending(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn closed_receiver_returns_original_msg_and_frees_slot() {
+    async fn closed_receiver_returns_original_msg_and_frees_slot() -> R {
         let gate = Gate::new();
         let (tx, rx) = channel::<String>(gate.clone(), 1);
         drop(rx);
-        let err = tx.send("hello".to_owned()).await.expect_err("closed");
+        let Err(err) = tx.send("hello".to_owned()).await else {
+            return Err("expected closed-channel error".into());
+        };
         assert_eq!(err.0, "hello", "original message returned verbatim");
         assert_eq!(gate.pending(), 0, "permit freed on closed-channel failure");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dropped_queued_message_frees_slot() {
+    async fn dropped_queued_message_frees_slot() -> R {
         // A message enqueued but never received (receiver dropped with items
         // still buffered) frees its slot when the channel drops it.
         let gate = Gate::new();
         let (tx, rx) = channel::<u8>(gate.clone(), 4);
-        tx.send(1).await.expect("send");
-        tx.send(2).await.expect("send");
+        tx.send(1).await?;
+        tx.send(2).await?;
         assert_eq!(gate.pending(), 2);
         drop(rx);
         drop(tx);
@@ -236,14 +276,15 @@ mod tests {
             0,
             "buffered-but-undelivered messages free their slots"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancelled_send_future_frees_slot() {
+    async fn cancelled_send_future_frees_slot() -> R {
         // Fill the channel, then cancel a blocked send; its permit must return.
         let gate = Gate::new();
         let (tx, mut rx) = channel::<u8>(gate.clone(), 1);
-        tx.send(1).await.expect("fill");
+        tx.send(1).await?;
         assert_eq!(gate.pending(), 1);
         {
             let blocked = tx.send(2);
@@ -252,9 +293,9 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked).await;
         }
         // The cancelled send's permit is freed; only the first message remains.
-        let (_m, permit) = rx.recv().await.expect("recv");
+        let (_m, permit) = rx.recv().await.ok_or("recv")?;
         drop(permit);
-        // Give any freed permit time to settle (all synchronous here).
         assert_eq!(gate.pending(), 0, "cancelled send frees its slot");
+        Ok(())
     }
 }

@@ -235,7 +235,7 @@ pub struct SessionLoop<S, E> {
     fsm: SessionFsm,
     source: Option<S>,
     handler: E,
-    control: mpsc::Receiver<SessionControl>,
+    control: crate::gate::GatedReceiver<SessionControl>,
     shutdown: watch::Receiver<bool>,
     config: SessionLoopConfig,
     children: JoinSet<()>,
@@ -249,7 +249,7 @@ pub struct SessionLoop<S, E> {
 
 enum LoopAction {
     Event(SessionEvent),
-    Control(SessionControl),
+    Control(SessionControl, crate::gate::GatePermit),
     /// The armed one-shot deadline fired.
     Deadline(SessionEvent),
     SourceExhausted,
@@ -289,7 +289,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
     pub fn new(
         source: S,
         handler: E,
-        control: mpsc::Receiver<SessionControl>,
+        control: crate::gate::GatedReceiver<SessionControl>,
         shutdown: watch::Receiver<bool>,
         config: SessionLoopConfig,
     ) -> Self {
@@ -508,13 +508,15 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                         self.apply(event, &mut armed_deadline, None).await;
                     }
                 }
-                LoopAction::Control(command) => {
+                LoopAction::Control(command, _permit) => {
                     let drain_deadline = match command {
                         SessionControl::GracefulCloseAfter(deadline) => Some(deadline),
                         _ => None,
                     };
                     self.apply(command.session_event(), &mut armed_deadline, drain_deadline)
                         .await;
+                    // Permit drops here, after the control's effects are applied
+                    // (any effect it spawned already holds its own cmd permit).
                 }
             }
             if self.fsm.state() == SessionState::Ready
@@ -561,7 +563,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
             // is gone; a relay that vanished (runtime teardown) reads the same.
             _ = &mut *shutdown_fired => LoopAction::ServerShutdown,
             command = self.control.recv(), if !self.control_detached => match command {
-                Some(command) => LoopAction::Control(command),
+                Some((command, permit)) => LoopAction::Control(command, permit),
                 None => LoopAction::ControlDetached,
             },
             () = deadline_sleep.as_mut(), if armed_deadline.is_some() => {
