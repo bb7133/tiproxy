@@ -132,6 +132,22 @@ pub trait SessionEventSource: Send + 'static {
     {
         Err(self)
     }
+
+    /// A source backed by the engine's gated channel hands that channel to the
+    /// loop so each event arrives with its admission [`GatePermit`]. This is the
+    /// only path on which the fast path may engage; every other source keeps the
+    /// default `Err(self)` and is read ungated (pump/`into_event_channel`), which
+    /// forces the fast path off.
+    ///
+    /// # Errors
+    /// Returns `Err(self)` when the source is not the engine's gated channel;
+    /// the source is handed back unchanged.
+    fn into_gated_event_channel(self) -> Result<crate::gate::GatedReceiver<SessionEvent>, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
 }
 
 /// Executes FSM effects. Implementations borrow the session's child set to
@@ -248,7 +264,10 @@ pub struct SessionLoop<S, E> {
 }
 
 enum LoopAction {
-    Event(SessionEvent),
+    /// A transport event, with its admission permit when it came from the
+    /// engine's gated channel (`None` for an ungated pump/generic source, which
+    /// keeps the fast path off).
+    Event(SessionEvent, Option<crate::gate::GatePermit>),
     Control(SessionControl, crate::gate::GatePermit),
     /// The armed one-shot deadline fired.
     Deadline(SessionEvent),
@@ -257,6 +276,25 @@ enum LoopAction {
     ControlDetached,
     ChildFinished,
     BackendProbe,
+}
+
+/// The loop's event receiver: the engine's gated channel (permits travel with
+/// events, enabling the fast path) or an ungated plain channel (direct generic
+/// source or the classifier pump; always fast-path-off).
+enum LoopEventRx {
+    Gated(crate::gate::GatedReceiver<SessionEvent>),
+    Plain(mpsc::Receiver<SessionEvent>),
+}
+
+impl LoopEventRx {
+    /// Cancel-safe receive of the next `(event, permit?)`. The only await is the
+    /// inner channel recv, so losing a `select!` race drops nothing.
+    async fn recv(&mut self) -> Option<(SessionEvent, Option<crate::gate::GatePermit>)> {
+        match self {
+            Self::Gated(rx) => rx.recv().await.map(|(event, permit)| (event, Some(permit))),
+            Self::Plain(rx) => rx.recv().await.map(|event| (event, None)),
+        }
+    }
 }
 
 /// Parks on the shared shutdown `watch` once and fires `fired` when the
@@ -333,28 +371,35 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         // channel into another, so this removes that task/channel forward on
         // the engine path. Every other source keeps the pump and its cancel
         // protection.
-        let (mut events, pump): (mpsc::Receiver<SessionEvent>, Option<JoinHandle<()>>) =
-            match source.into_event_channel() {
-                Ok(events) => (events, None),
-                Err(mut source) => {
-                    let (event_tx, events) = mpsc::channel::<SessionEvent>(EVENT_PUMP_CAPACITY);
-                    let pump: JoinHandle<()> = tokio::spawn(async move {
-                        loop {
-                            // Reserve the slot **before** touching the transport: the
-                            // classifier reads at most one event ahead of the loop,
-                            // so transport backpressure is real (an unconsumed event
-                            // never triggers speculative classification of the next).
-                            let Ok(permit) = event_tx.reserve().await else {
-                                break;
-                            };
-                            match source.next_event().await {
-                                Some(event) => permit.send(event),
-                                None => break,
+        // Preference order: the engine's gated channel (fast-path eligible),
+        // then a plain pre-classified channel, then the classifier pump. Only
+        // the gated path carries admission permits; the other two are ungated
+        // and keep the fast path off.
+        let (mut events, pump): (LoopEventRx, Option<JoinHandle<()>>) =
+            match source.into_gated_event_channel() {
+                Ok(gated) => (LoopEventRx::Gated(gated), None),
+                Err(source) => match source.into_event_channel() {
+                    Ok(plain) => (LoopEventRx::Plain(plain), None),
+                    Err(mut source) => {
+                        let (event_tx, plain) = mpsc::channel::<SessionEvent>(EVENT_PUMP_CAPACITY);
+                        let pump: JoinHandle<()> = tokio::spawn(async move {
+                            loop {
+                                // Reserve the slot **before** touching the transport: the
+                                // classifier reads at most one event ahead of the loop,
+                                // so transport backpressure is real (an unconsumed event
+                                // never triggers speculative classification of the next).
+                                let Ok(permit) = event_tx.reserve().await else {
+                                    break;
+                                };
+                                match source.next_event().await {
+                                    Some(event) => permit.send(event),
+                                    None => break,
+                                }
                             }
-                        }
-                    });
-                    (events, Some(pump))
-                }
+                        });
+                        (LoopEventRx::Plain(plain), Some(pump))
+                    }
+                },
             };
 
         let end = self.event_loop(&mut events).await;
@@ -397,7 +442,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
         }
     }
 
-    async fn event_loop(&mut self, events: &mut mpsc::Receiver<SessionEvent>) -> LoopEnd {
+    async fn event_loop(&mut self, events: &mut LoopEventRx) -> LoopEnd {
         let handshake_deadline = Instant::now() + self.config.handshake_deadline;
         let mut armed_deadline: Option<(Instant, SessionEvent)> =
             Some((handshake_deadline, SessionEvent::HandshakeTimerExpired));
@@ -492,7 +537,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                     armed_deadline = None;
                     self.apply(event, &mut armed_deadline, None).await;
                 }
-                LoopAction::Event(event) => {
+                LoopAction::Event(event, permit) => {
                     if self.fsm.state() == SessionState::RedirectPending
                         && matches!(
                             event,
@@ -503,9 +548,12 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                         // A response can reach the client before the engine
                         // consumes the following StartRedirectHandshake effect.
                         // Rejecting this next command would lose its ACK forever.
-                        queued_command = Some(event);
+                        // The permit rides with the queued command, so the gate
+                        // stays non-empty until it is finally applied.
+                        queued_command = Some((event, permit));
                     } else {
                         self.apply(event, &mut armed_deadline, None).await;
+                        drop(permit);
                     }
                 }
                 LoopAction::Control(command, _permit) => {
@@ -520,19 +568,20 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 }
             }
             if self.fsm.state() == SessionState::Ready
-                && let Some(event) = queued_command.take()
+                && let Some((event, permit)) = queued_command.take()
             {
                 // apply() enqueues all terminal redirect effects first, so the
                 // backend swap (or failure retaining the old backend) precedes
                 // this command's forwarding ACK. Closing instead drops the slot.
                 self.apply(event, &mut armed_deadline, None).await;
+                drop(permit);
             }
         }
     }
 
     async fn next_action(
         &mut self,
-        events: &mut mpsc::Receiver<SessionEvent>,
+        events: &mut LoopEventRx,
         shutdown_fired: &mut oneshot::Receiver<()>,
         deadline_sleep: &mut Pin<Box<Sleep>>,
         probe_sleep: &mut Pin<Box<Sleep>>,
@@ -578,7 +627,7 @@ impl<S: SessionEventSource, E: EffectHandler> SessionLoop<S, E> {
                 LoopAction::ChildFinished
             }
             event = events.recv() => match event {
-                Some(event) => LoopAction::Event(event),
+                Some((event, permit)) => LoopAction::Event(event, permit),
                 None => LoopAction::SourceExhausted,
             },
         }

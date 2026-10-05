@@ -420,15 +420,17 @@ struct EngineExit {
 /// The event-source half: the loop's pump polls this; the engine feeds
 /// it through a one-slot channel.
 struct EventRx {
-    events: mpsc::Receiver<SessionEvent>,
+    events: crate::gate::GatedReceiver<SessionEvent>,
 }
 
 impl SessionEventSource for EventRx {
     async fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events.recv().await
+        // Only reached if the gated hand-off is bypassed (it is not for the
+        // engine path); drop the permit since the pump path is ungated.
+        self.events.recv().await.map(|(event, _permit)| event)
     }
 
-    fn into_event_channel(self) -> Result<mpsc::Receiver<SessionEvent>, Self> {
+    fn into_gated_event_channel(self) -> Result<crate::gate::GatedReceiver<SessionEvent>, Self> {
         Ok(self.events)
     }
 }
@@ -759,7 +761,7 @@ async fn run_bound_session_observed(
     // owner→loop channels. S1 wires the cmd channel through it (events/control
     // follow in later slices); the counter is maintained but not yet read.
     let gate = crate::gate::Gate::new();
-    let (event_tx, event_rx) = mpsc::channel(1);
+    let (event_tx, event_rx) = crate::gate::channel::<SessionEvent>(gate.clone(), 1);
     let (cmd_tx, cmd_rx) = crate::gate::channel::<EngineCmd>(gate.clone(), ENGINE_CMD_CAPACITY);
     let (report_tx, mut report_rx) = mpsc::channel(ENGINE_REPORT_CAPACITY);
     let (control_tx, control_rx) = crate::gate::channel::<SessionControl>(gate.clone(), 8);
@@ -1389,7 +1391,7 @@ struct Engine {
     snapshot_updates: watch::Receiver<Arc<ValidatedSnapshot>>,
     /// Process-wide registry; absent only in legacy/unit compositions.
     metering: Option<MeteringSourceRegistry>,
-    events: mpsc::Sender<SessionEvent>,
+    events: crate::gate::GatedSender<SessionEvent>,
     cmds: crate::gate::GatedReceiver<EngineCmd>,
     reports: mpsc::Sender<EngineReport>,
     route: Option<RouteSeed>,
