@@ -840,6 +840,7 @@ async fn run_bound_session_observed(
     // fires — not only when the loop finishes its own cleanup.
     let mut owner_shutdown = shutdown.clone();
     let session_loop = SessionLoop::new(
+        gate.clone(),
         EventRx { events: event_rx },
         CmdTx {
             cmds: cmd_tx.clone(),
