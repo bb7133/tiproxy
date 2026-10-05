@@ -25,6 +25,7 @@ pub mod capture_format;
 pub mod control_commands;
 pub mod control_dispatch;
 pub mod control_runtime;
+mod gate;
 pub mod metering;
 pub mod observability;
 pub mod registry;
