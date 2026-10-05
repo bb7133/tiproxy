@@ -286,6 +286,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_permits_release_before_the_steady_phase() -> R {
+        // Models the engine lifecycle: each handshake effect holds a permit
+        // across its I/O then drops it; by the time the steady command phase
+        // runs, pending is 0, and it returns to 0 between commands (so a later
+        // fast path can engage at a command boundary).
+        let gate = Gate::new();
+        let (tx, mut rx) = channel::<u8>(gate.clone(), 4);
+        // Handshake: three effects, each permit scoped to its own I/O.
+        for effect in [10_u8, 11, 12] {
+            tx.send(effect).await?;
+            let (_e, permit) = rx.recv().await.ok_or("recv handshake effect")?;
+            // ... effect I/O happens here, permit held ...
+            drop(permit);
+            assert_eq!(gate.pending(), 0, "handshake permit released after its I/O");
+        }
+        assert_eq!(
+            gate.pending(),
+            0,
+            "no handshake permit leaks into the steady phase"
+        );
+        // Steady phase: each command's permit drops at the end of its iteration.
+        for cmd in [20_u8, 21] {
+            tx.send(cmd).await?;
+            let (_c, permit) = rx.recv().await.ok_or("recv command")?;
+            assert_eq!(gate.pending(), 1, "in-flight during the command");
+            drop(permit);
+            assert_eq!(gate.pending(), 0, "pending back to 0 between commands");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn closed_receiver_returns_original_msg_and_frees_slot() -> R {
         let gate = Gate::new();
         let (tx, rx) = channel::<String>(gate.clone(), 1);

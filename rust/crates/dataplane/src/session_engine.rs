@@ -1750,12 +1750,15 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        let _greeting_permit = match self.await_effect(SessionEffect::SendProxyGreeting).await {
-            EffectAck::Got(permit) => permit,
+        // Scope the permit to exactly the greeting I/O so it is released before
+        // the rest of the handshake — it must never leak into the command phase.
+        match self.await_effect(SessionEffect::SendProxyGreeting).await {
             EffectAck::Closing => return None,
-        };
-        if let Err(source) = self.send_greeting().await {
-            return Some(source);
+            EffectAck::Got(_greeting_permit) => {
+                if let Err(source) = self.send_greeting().await {
+                    return Some(source);
+                }
+            }
         }
 
         // PROXY protocol v2 inbound (WIRE-activation B): once the greeting is
@@ -1830,12 +1833,13 @@ impl Engine {
             {
                 return Some(WireErrorSource::Proxy);
             }
-            let _tls_permit = match self.await_effect(SessionEffect::ActivateFrontendTls).await {
-                EffectAck::Got(permit) => permit,
+            match self.await_effect(SessionEffect::ActivateFrontendTls).await {
                 EffectAck::Closing => return None,
-            };
-            if let Err(source) = self.activate_frontend_tls().await {
-                return Some(source);
+                EffectAck::Got(_tls_permit) => {
+                    if let Err(source) = self.activate_frontend_tls().await {
+                        return Some(source);
+                    }
+                }
             }
             // FSM: SslRequest --TlsActivated--> Greeting (no effect). The real
             // handshake response arrives inside TLS; its MySQL sequence
@@ -1937,7 +1941,7 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        let _dial_permit = match self.await_effect(SessionEffect::DialBackend).await {
+        let dial_permit = match self.await_effect(SessionEffect::DialBackend).await {
             EffectAck::Got(permit) => permit,
             EffectAck::Closing => return None,
         };
@@ -2330,7 +2334,11 @@ impl Engine {
         {
             return Some(WireErrorSource::Proxy);
         }
-        let _fwd_handshake_permit = match self
+        // The dial's processing (route + connect + backend greeting/verify)
+        // ends here, where the next handshake effect begins; release its permit
+        // so it never spans into the command phase.
+        drop(dial_permit);
+        let fwd_handshake_permit = match self
             .await_effect(SessionEffect::ForwardHandshakeToBackend)
             .await
         {
@@ -2403,6 +2411,10 @@ impl Engine {
                 return Some(source);
             }
         }
+
+        // The handshake forward is done; release its permit before the auth
+        // relay so it does not span into the command phase.
+        drop(fwd_handshake_permit);
 
         // Engine-internal authentication relay; the FSM sees only the
         // terminal outcome.
@@ -3080,9 +3092,16 @@ impl Engine {
         if self.events.send(event).await.is_err() {
             return Err(WireErrorSource::Proxy);
         }
-        let _ = self
+        // Hold the forward ack's permit to the end of this change-user round
+        // (teardown still finishes the round); do not gate on it, matching the
+        // prior behavior.
+        let _round_permit = match self
             .await_effect(SessionEffect::ForwardResponseToClient)
-            .await;
+            .await
+        {
+            EffectAck::Got(permit) => Some(permit),
+            EffectAck::Closing => None,
+        };
         Ok(ChangeUserRoundProgress::Finished)
     }
 
