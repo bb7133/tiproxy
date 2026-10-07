@@ -2858,8 +2858,7 @@ impl Engine {
             // The permit (fast) or the awaited effect's permit (slow) is held to
             // the end of this iteration, keeping `pending >= 1` across the
             // forward exactly as the slow path does.
-            let _fwd_cmd_permit = if self.fast_path_enabled && event == SessionEvent::ClientCommand
-            {
+            let fwd_cmd_permit = if self.fast_path_enabled && event == SessionEvent::ClientCommand {
                 match self.core.try_commit_steady(
                     SessionEvent::ClientCommand,
                     SessionEffect::ForwardCommandToBackend,
@@ -2992,7 +2991,7 @@ impl Engine {
             let response_source = if pending.expected == ExpectedResponse::Prepare {
                 self.prepare_response_rounds(&pending).await
             } else {
-                self.response_rounds(&pending).await
+                self.response_rounds(&pending, &fwd_cmd_permit).await
             };
             self.record_command(&pending);
             if let Some(source) = response_source {
@@ -3510,7 +3509,11 @@ impl Engine {
 
     /// Streams one command's backend response(s) to the client.
     #[allow(clippy::too_many_lines)] // hot response loop; opt#5 bypass adds a branch
-    async fn response_rounds(&mut self, pending: &PendingCommand) -> Option<WireErrorSource> {
+    async fn response_rounds(
+        &mut self,
+        pending: &PendingCommand,
+        fwd_permit: &crate::gate::GatePermit,
+    ) -> Option<WireErrorSource> {
         let Ok(mut observer) = ResponseObserver::new(
             pending.expected,
             self.negotiated,
@@ -3691,16 +3694,39 @@ impl Engine {
             }
             bypass_since_yield = 0;
             let event = effect.session_event();
-            if self.events.send(event).await.is_err() {
-                return Some(WireErrorSource::Proxy);
-            }
             let expected_ack = match effect.disposition {
                 ResponseDisposition::LocalInfile => SessionEffect::RequestLocalInfileFromClient,
                 _ => SessionEffect::ForwardResponseToClient,
             };
-            let _resp_ack_permit = match self.await_effect(expected_ack).await {
-                EffectAck::Got(permit) => permit,
-                EffectAck::Closing => return None,
+            // S2c response-point fast path: the response packet is already
+            // flushed to the client above, so this `events`→loop→`await_effect`
+            // round-trip is pure FSM bookkeeping with no I/O. When enabled and
+            // the only in-flight registration is this command's own forward
+            // permit (`pending == 1`), commit the response transition inline and
+            // skip the hop. `LocalInfile` (which expects a different ack and
+            // then reads from the client) always takes the slow path. Default-off.
+            let committed_inline = self.fast_path_enabled
+                && expected_ack == SessionEffect::ForwardResponseToClient
+                && self.core.try_inline_commit_excluding(
+                    fwd_permit,
+                    event,
+                    SessionEffect::ForwardResponseToClient,
+                    &self.shutdown,
+                );
+            // On the slow path the ack permit is held to the end of the loop
+            // iteration exactly as before (so flag-off timing is byte-identical);
+            // on the inline path there is no new permit and `fwd_permit` keeps
+            // the floor.
+            let _resp_ack_permit = if committed_inline {
+                None
+            } else {
+                if self.events.send(event).await.is_err() {
+                    return Some(WireErrorSource::Proxy);
+                }
+                match self.await_effect(expected_ack).await {
+                    EffectAck::Got(permit) => Some(permit),
+                    EffectAck::Closing => return None,
+                }
             };
             match effect.disposition {
                 ResponseDisposition::Continue | ResponseDisposition::MoreResults => {}
