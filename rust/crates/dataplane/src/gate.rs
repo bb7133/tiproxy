@@ -170,6 +170,52 @@ impl Gate {
         }
     }
 
+    /// Engine fast path for the response-ACK point: commit one steady transition
+    /// inline when the *only* in-flight registration is the caller's own command
+    /// `fwd_permit`.
+    ///
+    /// Unlike [`Gate::try_commit_steady`] this registers **no** new permit: the
+    /// response packet is already flushed to the client before this point, so
+    /// the skipped `events`→loop→`await_effect` round-trip carries no I/O. The
+    /// existing `fwd_permit` keeps the `pending` floor across the response phase
+    /// exactly as before.
+    ///
+    /// `fwd_permit` is a capability/liveness witness. Rust's borrow proves it is
+    /// not dropped for the duration of the call, and [`Arc::ptr_eq`] proves it
+    /// belongs to *this* core — so `pending == 1` means that single registration
+    /// is exactly this permit and nothing else (no redirect/drain/control/
+    /// in-flight sync) is outstanding. The identity check, the `open`/shutdown
+    /// read, the speculative transition, the effect match, and the write-back
+    /// all run in one lock critical section; no raw `pending` escapes, so a
+    /// control intent cannot slip in between a check and the commit (no TOCTOU).
+    /// A same-core identity mismatch falls back rather than asserting.
+    pub(crate) fn try_inline_commit_excluding(
+        &self,
+        fwd_permit: &GatePermit,
+        event: SessionEvent,
+        expected_effect: SessionEffect,
+        shutdown: &watch::Receiver<bool>,
+    ) -> bool {
+        let mut inner = lock(&self.inner);
+        let closed = shutdown.has_changed().map_or(true, |_| *shutdown.borrow());
+        if !Arc::ptr_eq(&fwd_permit.inner, &self.inner)
+            || !inner.open
+            || closed
+            || inner.pending != 1
+        {
+            return false;
+        }
+        let mut speculative = inner.fsm.clone();
+        match speculative.on_event(event) {
+            Ok(effects) if effects.len() == 1 && effects[0] == expected_effect => {
+                inner.fsm = speculative;
+                inner.fast_transitions += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Admits a quiescent loop-side operation (currently the backend probe)
     /// atomically with the core: only when the core is `open`, `pending == 0`,
     /// and `state_ok` holds for the current FSM state does it register an
@@ -604,6 +650,154 @@ mod tests {
         assert_eq!(core.fast_transitions(), 0);
         assert_eq!(core.pending(), 0);
         assert_eq!(core.state_snapshot(), SessionState::Ready);
+    }
+
+    /// Drives a core to `Command` (after a `ClientCommand`) — the state where a
+    /// backend response part produces `ForwardResponseToClient`.
+    fn core_in_command() -> Gate {
+        let core = core_in_ready();
+        assert!(
+            matches!(
+                core.apply_slow(SessionEvent::ClientCommand, true),
+                SlowOutcome::Applied { .. }
+            ),
+            "Ready ClientCommand must apply"
+        );
+        assert_eq!(core.state_snapshot(), SessionState::Command);
+        core
+    }
+
+    #[test]
+    fn try_inline_commit_excluding_commits_the_response_point_without_a_new_permit() -> R {
+        let (_tx, shutdown) = watch::channel(false);
+        let core = core_in_command();
+        // The command's own forward permit is the sole in-flight registration.
+        let own = core.operation_permit();
+        assert_eq!(core.pending(), 1);
+
+        // Reference: what the slow path would do for the same response event.
+        let reference = core_in_command();
+        let SlowOutcome::Applied { result, post_state } =
+            reference.apply_slow(SessionEvent::BackendResponsePart, true)
+        else {
+            return Err("slow path must apply the response part".into());
+        };
+        assert_eq!(result, Ok(vec![SessionEffect::ForwardResponseToClient]));
+
+        // Fast path: commits the same transition inline, registers NO new permit
+        // (the already-flushed packet means no post-commit I/O), bumps the
+        // counter, and lands on the same FSM state.
+        assert!(
+            core.try_inline_commit_excluding(
+                &own,
+                SessionEvent::BackendResponsePart,
+                SessionEffect::ForwardResponseToClient,
+                &shutdown,
+            ),
+            "a quiescent response part whose sole blocker is the own permit commits inline"
+        );
+        assert_eq!(core.fast_transitions(), 1);
+        assert_eq!(
+            core.pending(),
+            1,
+            "no new permit is registered; the own permit still holds the floor"
+        );
+        assert_eq!(
+            core.state_snapshot(),
+            post_state,
+            "fast commit lands on the same FSM state as the slow transition"
+        );
+
+        // The terminal response part also commits inline (Response -> Ready).
+        assert!(
+            core.try_inline_commit_excluding(
+                &own,
+                SessionEvent::BackendResponseTxnDone,
+                SessionEffect::ForwardResponseToClient,
+                &shutdown,
+            ),
+            "the terminal response part also commits inline"
+        );
+        assert_eq!(core.fast_transitions(), 2);
+        assert_eq!(core.state_snapshot(), SessionState::Ready);
+
+        drop(own);
+        assert_eq!(core.pending(), 0, "dropping the own permit frees the floor");
+        Ok(())
+    }
+
+    #[test]
+    fn try_inline_commit_excluding_falls_back_unless_the_own_permit_is_the_sole_blocker() {
+        let (_open_tx, open) = watch::channel(false);
+        let assert_fallback =
+            |core: &Gate, own: &GatePermit, shutdown: &watch::Receiver<bool>, label: &str| {
+                let state = core.state_snapshot();
+                let fast = core.fast_transitions();
+                let pending = core.pending();
+                assert!(
+                    !core.try_inline_commit_excluding(
+                        own,
+                        SessionEvent::BackendResponsePart,
+                        SessionEffect::ForwardResponseToClient,
+                        shutdown,
+                    ),
+                    "{label}: must fall back"
+                );
+                assert_eq!(core.state_snapshot(), state, "{label}: FSM untouched");
+                assert_eq!(core.fast_transitions(), fast, "{label}: no fast count");
+                assert_eq!(core.pending(), pending, "{label}: pending untouched");
+            };
+
+        // pending == 2: own permit plus an extra in-flight op (a concurrent
+        // redirect/drain/control registration) — the own permit is no longer the
+        // sole blocker.
+        let core = core_in_command();
+        let own = core.operation_permit();
+        let extra = core.operation_permit();
+        assert_eq!(core.pending(), 2);
+        assert_fallback(&core, &own, &open, "pending==2");
+        drop(extra);
+
+        // Wrong-gate witness: a permit from a DIFFERENT core fails `Arc::ptr_eq`
+        // even though the host core is quiescent with pending == 1.
+        let other = core_in_command();
+        let foreign = other.operation_permit();
+        let host = core_in_command();
+        let _host_own = host.operation_permit();
+        assert_eq!(host.pending(), 1);
+        assert_fallback(&host, &foreign, &open, "wrong-gate witness");
+
+        // Sealed closed.
+        let sealed = core_in_command();
+        let sealed_own = sealed.operation_permit();
+        sealed.seal_closed();
+        assert_fallback(&sealed, &sealed_own, &open, "sealed");
+
+        // Shutdown observed (value true).
+        let (_tx, closed) = watch::channel(true);
+        let s2 = core_in_command();
+        let s2_own = s2.operation_permit();
+        assert_fallback(&s2, &s2_own, &closed, "shutdown-true");
+
+        // Effect mismatch: correct event/state, wrong expected effect.
+        let mism = core_in_command();
+        let mism_own = mism.operation_permit();
+        let state = mism.state_snapshot();
+        assert!(
+            !mism.try_inline_commit_excluding(
+                &mism_own,
+                SessionEvent::BackendResponsePart,
+                SessionEffect::ForwardCommandToBackend,
+                &open,
+            ),
+            "a non-matching expected effect must fall back"
+        );
+        assert_eq!(
+            mism.state_snapshot(),
+            state,
+            "mismatch leaves the FSM untouched"
+        );
+        assert_eq!(mism.fast_transitions(), 0);
     }
 
     #[test]
