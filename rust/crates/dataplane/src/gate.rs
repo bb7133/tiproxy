@@ -46,9 +46,13 @@ struct FsmCore {
     /// and [`Gate::try_commit_steady`] (engine fast path) read it under this
     /// lock, so they linearize on the same seal.
     open: bool,
-    /// Count of transitions the engine committed inline on the fast path
-    /// (diagnostic; read by tests and metrics).
+    /// Count of command-point transitions the engine committed inline on the
+    /// fast path (S2b; diagnostic; read by tests and metrics).
     fast_transitions: u64,
+    /// Count of response-point transitions committed inline (S2c). Kept separate
+    /// from `fast_transitions` so the A/B can report command vs response hits
+    /// independently.
+    response_transitions: u64,
 }
 
 /// Handle to the shared session core (FSM + admission gate) for one session.
@@ -74,6 +78,7 @@ impl Gate {
                 pending: 0,
                 open: true,
                 fast_transitions: 0,
+                response_transitions: 0,
             })),
         }
     }
@@ -209,7 +214,7 @@ impl Gate {
         match speculative.on_event(event) {
             Ok(effects) if effects.len() == 1 && effects[0] == expected_effect => {
                 inner.fsm = speculative;
-                inner.fast_transitions += 1;
+                inner.response_transitions += 1;
                 true
             }
             _ => false,
@@ -242,6 +247,19 @@ impl Gate {
     #[cfg(test)]
     pub(crate) fn fast_transitions(&self) -> u64 {
         lock(&self.inner).fast_transitions
+    }
+
+    /// `(command_inline, response_inline)` commit counts for this session, read
+    /// at teardown by the A/B hit-rate diagnostic. Cheap; never on the hot path.
+    pub(crate) fn transition_counts(&self) -> (u64, u64) {
+        let inner = lock(&self.inner);
+        (inner.fast_transitions, inner.response_transitions)
+    }
+
+    /// Count of response-point inline commits (S2c). Test/diagnostic only.
+    #[cfg(test)]
+    pub(crate) fn response_transitions(&self) -> u64 {
+        lock(&self.inner).response_transitions
     }
 
     /// Registers a standalone "operation" permit not tied to a single message.
@@ -696,7 +714,7 @@ mod tests {
             ),
             "a quiescent response part whose sole blocker is the own permit commits inline"
         );
-        assert_eq!(core.fast_transitions(), 1);
+        assert_eq!(core.response_transitions(), 1);
         assert_eq!(
             core.pending(),
             1,
@@ -718,7 +736,7 @@ mod tests {
             ),
             "the terminal response part also commits inline"
         );
-        assert_eq!(core.fast_transitions(), 2);
+        assert_eq!(core.response_transitions(), 2);
         assert_eq!(core.state_snapshot(), SessionState::Ready);
 
         drop(own);
@@ -732,7 +750,7 @@ mod tests {
         let assert_fallback =
             |core: &Gate, own: &GatePermit, shutdown: &watch::Receiver<bool>, label: &str| {
                 let state = core.state_snapshot();
-                let fast = core.fast_transitions();
+                let fast = core.response_transitions();
                 let pending = core.pending();
                 assert!(
                     !core.try_inline_commit_excluding(
@@ -744,7 +762,7 @@ mod tests {
                     "{label}: must fall back"
                 );
                 assert_eq!(core.state_snapshot(), state, "{label}: FSM untouched");
-                assert_eq!(core.fast_transitions(), fast, "{label}: no fast count");
+                assert_eq!(core.response_transitions(), fast, "{label}: no fast count");
                 assert_eq!(core.pending(), pending, "{label}: pending untouched");
             };
 
@@ -797,7 +815,7 @@ mod tests {
             state,
             "mismatch leaves the FSM untouched"
         );
-        assert_eq!(mism.fast_transitions(), 0);
+        assert_eq!(mism.response_transitions(), 0);
     }
 
     #[test]

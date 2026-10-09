@@ -719,6 +719,25 @@ fn fast_path_enabled() -> bool {
     })
 }
 
+/// Whether the S2c response-point inline commit is enabled. Read once from
+/// `TIPROXY_FSM_FASTPATH_RESPONSE`; when unset it follows the main
+/// `TIPROXY_FSM_FASTPATH` flag. This gives the three same-binary A/B arms:
+/// `A` main off (both off), `B` main on + response off (command point only =
+/// S2b), `C` both on (S2b + S2c). Explicit `0`/`false`/`off` disables only the
+/// response point; `1`/`true`/`on` enables it. The command point stays gated by
+/// `fast_path_enabled()` alone, so it is unaffected.
+fn fast_path_response_enabled(main_enabled: bool) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("TIPROXY_FSM_FASTPATH_RESPONSE") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => true,
+            "0" | "false" | "off" => false,
+            _ => main_enabled,
+        },
+        Err(_) => main_enabled,
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_bound_session_observed(
     connection: AcceptedConnection,
@@ -852,6 +871,7 @@ async fn run_bound_session_observed(
         core: gate.clone(),
         shutdown: shutdown.clone(),
         fast_path_enabled: fast_path_enabled(),
+        fast_path_response_enabled: fast_path_response_enabled(fast_path_enabled()),
     };
 
     // The owner watches the same shutdown signal the loop consumes, so
@@ -1505,6 +1525,10 @@ struct Engine {
     /// Default off: when false the engine always takes the slow path, so the
     /// gate plumbing is behaviourally inert.
     fast_path_enabled: bool,
+    /// Whether the S2c response-point inline commit is enabled
+    /// (`TIPROXY_FSM_FASTPATH_RESPONSE`, follows the main flag when unset). Lets
+    /// the same binary run arm `B` (command point only) by disabling just this.
+    fast_path_response_enabled: bool,
 }
 
 /// Outcome of waiting for one specific FSM effect.
@@ -2585,7 +2609,24 @@ impl Engine {
 
         // Ready: the command/response phases until the wire or the FSM
         // ends the session.
-        self.command_phase().await
+        let outcome = self.command_phase().await;
+        self.log_fastpath_hits();
+        outcome
+    }
+
+    /// Diagnostic-only: when `TIPROXY_FSM_FASTPATH_DIAG` is set, print this
+    /// session's inline-commit counts (command-point / response-point) to stderr
+    /// at teardown for the A/B hit-rate tally. Off by default so the formal CPU
+    /// A/B binary carries no extra I/O; counts themselves are free (already
+    /// tracked under the gate lock).
+    fn log_fastpath_hits(&self) {
+        static DIAG: OnceLock<bool> = OnceLock::new();
+        if *DIAG.get_or_init(|| std::env::var("TIPROXY_FSM_FASTPATH_DIAG").is_ok()) {
+            let (command_inline, response_inline) = self.core.transition_counts();
+            eprintln!(
+                "FASTPATH_HITS command_inline={command_inline} response_inline={response_inline}"
+            );
+        }
     }
 
     fn refresh_backend_keepalive(&mut self) {
@@ -3706,6 +3747,7 @@ impl Engine {
             // skip the hop. `LocalInfile` (which expects a different ack and
             // then reads from the client) always takes the slow path. Default-off.
             let committed_inline = self.fast_path_enabled
+                && self.fast_path_response_enabled
                 && expected_ack == SessionEffect::ForwardResponseToClient
                 && self.core.try_inline_commit_excluding(
                     fwd_permit,
