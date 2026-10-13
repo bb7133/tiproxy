@@ -752,6 +752,32 @@ fi
 # the v2 header. Run one connection alone in a fresh log window so the row can
 # prove both fields without correlating against unrelated lifecycle records.
 if [[ $mode == rust ]]; then
+	# mysql may return the recovery SELECT before the Rust session task has
+	# emitted its close record. Fence that exact preceding session before taking
+	# the fresh-window offset; otherwise its delayed close can be mistaken for a
+	# second MTR-005 session. Keep the strict one-close assertion below rather
+	# than choosing an arbitrary record from an ambiguous window.
+	mtr005_prior_ready=$(grep '"event":"connection_ready"' "$run_dir/tiproxy-rs.log" | tail -1 || true)
+	mtr005_prior_id=$(sed -n 's/.*"connection_id":\([0-9][0-9]*\).*/\1/p' <<<"$mtr005_prior_ready")
+	if [[ ! $mtr005_prior_id =~ ^[0-9]+$ ]]; then
+		echo "MTR-005 could not identify the preceding recovery session: $mtr005_prior_ready" >&2
+		exit 1
+	fi
+	mtr005_prior_closed=false
+	for _ in {1..20}; do
+		if grep -q "\"event\":\"connection_closed\",\"connection_id\":$mtr005_prior_id," \
+			"$run_dir/tiproxy-rs.log"; then
+			mtr005_prior_closed=true
+			break
+		fi
+		sleep 0.25
+	done
+	if [[ $mtr005_prior_closed != true ]]; then
+		echo "MTR-005 preceding recovery session did not close: connection_id=$mtr005_prior_id" >&2
+		exit 1
+	fi
+	echo "MTR-005 prior lifecycle settled: connection_id=$mtr005_prior_id"
+
 	mtr005_offset=$(wc -l <"$run_dir/tiproxy-rs.log" | tr -d ' ')
 	if [[ $(mysql_ingress 'SELECT 1') != 1 ]]; then
 		echo "MTR-005 attribution query failed" >&2
