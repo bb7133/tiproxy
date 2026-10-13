@@ -833,7 +833,8 @@ capture_t4_m5_metric_diagnostics() {
 	# empty or stale publication is distinguishable from missing TiDB families.
 	for cluster in cluster-a cluster-b ''; do
 		name=${cluster:-primary}
-		curl --noproxy '*' --silent --show-error --max-time 5 \
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			--retry 2 --retry-all-errors --retry-delay 0 \
 			-D "$evidence_dir/admin-backend-metrics-$name.headers" \
 			-o "$evidence_dir/admin-backend-metrics-$name.json" \
 			"http://127.0.0.1:$admin_port/api/backend/metrics?cluster=$cluster" \
@@ -891,7 +892,8 @@ PYT4M5OWNERS
 		file_address=${address//[^0-9A-Za-z.-]/_}
 		for cluster in cluster-a cluster-b ''; do
 			name=${cluster:-primary}
-			curl --noproxy '*' --silent --show-error --max-time 5 \
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+				--retry 2 --retry-all-errors --retry-delay 0 \
 				-D "$evidence_dir/owner-$file_address-$name.headers" \
 				-o "$evidence_dir/owner-$file_address-$name.json" \
 				"http://$address/api/backend/metrics?cluster=$cluster" \
@@ -1051,6 +1053,41 @@ t4_assert_metric_owner_snapshot() {
 		cmp -s "$expected_a" "$actual_a" && cmp -s "$expected_b" "$actual_b"
 }
 
+t4_assert_local_metric_views() {
+	local evidence_dir=$1
+	local file_address="127.0.0.1_${ka_metrics_owner_port}"
+	local admin_a="$evidence_dir/admin-backend-metrics-cluster-a.json"
+	local admin_b="$evidence_dir/admin-backend-metrics-cluster-b.json"
+	local local_a="$evidence_dir/owner-$file_address-cluster-a.json"
+	local local_b="$evidence_dir/owner-$file_address-cluster-b.json"
+	[[ -s $admin_a && -s $admin_b && -s $local_a && -s $local_b ]] &&
+		cmp -s "$admin_a" "$local_a" && cmp -s "$admin_b" "$local_b"
+}
+
+t4_fetch_metric_json() {
+	local label=$1
+	local url=$2
+	local output=$3
+	local attempt errors="${output}.stderr" next="${output}.next"
+	for attempt in 1 2 3; do
+		if curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"$url" -o "$next" 2>"$errors"; then
+			mv "$next" "$output"
+			if ((attempt > 1)); then
+				printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$attempt" \
+					>>"$run_dir/t4-m5-post-config-fetch-retries.tsv"
+			fi
+			return 0
+		fi
+		printf '%s\t%s\t%s\t' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$attempt" \
+			>>"$run_dir/t4-m5-post-config-fetch-errors.tsv"
+		tr '\n' ' ' <"$errors" >>"$run_dir/t4-m5-post-config-fetch-errors.tsv"
+		printf '\n' >>"$run_dir/t4-m5-post-config-fetch-errors.tsv"
+		sleep 0.2
+	done
+	return 1
+}
+
 # The later keyspace/migration process starts cold and consumes several config
 # generations before CP-ADMIN checks it. Its own dedicated collector can remain
 # an empty follower: Rust selects the lowest create revision per zone and reads
@@ -1059,10 +1096,6 @@ t4_assert_metric_owner_snapshot() {
 run_t4_m5_post_config_metric_soak() {
 	local samples="$run_dir/t4-m5-post-config-metric-samples.tsv"
 	local health="$run_dir/t4-m5-post-config-health.json"
-	local admin_a="$run_dir/t4-m5-post-config-admin-cluster-a.json"
-	local admin_b="$run_dir/t4-m5-post-config-admin-cluster-b.json"
-	local local_a="$run_dir/t4-m5-post-config-local-cluster-a.json"
-	local local_b="$run_dir/t4-m5-post-config-local-cluster-b.json"
 	local owner_a="$run_dir/t4-m5-post-config-owner-cluster-a.json"
 	local owner_b="$run_dir/t4-m5-post-config-owner-cluster-b.json"
 	local selected_a="$run_dir/t4-m5-post-config-selected-cluster-a.tsv"
@@ -1091,6 +1124,10 @@ run_t4_m5_post_config_metric_soak() {
 		echo "T4 M5 PD still advertises a Rust-admin/Go-api address as a metric reader" >&2
 		exit 1
 	fi
+	if ! t4_assert_local_metric_views "$start_diagnostics"; then
+		echo "T4 M5 KA admin and its local dedicated metric endpoint diverged at start" >&2
+		exit 1
+	fi
 	printf 'cluster-a\t%s\t%s\t%s\ncluster-b\t%s\t%s\t%s\n' \
 		"$owner_a_address" "$owner_a_created" "$owner_a_key" \
 		"$owner_b_address" "$owner_b_created" "$owner_b_key" \
@@ -1100,21 +1137,11 @@ run_t4_m5_post_config_metric_soak() {
 			echo "T4 M5 post-config production query failed" >&2
 			exit 1
 		}
-		if curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-			"http://127.0.0.1:$ka_health_port/health" -o "$health" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-a" -o "$admin_a" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-				"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-b" -o "$admin_b" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-a" -o "$local_a" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-b" -o "$local_b" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-				"http://$owner_a_address/api/backend/metrics?cluster=cluster-a" -o "$owner_a" &&
-			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-				"http://$owner_b_address/api/backend/metrics?cluster=cluster-b" -o "$owner_b" &&
-			cmp -s "$admin_a" "$local_a" && cmp -s "$admin_b" "$local_b"; then
+		if t4_fetch_metric_json health "http://127.0.0.1:$ka_health_port/health" "$health" &&
+			t4_fetch_metric_json cluster-a-owner \
+				"http://$owner_a_address/api/backend/metrics?cluster=cluster-a" "$owner_a" &&
+			t4_fetch_metric_json cluster-b-owner \
+				"http://$owner_b_address/api/backend/metrics?cluster=cluster-b" "$owner_b"; then
 			observations=$(sed -n 's/.*"observations":\([0-9][0-9]*\).*/\1/p' "$health")
 			health_inputs=$(sed -n 's/.*"health_input_backends":\([0-9][0-9]*\).*/\1/p' "$health")
 			healthy=$(sed -n 's/.*"healthy_backends":\([0-9][0-9]*\).*/\1/p' "$health")
@@ -1131,6 +1158,10 @@ run_t4_m5_post_config_metric_soak() {
 					checkpoint_diagnostics="$run_dir/t4-m5-metric-diagnostics/post-config-$iteration"
 					if ! t4_assert_metric_owner_snapshot "$checkpoint_diagnostics" "$selected_a" "$selected_b"; then
 						echo "T4 M5 elected metric owner changed or became invalid at iteration $iteration" >&2
+						exit 1
+					fi
+					if ! t4_assert_local_metric_views "$checkpoint_diagnostics"; then
+						echo "T4 M5 KA admin and local dedicated metric views diverged at iteration $iteration" >&2
 						exit 1
 					fi
 					;;
@@ -1166,6 +1197,10 @@ PYT4M5ADVANCE
 					checkpoint_diagnostics="$run_dir/t4-m5-metric-diagnostics/post-config-final-$iteration"
 					if ! t4_assert_metric_owner_snapshot "$checkpoint_diagnostics" "$selected_a" "$selected_b"; then
 						echo "T4 M5 elected metric owner changed or became invalid at the final checkpoint" >&2
+						exit 1
+					fi
+					if ! t4_assert_local_metric_views "$checkpoint_diagnostics"; then
+						echo "T4 M5 KA admin and local dedicated metric views diverged at the final checkpoint" >&2
 						exit 1
 					fi
 					echo "T4 M5 post-config elected-owner metrics stayed nonempty for 90s and advanced: cluster-a $owner_a_address $first_a_latest->$a_latest, cluster-b $owner_b_address $first_b_latest->$b_latest"
