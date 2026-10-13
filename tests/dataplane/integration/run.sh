@@ -991,22 +991,110 @@ print(count, f"{latest:.6f}")
 PYT4M5HISTORY
 }
 
+t4_metric_elected_owner() {
+	local candidates=$1
+	local cluster=$2
+	local output=$3
+	python3 - "$candidates" "$cluster" "$output" <<'PYT4M5ELECTED'
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1])
+cluster = sys.argv[2].strip()
+output = pathlib.Path(sys.argv[3])
+prefix = "/tiproxy/metric_reader"
+if cluster and cluster != "default":
+    prefix += f"/{cluster}"
+
+owners = {}
+for line in source.read_text().splitlines():
+    fields = line.split("\t")
+    if len(fields) < 5:
+        continue
+    key, value, _lease, created_text, _modified = fields[:5]
+    if not key.startswith(prefix + "/"):
+        continue
+    suffix = key[len(prefix) + 1:]
+    if suffix.startswith("owner"):
+        zone = ""
+    else:
+        end = suffix.find("/")
+        if end <= 0 or not suffix[end + 1:].startswith("owner"):
+            continue
+        zone = suffix[:end]
+    try:
+        created = int(created_text)
+    except ValueError:
+        continue
+    previous = owners.get(zone)
+    if previous is None or created < previous[0]:
+        owners[zone] = (created, value, key)
+
+if "" not in owners:
+    raise SystemExit(f"no default-zone metric owner for {cluster!r} in {source}")
+created, address, key = owners[""]
+if not re.fullmatch(r"(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+):[0-9]+", address):
+    raise SystemExit(f"invalid elected metric owner address {address!r}")
+output.write_text(f"{address}\t{created}\t{key}\n")
+PYT4M5ELECTED
+}
+
+t4_assert_metric_owner_snapshot() {
+	local evidence_dir=$1
+	local expected_a=$2
+	local expected_b=$3
+	local actual_a="$evidence_dir/cluster-a-selected-owner.tsv"
+	local actual_b="$evidence_dir/cluster-b-selected-owner.tsv"
+	t4_metric_elected_owner "$evidence_dir/cluster-a-metric-readers.tsv" cluster-a "$actual_a" &&
+		t4_metric_elected_owner "$evidence_dir/cluster-b-metric-readers.tsv" cluster-b "$actual_b" &&
+		cmp -s "$expected_a" "$actual_a" && cmp -s "$expected_b" "$actual_b"
+}
+
 # The later keyspace/migration process starts cold and consumes several config
-# generations before CP-ADMIN checks it. Prove that its transient empty history
-# recovers, stays nonempty past the 60-second retention window, and continues to
-# receive newer samples from the same owner endpoint.
+# generations before CP-ADMIN checks it. Its own dedicated collector can remain
+# an empty follower: Rust selects the lowest create revision per zone and reads
+# that peer. Prove that route inputs stay live past the 60-second retention
+# window and that the actually elected owner keeps publishing newer samples.
 run_t4_m5_post_config_metric_soak() {
 	local samples="$run_dir/t4-m5-post-config-metric-samples.tsv"
 	local health="$run_dir/t4-m5-post-config-health.json"
 	local admin_a="$run_dir/t4-m5-post-config-admin-cluster-a.json"
 	local admin_b="$run_dir/t4-m5-post-config-admin-cluster-b.json"
+	local local_a="$run_dir/t4-m5-post-config-local-cluster-a.json"
+	local local_b="$run_dir/t4-m5-post-config-local-cluster-b.json"
 	local owner_a="$run_dir/t4-m5-post-config-owner-cluster-a.json"
 	local owner_b="$run_dir/t4-m5-post-config-owner-cluster-b.json"
+	local selected_a="$run_dir/t4-m5-post-config-selected-cluster-a.tsv"
+	local selected_b="$run_dir/t4-m5-post-config-selected-cluster-b.tsv"
+	local start_diagnostics="$run_dir/t4-m5-metric-diagnostics/post-config-start"
+	local checkpoint_diagnostics
 	local iteration observations health_inputs healthy cpu memory
 	local a_count a_latest b_count b_latest
+	local owner_a_address owner_a_created owner_a_key
+	local owner_b_address owner_b_created owner_b_key
 	local first_pass_iteration=0 first_a_latest= first_b_latest=
 	printf 'captured_at\titeration\tobservations\thealth_inputs\thealthy\tcpu\tmemory\tcluster_a_samples\tcluster_a_latest\tcluster_b_samples\tcluster_b_latest\n' >"$samples"
 	capture_t4_m5_metric_diagnostics post-config-start "$ka_health_port" "$ka_admin_port"
+	t4_metric_elected_owner "$start_diagnostics/cluster-a-metric-readers.tsv" cluster-a "$selected_a" || {
+		echo "T4 M5 could not resolve cluster-a's elected Rust metric owner" >&2
+		exit 1
+	}
+	t4_metric_elected_owner "$start_diagnostics/cluster-b-metric-readers.tsv" cluster-b "$selected_b" || {
+		echo "T4 M5 could not resolve cluster-b's elected Rust metric owner" >&2
+		exit 1
+	}
+	IFS=$'\t' read -r owner_a_address owner_a_created owner_a_key <"$selected_a"
+	IFS=$'\t' read -r owner_b_address owner_b_created owner_b_key <"$selected_b"
+	if cut -f2 "$start_diagnostics"/*-metric-readers.tsv |
+		grep -Fqx -e "127.0.0.1:$TIPROXY_API_PORT" -e "127.0.0.1:$ka_admin_port"; then
+		echo "T4 M5 PD still advertises a Rust-admin/Go-api address as a metric reader" >&2
+		exit 1
+	fi
+	printf 'cluster-a\t%s\t%s\t%s\ncluster-b\t%s\t%s\t%s\n' \
+		"$owner_a_address" "$owner_a_created" "$owner_a_key" \
+		"$owner_b_address" "$owner_b_created" "$owner_b_key" \
+		>"$run_dir/t4-m5-post-config-selected-owners.tsv"
 	for iteration in {1..180}; do
 		mysql_ka_root 'SELECT 1' >/dev/null 2>&1 || {
 			echo "T4 M5 post-config production query failed" >&2
@@ -1017,25 +1105,34 @@ run_t4_m5_post_config_metric_soak() {
 			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
 			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-a" -o "$admin_a" &&
 			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-b" -o "$admin_b" &&
+				"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-b" -o "$admin_b" &&
 			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-			"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-a" -o "$owner_a" &&
+				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-a" -o "$local_a" &&
 			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-			"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-b" -o "$owner_b" &&
-			cmp -s "$admin_a" "$owner_a" && cmp -s "$admin_b" "$owner_b"; then
+				"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-b" -o "$local_b" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+				"http://$owner_a_address/api/backend/metrics?cluster=cluster-a" -o "$owner_a" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+				"http://$owner_b_address/api/backend/metrics?cluster=cluster-b" -o "$owner_b" &&
+			cmp -s "$admin_a" "$local_a" && cmp -s "$admin_b" "$local_b"; then
 			observations=$(sed -n 's/.*"observations":\([0-9][0-9]*\).*/\1/p' "$health")
 			health_inputs=$(sed -n 's/.*"health_input_backends":\([0-9][0-9]*\).*/\1/p' "$health")
 			healthy=$(sed -n 's/.*"healthy_backends":\([0-9][0-9]*\).*/\1/p' "$health")
 			cpu=$(sed -n 's/.*"cpu_series":\([0-9][0-9]*\).*/\1/p' "$health")
 			memory=$(sed -n 's/.*"memory_series":\([0-9][0-9]*\).*/\1/p' "$health")
-			read -r a_count a_latest <<<"$(t4_metric_history_summary "$admin_a")"
-			read -r b_count b_latest <<<"$(t4_metric_history_summary "$admin_b")"
+			read -r a_count a_latest <<<"$(t4_metric_history_summary "$owner_a")"
+			read -r b_count b_latest <<<"$(t4_metric_history_summary "$owner_b")"
 			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$iteration" "$observations" "$health_inputs" \
 				"$healthy" "$cpu" "$memory" "$a_count" "$a_latest" "$b_count" "$b_latest" >>"$samples"
 			case "$iteration" in
 				1 | 5 | 10 | 15 | 30 | 60 | 90 | 120 | 150 | 180)
 					capture_t4_m5_metric_diagnostics "post-config-$iteration" "$ka_health_port" "$ka_admin_port"
+					checkpoint_diagnostics="$run_dir/t4-m5-metric-diagnostics/post-config-$iteration"
+					if ! t4_assert_metric_owner_snapshot "$checkpoint_diagnostics" "$selected_a" "$selected_b"; then
+						echo "T4 M5 elected metric owner changed or became invalid at iteration $iteration" >&2
+						exit 1
+					fi
 					;;
 			esac
 			if [[ $observations =~ ^[1-9][0-9]*$ &&
@@ -1049,8 +1146,8 @@ run_t4_m5_post_config_metric_soak() {
 					first_pass_iteration=$iteration
 					first_a_latest=$a_latest
 					first_b_latest=$b_latest
-					cp "$admin_a" "$run_dir/t4-m5-post-config-first-cluster-a.json"
-					cp "$admin_b" "$run_dir/t4-m5-post-config-first-cluster-b.json"
+					cp "$owner_a" "$run_dir/t4-m5-post-config-first-cluster-a.json"
+					cp "$owner_b" "$run_dir/t4-m5-post-config-first-cluster-b.json"
 				fi
 				if ((iteration - first_pass_iteration >= 90)); then
 					python3 - "$first_a_latest" "$a_latest" "$first_b_latest" "$b_latest" <<'PYT4M5ADVANCE'
@@ -1063,10 +1160,15 @@ if not (final_a > first_a and final_b > first_b):
         f"cluster-b {first_b}->{final_b}"
     )
 PYT4M5ADVANCE
-					cp "$admin_a" "$run_dir/t4-m5-post-config-final-cluster-a.json"
-					cp "$admin_b" "$run_dir/t4-m5-post-config-final-cluster-b.json"
+					cp "$owner_a" "$run_dir/t4-m5-post-config-final-cluster-a.json"
+					cp "$owner_b" "$run_dir/t4-m5-post-config-final-cluster-b.json"
 					capture_t4_m5_metric_diagnostics "post-config-final-$iteration" "$ka_health_port" "$ka_admin_port"
-					echo "T4 M5 post-config metrics stayed nonempty for 90s and advanced: cluster-a $first_a_latest->$a_latest, cluster-b $first_b_latest->$b_latest"
+					checkpoint_diagnostics="$run_dir/t4-m5-metric-diagnostics/post-config-final-$iteration"
+					if ! t4_assert_metric_owner_snapshot "$checkpoint_diagnostics" "$selected_a" "$selected_b"; then
+						echo "T4 M5 elected metric owner changed or became invalid at the final checkpoint" >&2
+						exit 1
+					fi
+					echo "T4 M5 post-config elected-owner metrics stayed nonempty for 90s and advanced: cluster-a $owner_a_address $first_a_latest->$a_latest, cluster-b $owner_b_address $first_b_latest->$b_latest"
 					return 0
 				fi
 			elif ((first_pass_iteration != 0)); then
@@ -1075,7 +1177,7 @@ PYT4M5ADVANCE
 				exit 1
 			fi
 		elif ((first_pass_iteration != 0)); then
-			echo "T4 M5 post-config admin/owner endpoints failed or diverged after first pass at iteration $first_pass_iteration" >&2
+			echo "T4 M5 post-config local/elected-owner endpoints failed or the local views diverged after first pass at iteration $first_pass_iteration" >&2
 			capture_t4_m5_metric_diagnostics "post-config-endpoint-failure-$iteration" "$ka_health_port" "$ka_admin_port"
 			exit 1
 		fi
