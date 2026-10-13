@@ -798,10 +798,111 @@ fi
 # real metric collector establish CPU history; the Rust health endpoint exposes
 # only payload-free counts captured after a successful reservation under the
 # current routing/health/metric fences.
+capture_t4_m5_metric_diagnostics() {
+	local label=$1
+	local evidence_dir="$run_dir/t4-m5-metric-diagnostics/$label"
+	local status_port name pd_name pd_port address file_address cluster
+	mkdir -p "$evidence_dir"
+
+	date -u +%Y-%m-%dT%H:%M:%SZ >"$evidence_dir/captured-at.txt"
+	curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+		"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
+		-o "$evidence_dir/rust-health.json" 2>"$evidence_dir/rust-health.stderr" || true
+	ss -lntp >"$evidence_dir/listeners.txt" 2>"$evidence_dir/listeners.stderr" || true
+
+	# Keep only the eight raw families used by the six routing queries. This
+	# proves whether TiDB exposes the source material without archiving its full
+	# metrics surface or any unrelated labels.
+	for name in tidb-a0 tidb-a1 tidb-b0; do
+		case "$name" in
+			tidb-a0) status_port=$((10080 + port_offset)) ;;
+			tidb-a1) status_port=$((10081 + port_offset)) ;;
+			tidb-b0) status_port=$((10080 + PORT_OFFSET_B)) ;;
+		esac
+		curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$status_port/metrics" \
+			2>"$evidence_dir/$name-metrics.stderr" |
+			awk '/^(process_cpu_seconds_total|tidb_server_maxprocs|process_resident_memory_bytes|tidb_server_memory_quota_bytes|pd_client_cmd_handle_failed_cmds_duration_seconds_count|pd_client_cmd_handle_cmds_duration_seconds_count|tidb_tikvclient_backoff_seconds_count|tidb_tikvclient_request_seconds_count)(\{|[[:space:]])/' \
+			>"$evidence_dir/$name-routing-metrics.txt" || true
+	done
+
+	# The Rust-owned management API is a read-only view of the same owner
+	# histories consumed by routing. Capture each cluster independently so an
+	# empty or stale publication is distinguishable from missing TiDB families.
+	for cluster in cluster-a cluster-b ''; do
+		name=${cluster:-primary}
+		curl --noproxy '*' --silent --show-error --max-time 5 \
+			-D "$evidence_dir/admin-backend-metrics-$name.headers" \
+			-o "$evidence_dir/admin-backend-metrics-$name.json" \
+			"http://127.0.0.1:$TIPROXY_API_PORT/api/backend/metrics?cluster=$cluster" \
+			2>"$evidence_dir/admin-backend-metrics-$name.stderr" || true
+	done
+
+	# Record both independent PD stores: elected metric readers, their retained
+	# lease/create revisions, and whether either cluster unexpectedly advertises
+	# Prometheus. The decoded TSV contains only etcd keys, owner addresses, and
+	# numeric revisions; no configuration or credential material is read.
+	for pd_name in cluster-a cluster-b; do
+		case "$pd_name" in
+			cluster-a) pd_port=$PD_PORT ;;
+			cluster-b) pd_port=$PD_PORT_B ;;
+		esac
+		ETCDCTL_API=3 "$etcdctl_bin" --endpoints "http://127.0.0.1:$pd_port" \
+			get /tiproxy/metric_reader --prefix --write-out=json \
+			>"$evidence_dir/$pd_name-metric-readers.json" \
+			2>"$evidence_dir/$pd_name-metric-readers.stderr" || true
+		ETCDCTL_API=3 "$etcdctl_bin" --endpoints "http://127.0.0.1:$pd_port" \
+			get /topology/prometheus --prefix --write-out=json \
+			>"$evidence_dir/$pd_name-prometheus.json" \
+			2>"$evidence_dir/$pd_name-prometheus.stderr" || true
+		python3 - "$evidence_dir/$pd_name-metric-readers.json" \
+			"$evidence_dir/$pd_name-metric-readers.tsv" <<'PYT4M5OWNERS' || true
+import base64
+import json
+import pathlib
+import sys
+
+source, output = map(pathlib.Path, sys.argv[1:3])
+try:
+    payload = json.loads(source.read_text())
+except Exception:
+    payload = {}
+rows = []
+for item in payload.get("kvs") or []:
+    try:
+        key = base64.b64decode(item.get("key", "")).decode("utf-8", "replace")
+        value = base64.b64decode(item.get("value", "")).decode("utf-8", "replace")
+    except Exception:
+        continue
+    rows.append((key, value, str(item.get("lease", "")),
+                 str(item.get("create_revision", "")), str(item.get("mod_revision", ""))))
+output.write_text("".join("\t".join(row) + "\n" for row in rows))
+PYT4M5OWNERS
+	done
+
+	# Read each advertised owner directly as well as through the management API.
+	# Restrict values to host:port syntax before forming a URL.
+	while IFS= read -r address; do
+		if [[ ! $address =~ ^(\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z.-]+):[0-9]+$ ]]; then
+			continue
+		fi
+		file_address=${address//[^0-9A-Za-z.-]/_}
+		for cluster in cluster-a cluster-b ''; do
+			name=${cluster:-primary}
+			curl --noproxy '*' --silent --show-error --max-time 5 \
+				-D "$evidence_dir/owner-$file_address-$name.headers" \
+				-o "$evidence_dir/owner-$file_address-$name.json" \
+				"http://$address/api/backend/metrics?cluster=$cluster" \
+				2>"$evidence_dir/owner-$file_address-$name.stderr" || true
+		done
+	done < <(cut -f2 "$evidence_dir"/*-metric-readers.tsv 2>/dev/null | sort -u)
+}
+
 run_t4_route_input_probe() {
 	local evidence="$run_dir/t4-m5-route-inputs.json"
-	local observations health_inputs healthy cpu memory
-	for _ in {1..180}; do
+	local observations health_inputs healthy cpu memory iteration
+	capture_t4_m5_metric_diagnostics readiness
+	for iteration in {1..180}; do
 		if ! mysql_ingress 'SELECT 1' >/dev/null 2>&1; then
 			echo "T4 M5 production route-input query failed" >&2
 			exit 1
@@ -813,6 +914,11 @@ run_t4_route_input_probe() {
 			healthy=$(sed -n 's/.*"healthy_backends":\([0-9][0-9]*\).*/\1/p' "$evidence")
 			cpu=$(sed -n 's/.*"cpu_series":\([0-9][0-9]*\).*/\1/p' "$evidence")
 			memory=$(sed -n 's/.*"memory_series":\([0-9][0-9]*\).*/\1/p' "$evidence")
+			case "$iteration" in
+				1 | 5 | 10 | 15 | 30 | 60 | 90 | 120 | 150 | 180)
+					capture_t4_m5_metric_diagnostics "probe-$iteration"
+					;;
+			esac
 			if [[ $observations =~ ^[1-9][0-9]*$ &&
 				$health_inputs =~ ^[1-9][0-9]*$ &&
 				$healthy =~ ^[1-9][0-9]*$ &&
@@ -825,6 +931,7 @@ run_t4_route_input_probe() {
 		sleep 1
 	done
 	echo "T4 M5 never observed nonempty real health, CPU, and memory inputs" >&2
+	capture_t4_m5_metric_diagnostics failure
 	cat "$evidence" >&2 2>/dev/null || true
 	exit 1
 }
