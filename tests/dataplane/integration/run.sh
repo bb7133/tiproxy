@@ -800,13 +800,15 @@ fi
 # current routing/health/metric fences.
 capture_t4_m5_metric_diagnostics() {
 	local label=$1
+	local health_port=${2:-$RUST_HEALTH_PORT}
+	local admin_port=${3:-$TIPROXY_API_PORT}
 	local evidence_dir="$run_dir/t4-m5-metric-diagnostics/$label"
 	local status_port name pd_name pd_port address file_address cluster
 	mkdir -p "$evidence_dir"
 
 	date -u +%Y-%m-%dT%H:%M:%SZ >"$evidence_dir/captured-at.txt"
 	curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-		"http://127.0.0.1:$RUST_HEALTH_PORT/health" \
+		"http://127.0.0.1:$health_port/health" \
 		-o "$evidence_dir/rust-health.json" 2>"$evidence_dir/rust-health.stderr" || true
 	ss -lntp >"$evidence_dir/listeners.txt" 2>"$evidence_dir/listeners.stderr" || true
 
@@ -834,7 +836,7 @@ capture_t4_m5_metric_diagnostics() {
 		curl --noproxy '*' --silent --show-error --max-time 5 \
 			-D "$evidence_dir/admin-backend-metrics-$name.headers" \
 			-o "$evidence_dir/admin-backend-metrics-$name.json" \
-			"http://127.0.0.1:$TIPROXY_API_PORT/api/backend/metrics?cluster=$cluster" \
+			"http://127.0.0.1:$admin_port/api/backend/metrics?cluster=$cluster" \
 			2>"$evidence_dir/admin-backend-metrics-$name.stderr" || true
 	done
 
@@ -900,7 +902,10 @@ PYT4M5OWNERS
 
 run_t4_route_input_probe() {
 	local evidence="$run_dir/t4-m5-route-inputs.json"
+	local samples="$run_dir/t4-m5-route-input-samples.tsv"
 	local observations health_inputs healthy cpu memory iteration
+	local first_pass_iteration=0
+	printf 'captured_at\titeration\tobservations\thealth_inputs\thealthy\tcpu\tmemory\n' >"$samples"
 	capture_t4_m5_metric_diagnostics readiness
 	for iteration in {1..180}; do
 		if ! mysql_ingress 'SELECT 1' >/dev/null 2>&1; then
@@ -914,6 +919,8 @@ run_t4_route_input_probe() {
 			healthy=$(sed -n 's/.*"healthy_backends":\([0-9][0-9]*\).*/\1/p' "$evidence")
 			cpu=$(sed -n 's/.*"cpu_series":\([0-9][0-9]*\).*/\1/p' "$evidence")
 			memory=$(sed -n 's/.*"memory_series":\([0-9][0-9]*\).*/\1/p' "$evidence")
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+				"$iteration" "$observations" "$health_inputs" "$healthy" "$cpu" "$memory" >>"$samples"
 			case "$iteration" in
 				1 | 5 | 10 | 15 | 30 | 60 | 90 | 120 | 150 | 180)
 					capture_t4_m5_metric_diagnostics "probe-$iteration"
@@ -924,15 +931,158 @@ run_t4_route_input_probe() {
 				$healthy =~ ^[1-9][0-9]*$ &&
 				$cpu =~ ^[1-9][0-9]*$ &&
 				$memory =~ ^[1-9][0-9]*$ ]]; then
-				echo "T4 M5 route inputs: observations=$observations health=$health_inputs healthy=$healthy cpu=$cpu memory=$memory"
-				return 0
+				if ((first_pass_iteration == 0)); then
+					first_pass_iteration=$iteration
+				fi
+				if ((iteration - first_pass_iteration >= 90)); then
+					capture_t4_m5_metric_diagnostics "steady-final-$iteration"
+					echo "T4 M5 sustained route inputs for 90s after first pass at iteration $first_pass_iteration: observations=$observations health=$health_inputs healthy=$healthy cpu=$cpu memory=$memory"
+					return 0
+				fi
+			elif ((first_pass_iteration != 0)); then
+				echo "T4 M5 route inputs regressed after first pass at iteration $first_pass_iteration" >&2
+				capture_t4_m5_metric_diagnostics "steady-regression-$iteration"
+				cat "$evidence" >&2 2>/dev/null || true
+				exit 1
 			fi
+		elif ((first_pass_iteration != 0)); then
+			echo "T4 M5 health endpoint failed after first pass at iteration $first_pass_iteration" >&2
+			capture_t4_m5_metric_diagnostics "steady-endpoint-failure-$iteration"
+			exit 1
 		fi
 		sleep 1
 	done
 	echo "T4 M5 never observed nonempty real health, CPU, and memory inputs" >&2
 	capture_t4_m5_metric_diagnostics failure
 	cat "$evidence" >&2 2>/dev/null || true
+	exit 1
+}
+
+t4_metric_history_summary() {
+	python3 - "$1" <<'PYT4M5HISTORY'
+import json
+import pathlib
+import sys
+
+try:
+    payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except Exception:
+    payload = {}
+count = 0
+latest = 0.0
+for query in payload.values() if isinstance(payload, dict) else ():
+    if not isinstance(query, dict):
+        continue
+    for backend in query.values():
+        if not isinstance(backend, dict):
+            continue
+        for name in ("Step1History", "Step2History"):
+            history = backend.get(name)
+            if not isinstance(history, list):
+                continue
+            count += len(history)
+            for sample in history:
+                if isinstance(sample, list) and sample:
+                    try:
+                        latest = max(latest, float(sample[0]))
+                    except (TypeError, ValueError):
+                        pass
+print(count, f"{latest:.6f}")
+PYT4M5HISTORY
+}
+
+# The later keyspace/migration process starts cold and consumes several config
+# generations before CP-ADMIN checks it. Prove that its transient empty history
+# recovers, stays nonempty past the 60-second retention window, and continues to
+# receive newer samples from the same owner endpoint.
+run_t4_m5_post_config_metric_soak() {
+	local samples="$run_dir/t4-m5-post-config-metric-samples.tsv"
+	local health="$run_dir/t4-m5-post-config-health.json"
+	local admin_a="$run_dir/t4-m5-post-config-admin-cluster-a.json"
+	local admin_b="$run_dir/t4-m5-post-config-admin-cluster-b.json"
+	local owner_a="$run_dir/t4-m5-post-config-owner-cluster-a.json"
+	local owner_b="$run_dir/t4-m5-post-config-owner-cluster-b.json"
+	local iteration observations health_inputs healthy cpu memory
+	local a_count a_latest b_count b_latest
+	local first_pass_iteration=0 first_a_latest= first_b_latest=
+	printf 'captured_at\titeration\tobservations\thealth_inputs\thealthy\tcpu\tmemory\tcluster_a_samples\tcluster_a_latest\tcluster_b_samples\tcluster_b_latest\n' >"$samples"
+	capture_t4_m5_metric_diagnostics post-config-start "$ka_health_port" "$ka_admin_port"
+	for iteration in {1..180}; do
+		mysql_ka_root 'SELECT 1' >/dev/null 2>&1 || {
+			echo "T4 M5 post-config production query failed" >&2
+			exit 1
+		}
+		if curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_health_port/health" -o "$health" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-a" -o "$admin_a" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_admin_port/api/backend/metrics?cluster=cluster-b" -o "$admin_b" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-a" -o "$owner_a" &&
+			curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+			"http://127.0.0.1:$ka_metrics_owner_port/api/backend/metrics?cluster=cluster-b" -o "$owner_b" &&
+			cmp -s "$admin_a" "$owner_a" && cmp -s "$admin_b" "$owner_b"; then
+			observations=$(sed -n 's/.*"observations":\([0-9][0-9]*\).*/\1/p' "$health")
+			health_inputs=$(sed -n 's/.*"health_input_backends":\([0-9][0-9]*\).*/\1/p' "$health")
+			healthy=$(sed -n 's/.*"healthy_backends":\([0-9][0-9]*\).*/\1/p' "$health")
+			cpu=$(sed -n 's/.*"cpu_series":\([0-9][0-9]*\).*/\1/p' "$health")
+			memory=$(sed -n 's/.*"memory_series":\([0-9][0-9]*\).*/\1/p' "$health")
+			read -r a_count a_latest <<<"$(t4_metric_history_summary "$admin_a")"
+			read -r b_count b_latest <<<"$(t4_metric_history_summary "$admin_b")"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$iteration" "$observations" "$health_inputs" \
+				"$healthy" "$cpu" "$memory" "$a_count" "$a_latest" "$b_count" "$b_latest" >>"$samples"
+			case "$iteration" in
+				1 | 5 | 10 | 15 | 30 | 60 | 90 | 120 | 150 | 180)
+					capture_t4_m5_metric_diagnostics "post-config-$iteration" "$ka_health_port" "$ka_admin_port"
+					;;
+			esac
+			if [[ $observations =~ ^[1-9][0-9]*$ &&
+				$health_inputs =~ ^[1-9][0-9]*$ &&
+				$healthy =~ ^[1-9][0-9]*$ &&
+				$cpu =~ ^[1-9][0-9]*$ &&
+				$memory =~ ^[1-9][0-9]*$ &&
+				$a_count =~ ^[1-9][0-9]*$ &&
+				$b_count =~ ^[1-9][0-9]*$ ]]; then
+				if ((first_pass_iteration == 0)); then
+					first_pass_iteration=$iteration
+					first_a_latest=$a_latest
+					first_b_latest=$b_latest
+					cp "$admin_a" "$run_dir/t4-m5-post-config-first-cluster-a.json"
+					cp "$admin_b" "$run_dir/t4-m5-post-config-first-cluster-b.json"
+				fi
+				if ((iteration - first_pass_iteration >= 90)); then
+					python3 - "$first_a_latest" "$a_latest" "$first_b_latest" "$b_latest" <<'PYT4M5ADVANCE'
+import sys
+
+first_a, final_a, first_b, final_b = map(float, sys.argv[1:])
+if not (final_a > first_a and final_b > first_b):
+    raise SystemExit(
+        f"metric timestamps did not advance: cluster-a {first_a}->{final_a}, "
+        f"cluster-b {first_b}->{final_b}"
+    )
+PYT4M5ADVANCE
+					cp "$admin_a" "$run_dir/t4-m5-post-config-final-cluster-a.json"
+					cp "$admin_b" "$run_dir/t4-m5-post-config-final-cluster-b.json"
+					capture_t4_m5_metric_diagnostics "post-config-final-$iteration" "$ka_health_port" "$ka_admin_port"
+					echo "T4 M5 post-config metrics stayed nonempty for 90s and advanced: cluster-a $first_a_latest->$a_latest, cluster-b $first_b_latest->$b_latest"
+					return 0
+				fi
+			elif ((first_pass_iteration != 0)); then
+				echo "T4 M5 post-config metrics regressed after first pass at iteration $first_pass_iteration" >&2
+				capture_t4_m5_metric_diagnostics "post-config-regression-$iteration" "$ka_health_port" "$ka_admin_port"
+				exit 1
+			fi
+		elif ((first_pass_iteration != 0)); then
+			echo "T4 M5 post-config admin/owner endpoints failed or diverged after first pass at iteration $first_pass_iteration" >&2
+			capture_t4_m5_metric_diagnostics "post-config-endpoint-failure-$iteration" "$ka_health_port" "$ka_admin_port"
+			exit 1
+		fi
+		sleep 1
+	done
+	echo "T4 M5 post-config metrics never stayed nonempty and advancing for 90s" >&2
+	capture_t4_m5_metric_diagnostics post-config-failure "$ka_health_port" "$ka_admin_port"
 	exit 1
 }
 
@@ -2564,6 +2714,9 @@ if [[ $mode == rust ]]; then
 		fi
 	done
 	echo "CP-ADMIN: debug/redirect sweep offered=$adm_offered accepted=$adm_accepted settled with $adm_active active; persistent session self-migrated on A1 (backend conn $adm_conn_before -> $adm_conn_after, database+user-variable restored); backend/metrics admin == metric-owner bytes (cluster-a $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-a.json") B, cluster-b $(wc -c <"$run_dir/cp-admin-backend-metrics-cluster-b.json") B, primary $(wc -c <"$run_dir/cp-admin-backend-metrics-primary.json") B)"
+	if [[ ${DATAPLANE_T4_QUALIFICATION:-0} == 1 && ${DATAPLANE_T4_ROW:-} == M5 ]]; then
+		run_t4_m5_post_config_metric_soak
+	fi
 
 	# Close the migrated client, then restore the initial A0 pin before the
 	# separate cross-keyspace refusal phase establishes its own old session.
